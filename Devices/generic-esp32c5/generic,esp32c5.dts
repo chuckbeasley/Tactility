@@ -1,0 +1,53 @@
+/dts-v1/;
+
+#include <tactility/bindings/root.h>
+#include <tactility/bindings/esp32_wifi_pinned.h>
+#include <tactility/bindings/esp32_gpio.h>
+#include <tactility/bindings/esp32_i2c.h>
+#include <tactility/bindings/esp32_spi.h>
+#include <bindings/st7796.h>
+#include <bindings/xpt2046_softspi.h>
+
+/ {
+	compatible = "root";
+	model = "Generic ESP32 C5";
+
+	wifi0 {
+		compatible = "espressif,esp32-wifi-pinned";
+		status = "disabled";
+	};
+
+	gpio0 {
+		compatible = "espressif,esp32-gpio";
+		gpio-count = <29>;
+	};
+
+	spi0 {
+		compatible = "espressif,esp32-spi";
+		host = <SPI2_HOST>;
+		cs-gpios = <&gpio0 1 GPIO_FLAG_NONE>;
+		pin-mosi = <&gpio0 7 GPIO_FLAG_NONE>;
+		pin-sclk = <&gpio0 8 GPIO_FLAG_NONE>;
+
+		display@0 {
+			compatible = "sitronix,st7796";
+			horizontal-resolution = <480>;
+			vertical-resolution = <320>;
+			swap-xy;
+			pixel-clock-hz = <40000000>;
+			pin-dc = <&gpio0 0 GPIO_FLAG_NONE>;
+			pin-reset = <&gpio0 3 GPIO_FLAG_NONE>;
+		};
+	};
+
+	touch {
+		compatible = "xptek,xpt2046-softspi";
+		pin-mosi = <&gpio0 15 GPIO_FLAG_NONE>;
+		pin-miso = <&gpio0 9 GPIO_FLAG_NONE>;
+		pin-sck = <&gpio0 23 GPIO_FLAG_NONE>;
+		pin-cs = <&gpio0 28 GPIO_FLAG_NONE>;
+		x-max = <480>;
+		y-max = <320>;
+		swap-xy;
+	};
+};

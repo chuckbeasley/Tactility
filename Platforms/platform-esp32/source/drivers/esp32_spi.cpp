@@ -22,6 +22,7 @@ extern "C" {
 struct Esp32SpiInternal {
     RecursiveMutex mutex = {};
     bool initialized = false;
+    bool bus_owner = false;  // true if we called spi_bus_initialize (vs. joining existing bus)
 
     // Bus pin descriptors
     GpioDescriptor* sclk_descriptor = nullptr;
@@ -118,12 +119,18 @@ static error_t start(Device* device) {
     };
 
     esp_err_t ret = spi_bus_initialize(dts_config->host, &buscfg, SPI_DMA_CH_AUTO);
-    if (ret != ESP_OK) {
+    if (ret == ESP_ERR_INVALID_STATE) {
+        // Bus already initialized (e.g. by esp_hosted). Join it without taking ownership.
+        LOG_I(TAG, "SPI bus already initialized, joining existing bus");
+        data->bus_owner = false;
+    } else if (ret != ESP_OK) {
         data->cleanup_pins();
         device_set_driver_data(device, nullptr);
         delete data;
         LOG_E(TAG, "Failed to initialize SPI bus: %s", esp_err_to_name(ret));
         return ERROR_RESOURCE;
+    } else {
+        data->bus_owner = true;
     }
 
     // MISO is only actively driven by the selected slave; between commands (and briefly during
@@ -164,7 +171,7 @@ static error_t stop(Device* device) {
     auto* driver_data = GET_DATA(device);
     auto* dts_config = GET_CONFIG(device);
 
-    if (driver_data->initialized) {
+    if (driver_data->initialized && driver_data->bus_owner) {
         spi_bus_free(dts_config->host);
     }
 

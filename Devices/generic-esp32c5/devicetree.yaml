@@ -1,0 +1,5 @@
+dependencies:
+  - Platforms/platform-esp32
+  - Drivers/st7796-module
+  - Drivers/xpt2046-softspi-module
+dts: generic,esp32c5.dts

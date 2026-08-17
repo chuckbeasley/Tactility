@@ -23,6 +23,7 @@
 #include <lvgl/widgets/toolbar.h>
 
 #include <cstring>
+#include <format>
 
 namespace tt::app::development {
 

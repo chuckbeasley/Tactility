@@ -2,7 +2,6 @@
 
 #include <tactility/device.h>
 #include <tactility/log.h>
-#include <tactility/log_queue.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,46 +11,43 @@ extern "C" {
 
 extern const ModuleSymbol KERNEL_SYMBOLS[];
 
-extern Driver root_driver;
-extern Driver battery_sense_driver;
-extern Driver battery_sense_power_supply_driver;
-extern Driver gpio_hog_driver;
-extern Driver pwm_backlight_driver;
-extern Driver gpio_backlight_driver;
-extern Driver rgb_led_gpio_driver;
-extern Driver rgb_led_pwm_driver;
+static error_t start() {
+    extern Driver root_driver;
+    if (driver_construct_add(&root_driver) != ERROR_NONE) return ERROR_RESOURCE;
+    extern Driver battery_sense_driver;
+    if (driver_construct_add(&battery_sense_driver) != ERROR_NONE) return ERROR_RESOURCE;
+    extern Driver battery_sense_power_supply_driver;
+    if (driver_construct_add(&battery_sense_power_supply_driver) != ERROR_NONE) return ERROR_RESOURCE;
+    extern Driver gpio_hog_driver;
+    if (driver_construct_add(&gpio_hog_driver) != ERROR_NONE) return ERROR_RESOURCE;
+    extern Driver pwm_backlight_driver;
+    if (driver_construct_add(&pwm_backlight_driver) != ERROR_NONE) return ERROR_RESOURCE;
+    extern Driver gpio_backlight_driver;
+    if (driver_construct_add(&gpio_backlight_driver) != ERROR_NONE) return ERROR_RESOURCE;
+    extern Driver rgb_led_gpio_driver;
+    if (driver_construct_add(&rgb_led_gpio_driver) != ERROR_NONE) return ERROR_RESOURCE;
+    extern Driver rgb_led_pwm_driver;
+    if (driver_construct_add(&rgb_led_pwm_driver) != ERROR_NONE) return ERROR_RESOURCE;
+    return ERROR_NONE;
+}
 
-/**
- * @warning Because the drivers have no owning module, they cannot be unbound.
- * This is fine for now because we never unload the kernel once it's loaded.
- */
-static Driver* const KERNEL_DRIVERS[] = {
-    &root_driver,
-    &battery_sense_driver,
-    &battery_sense_power_supply_driver,
-    &gpio_hog_driver,
-    &pwm_backlight_driver,
-    &gpio_backlight_driver,
-    &rgb_led_gpio_driver,
-    &rgb_led_pwm_driver,
-    nullptr,
-};
+static error_t stop() {
+    return ERROR_NONE;
+}
 
-Module kernel_module = {
+Module root_module = {
     .name = "kernel",
-    .start = nullptr,
-    .stop = nullptr,
-    .drivers = KERNEL_DRIVERS,
-    .symbols = static_cast<const struct ModuleSymbol*>(KERNEL_SYMBOLS),
-    .internal = nullptr,
+    .start = start,
+    .stop = stop,
+    .drivers = nullptr,
+    .symbols = (const struct ModuleSymbol*)KERNEL_SYMBOLS,
+    .internal = nullptr
 };
 
 error_t kernel_init(Module* const dts_modules[], const DtsDevice dts_devices[]) {
-    log_queue_init();
-
     LOG_I(TAG, "init");
 
-    if (module_construct_add_start(&kernel_module) != ERROR_NONE) {
+    if (module_construct_add_start(&root_module) != ERROR_NONE) {
         LOG_E(TAG, "root module init failed");
         return ERROR_RESOURCE;
     }

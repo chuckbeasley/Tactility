@@ -42,7 +42,7 @@ void lvgl_devices_attach() {
     lv_disp_t* lvgl_display = NULL;
     bool display_updates_slowly = false;
 
-    struct LvglDeviceList display_devices = {0};
+    struct LvglDeviceList display_devices = { {nullptr}, 0};
     device_for_each_of_type(&DISPLAY_TYPE, &display_devices, lvgl_device_list_collect);
     for (size_t i = 0; i < display_devices.count; i++) {
         struct Device* kernel_display_device = display_devices.devices[i];
@@ -70,13 +70,21 @@ void lvgl_devices_attach() {
         bool prefer_external_ram_buffer = display_has_capability(kernel_display_device, DISPLAY_CAPABILITY_PREFER_EXTERNAL_RAM);
         struct LvglDisplayConfig lvgl_display_config = {
             .buffer_height = (uint16_t)(vres > 10 ? vres / 10 : vres),
+            .double_buffer = true,
             .sw_rotate = !can_hw_rotate,
             .swap_bytes = swap_bytes,
             .force_full_frame = display_requires_full_frame,
             .prefer_external_ram = prefer_external_ram_buffer
         };
         lv_disp_t* added_display = NULL;
-        if (lvgl_display_add(kernel_display_device, &lvgl_display_config, &added_display) == ERROR_NONE) {
+        error_t add_result = lvgl_display_add(kernel_display_device, &lvgl_display_config, &added_display);
+        if (add_result == ERROR_OUT_OF_MEMORY && lvgl_display_config.double_buffer) {
+            // Fall back to a single buffer when RAM is too tight for a double-buffer pair.
+            LOG_W(TAG, "Not enough RAM for double-buffer on %s, retrying with single buffer", kernel_display_device->name);
+            lvgl_display_config.double_buffer = false;
+            add_result = lvgl_display_add(kernel_display_device, &lvgl_display_config, &added_display);
+        }
+        if (add_result == ERROR_NONE) {
             LOG_I(TAG, "Bound %s to LVGL", kernel_display_device->name);
             // Pointers/keyboards below bind to the first display bound here, matching that display's
             // refresh behavior.
@@ -89,7 +97,7 @@ void lvgl_devices_attach() {
         }
     }
 
-    struct LvglDeviceList pointer_devices = {0};
+    struct LvglDeviceList pointer_devices = { {nullptr}, 0};
     device_for_each_of_type(&POINTER_TYPE, &pointer_devices, lvgl_device_list_collect);
     for (size_t i = 0; i < pointer_devices.count; i++) {
         struct Device* kernel_pointer_device = pointer_devices.devices[i];
@@ -115,7 +123,7 @@ void lvgl_devices_attach() {
         }
     }
 
-    struct LvglDeviceList keyboard_devices = {0};
+    struct LvglDeviceList keyboard_devices = {{nullptr}, 0};
     device_for_each_of_type(&KEYBOARD_TYPE, &keyboard_devices, lvgl_device_list_collect);
     for (size_t i = 0; i < keyboard_devices.count; i++) {
         struct Device* kernel_keyboard_device = keyboard_devices.devices[i];
