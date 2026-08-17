@@ -50,8 +50,8 @@ static bool IRAM_ATTR on_color_trans_done(esp_lcd_panel_io_handle_t, esp_lcd_pan
     return high_task_woken == pdTRUE;
 }
 
-static int pin_or_unused(const struct GpioPinSpec& pin) {
-    return pin.gpio_controller == nullptr ? -1 : static_cast<int>(pin.pin);
+static gpio_num_t pin_or_unused(const struct GpioPinSpec& pin) {
+    return pin.gpio_controller == nullptr ? GPIO_NUM_NC : static_cast<gpio_num_t>(pin.pin);
 }
 
 // region Driver lifecycle
@@ -113,13 +113,13 @@ static error_t start(Device* device) {
     }
 
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = pin_or_unused(config->pin_reset),
         .rgb_ele_order = config->bgr_order ? LCD_RGB_ELEMENT_ORDER_BGR : LCD_RGB_ELEMENT_ORDER_RGB,
         .data_endian = LCD_RGB_DATA_ENDIAN_LITTLE,
         .bits_per_pixel = config->bits_per_pixel,
+        .reset_gpio_num = pin_or_unused(config->pin_reset),
+        .vendor_config = nullptr,
         // ST7796's reset line is fixed active-low in hardware.
         .flags = { .reset_active_high = false },
-        .vendor_config = nullptr,
     };
 
     ret = esp_lcd_new_panel_st7796(internal->io_handle, &panel_config, &internal->panel_handle);

@@ -137,11 +137,6 @@ const esp_elfsym main_symbols[] {
     ESP_ELFSYM_EXPORT(fminf),
     ESP_ELFSYM_EXPORT(round),
     ESP_ELFSYM_EXPORT(roundf),
-#ifndef _REENT_ONLY
-    ESP_ELFSYM_EXPORT(acos),
-    ESP_ELFSYM_EXPORT(acosf),
-    ESP_ELFSYM_EXPORT(asin),
-    ESP_ELFSYM_EXPORT(asinf),
     ESP_ELFSYM_EXPORT(atan2),
     ESP_ELFSYM_EXPORT(atan2f),
     ESP_ELFSYM_EXPORT(sinh),
@@ -160,17 +155,11 @@ const esp_elfsym main_symbols[] {
     ESP_ELFSYM_EXPORT(sqrtf),
     ESP_ELFSYM_EXPORT(fmod),
     ESP_ELFSYM_EXPORT(fmodf),
-#endif
-    // sys/errno.h
-    ESP_ELFSYM_EXPORT(__errno),
-    // freertos_tasks_c_additions.h
-    ESP_ELFSYM_EXPORT(__getreent),
-#ifdef __HAVE_LOCALE_INFO__
-    // ctype.h
-    ESP_ELFSYM_EXPORT(__locale_ctype_ptr),
-#else
-    ESP_ELFSYM_EXPORT(_ctype_),
-#endif
+    // ctype.h - _ctype_ is the locale classification table used by isalpha() etc.
+    // Under picolibc __locale_ctype_ptr() is a macro expanding to _ctype_, so the
+    // array decays to a pointer directly rather than using ESP_ELFSYM_EXPORT (which
+    // would try to take &_ctype_ after macro expansion makes it a non-lvalue).
+    { "_ctype_", (void*)_ctype_ },
     // getopt.h
     ESP_ELFSYM_EXPORT(getopt_long),
     ESP_ELFSYM_EXPORT(optind),

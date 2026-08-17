@@ -30,6 +30,8 @@ const ModuleSymbol service_module_symbols[] = {
 
 Module service_module = {
     .name = "service",
+    .start = nullptr,
+    .stop = nullptr,
     .drivers = nullptr,
     .symbols = service_module_symbols,
     .internal = nullptr

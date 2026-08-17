@@ -6,7 +6,7 @@ get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
 # Get the project and device id
 if (DEFINED ENV{ESP_IDF_VERSION})
-    include("../Buildscripts/device.cmake")
+    include("${PROJECT_ROOT}/Buildscripts/device.cmake")
     init_tactility_globals("../sdkconfig")
     get_property(TACTILITY_DEVICE_PROJECT GLOBAL PROPERTY TACTILITY_DEVICE_PROJECT)
     get_property(TACTILITY_DEVICE_ID GLOBAL PROPERTY TACTILITY_DEVICE_ID)

@@ -13,8 +13,10 @@
 #include <tactility/delay.h>
 #include <tactility/error.h>
 #include <tactility/log.h>
+#include <driver/gpio.h>
 
 #include <cstdlib>
+#include <algorithm>
 #include <new>
 
 constexpr auto* TAG = "XPT2046SoftSPI";
@@ -34,14 +36,15 @@ constexpr uint8_t CMD_READ_BATTERY = 0xA7;
 
 constexpr int RAW_MIN_DEFAULT = 100;
 constexpr int RAW_MAX_DEFAULT = 1900;
-constexpr int RAW_VALID_MIN = 100;
+constexpr int RAW_VALID_MIN = 50;
 constexpr int RAW_VALID_MAX = 3900;
 constexpr int SAMPLE_COUNT = 8;
 
 } // namespace
 
 struct Xpt2046SoftSpiInternal {
-    GpioDescriptor* mosi;
+    // MOSI configured as a plain GPIO output — bit-banged directly via gpio_set_level().
+    gpio_num_t mosi_pin;
     GpioDescriptor* miso;
     GpioDescriptor* sck;
     GpioDescriptor* cs;
@@ -60,7 +63,6 @@ static void destroy_power_supply_child(Device* child);
 // region Driver lifecycle
 
 static void release_descriptors(Xpt2046SoftSpiInternal* internal) {
-    if (internal->mosi != nullptr) gpio_descriptor_release(internal->mosi);
     if (internal->miso != nullptr) gpio_descriptor_release(internal->miso);
     if (internal->sck != nullptr) gpio_descriptor_release(internal->sck);
     if (internal->cs != nullptr) gpio_descriptor_release(internal->cs);
@@ -75,12 +77,13 @@ static error_t start(Device* device) {
     }
     *internal = {};
 
-    internal->mosi = gpio_descriptor_acquire(config->pin_mosi.gpio_controller, config->pin_mosi.pin, GPIO_FLAG_DIRECTION_OUTPUT, GPIO_OWNER_GPIO);
-    internal->miso = gpio_descriptor_acquire(config->pin_miso.gpio_controller, config->pin_miso.pin, GPIO_FLAG_DIRECTION_INPUT | GPIO_FLAG_PULL_UP, GPIO_OWNER_GPIO);
+    internal->mosi_pin = static_cast<gpio_num_t>(config->pin_mosi.pin);
+    gpio_set_direction(internal->mosi_pin, GPIO_MODE_OUTPUT);
+    internal->miso = gpio_descriptor_acquire(config->pin_miso.gpio_controller, config->pin_miso.pin, GPIO_FLAG_DIRECTION_INPUT, GPIO_OWNER_GPIO);
     internal->sck = gpio_descriptor_acquire(config->pin_sck.gpio_controller, config->pin_sck.pin, GPIO_FLAG_DIRECTION_OUTPUT, GPIO_OWNER_GPIO);
     internal->cs = gpio_descriptor_acquire(config->pin_cs.gpio_controller, config->pin_cs.pin, GPIO_FLAG_DIRECTION_OUTPUT | GPIO_FLAG_ACTIVE_LOW, GPIO_OWNER_GPIO);
 
-    if (internal->mosi == nullptr || internal->miso == nullptr || internal->sck == nullptr || internal->cs == nullptr) {
+    if (internal->miso == nullptr || internal->sck == nullptr || internal->cs == nullptr) {
         LOG_E(TAG, "Failed to acquire GPIO descriptors");
         release_descriptors(internal);
         free(internal);
@@ -90,7 +93,7 @@ static error_t start(Device* device) {
     // Idle state: CS high (deselected), SCK/MOSI low.
     bool ok = gpio_descriptor_set_level(internal->cs, false) == ERROR_NONE &&
         gpio_descriptor_set_level(internal->sck, false) == ERROR_NONE &&
-        gpio_descriptor_set_level(internal->mosi, false) == ERROR_NONE;
+        gpio_set_level(internal->mosi_pin, 0) == ESP_OK;
 
     if (!ok) {
         LOG_E(TAG, "Failed to configure GPIO pins");
@@ -141,16 +144,23 @@ static error_t stop(Device* device) {
 static int read_spi_command(Xpt2046SoftSpiInternal* internal, uint8_t command) {
     int result = 0;
 
-    gpio_descriptor_set_level(internal->cs, true);
+    gpio_descriptor_set_level(internal->cs, false); // assert CS (active-low)
     delay_micros(1);
 
     for (int i = 7; i >= 0; i--) {
-        gpio_descriptor_set_level(internal->mosi, (command & (1 << i)) != 0);
+        gpio_set_level(internal->mosi_pin, (command & (1 << i)) != 0);
         gpio_descriptor_set_level(internal->sck, true);
         delay_micros(1);
         gpio_descriptor_set_level(internal->sck, false);
         delay_micros(1);
     }
+
+    // XPT2046 requires one busy clock cycle after the last command bit before data is valid.
+    gpio_set_level(internal->mosi_pin, 0);
+    gpio_descriptor_set_level(internal->sck, true);
+    delay_micros(2);
+    gpio_descriptor_set_level(internal->sck, false);
+    delay_micros(2);
 
     for (int i = 11; i >= 0; i--) {
         gpio_descriptor_set_level(internal->sck, true);
@@ -164,7 +174,7 @@ static int read_spi_command(Xpt2046SoftSpiInternal* internal, uint8_t command) {
         delay_micros(1);
     }
 
-    gpio_descriptor_set_level(internal->cs, false);
+    gpio_descriptor_set_level(internal->cs, true); // deassert CS
 
     return result;
 }
@@ -317,7 +327,6 @@ static error_t xpt2046_softspi_read_data(Device* device, TickType_t timeout) {
     for (int i = 0; i < SAMPLE_COUNT; i++) {
         const int raw_x = read_spi_command(internal, CMD_READ_X);
         const int raw_y = read_spi_command(internal, CMD_READ_Y);
-
         if (raw_x > RAW_VALID_MIN && raw_x < RAW_VALID_MAX && raw_y > RAW_VALID_MIN && raw_y < RAW_VALID_MAX) {
             total_x += raw_x;
             total_y += raw_y;
@@ -327,7 +336,7 @@ static error_t xpt2046_softspi_read_data(Device* device, TickType_t timeout) {
         delay_millis(1);
     }
 
-    if (valid_samples < 3) {
+    if (valid_samples < 1) {
         internal->touched = false;
         return ERROR_NONE;
     }
@@ -335,25 +344,33 @@ static error_t xpt2046_softspi_read_data(Device* device, TickType_t timeout) {
     const int raw_x = total_x / valid_samples;
     const int raw_y = total_y / valid_samples;
 
-    int mapped_x = (raw_x - RAW_MIN_DEFAULT) * static_cast<int>(config->x_max) / (RAW_MAX_DEFAULT - RAW_MIN_DEFAULT);
-    int mapped_y = (raw_y - RAW_MIN_DEFAULT) * static_cast<int>(config->y_max) / (RAW_MAX_DEFAULT - RAW_MIN_DEFAULT);
+    const int display_x_max = static_cast<int>(config->x_max);
+    const int display_y_max = static_cast<int>(config->y_max);
+
+    // When swap_xy is set, physical X maps to screen Y and physical Y maps to screen X.
+    // Map to the pre-swap space so the values land in the correct range after the swap below.
+    const int pre_x_max = internal->swap_xy ? display_y_max : display_x_max;
+    const int pre_y_max = internal->swap_xy ? display_x_max : display_y_max;
+
+    int mapped_x = (raw_x - RAW_MIN_DEFAULT) * pre_x_max /
+                   (RAW_MAX_DEFAULT - RAW_MIN_DEFAULT);
+    int mapped_y = (raw_y - RAW_MIN_DEFAULT) * pre_y_max /
+                   (RAW_MAX_DEFAULT - RAW_MIN_DEFAULT);
 
     if (internal->swap_xy) {
-        const int swapped = mapped_x;
-        mapped_x = mapped_y;
-        mapped_y = swapped;
+        std::swap(mapped_x, mapped_y);
     }
     if (internal->mirror_x) {
-        mapped_x = static_cast<int>(config->x_max) - mapped_x;
+        mapped_x = display_x_max - mapped_x;
     }
     if (internal->mirror_y) {
-        mapped_y = static_cast<int>(config->y_max) - mapped_y;
+        mapped_y = display_y_max - mapped_y;
     }
 
     if (mapped_x < 0) mapped_x = 0;
-    if (mapped_x > static_cast<int>(config->x_max)) mapped_x = static_cast<int>(config->x_max);
+    if (mapped_x > display_x_max) mapped_x = display_x_max;
     if (mapped_y < 0) mapped_y = 0;
-    if (mapped_y > static_cast<int>(config->y_max)) mapped_y = static_cast<int>(config->y_max);
+    if (mapped_y > display_y_max) mapped_y = display_y_max;
 
     internal->x = static_cast<uint16_t>(mapped_x);
     internal->y = static_cast<uint16_t>(mapped_y);

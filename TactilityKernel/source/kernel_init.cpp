@@ -39,6 +39,7 @@ Module root_module = {
     .name = "kernel",
     .start = start,
     .stop = stop,
+    .drivers = nullptr,
     .symbols = (const struct ModuleSymbol*)KERNEL_SYMBOLS,
     .internal = nullptr
 };

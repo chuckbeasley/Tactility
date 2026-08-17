@@ -31,7 +31,7 @@ if (DEFINED ENV{ESP_IDF_VERSION})
         esp_http_client
         esp-tls
         esp_wifi
-        json # Effectively cJSON
+        espressif__cjson
         nvs_flash
         spiffs
         vfs
@@ -44,7 +44,7 @@ if (DEFINED ENV{ESP_IDF_VERSION})
         list(APPEND REQUIRES_LIST esp_tinyusb)
     endif ()
 
-    if ("${IDF_TARGET}" STREQUAL "esp32p4")
+    if (CONFIG_ESP_HOSTED_ENABLED AND ("${IDF_TARGET}" STREQUAL "esp32p4" OR "${IDF_TARGET}" STREQUAL "esp32c5"))
         # EspNowBackendHosted.cpp needs esp_hosted.h / esp_hosted_misc.h.
         list(APPEND REQUIRES_LIST espressif__esp_hosted)
     endif ()
@@ -84,4 +84,3 @@ if (DEFINED ENV{ESP_IDF_VERSION})
     endif ()
 
 endif ()
-

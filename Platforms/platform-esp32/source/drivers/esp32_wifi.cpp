@@ -18,7 +18,7 @@
 #include <tactility/log.h>
 #include <tactility/time.h>
 
-#if defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
+#if defined(CONFIG_ESP_HOSTED_ENABLED)
 #include <tactility/drivers/esp32_esp_hosted_ota.h>
 #endif
 
@@ -69,6 +69,10 @@ struct Esp32WifiCtx {
     Mutex callbackMutex{};
     WifiCallbackEntry callbacks[WIFI_MAX_CALLBACKS] = {};
     size_t callbackCount = 0;
+
+    // Promiscuous mode
+    WifiPromiscuousCallback promiscuousCallback = nullptr;
+    void* promiscuousContext = nullptr;
 };
 
 #define GET_CTX(device) (static_cast<Esp32WifiCtx*>(device_get_driver_data(device)))
@@ -86,8 +90,8 @@ WifiAuthenticationType to_wifi_authentication_type(wifi_auth_mode_t mode) {
         case WIFI_AUTH_WAPI_PSK: return WIFI_AUTHENTICATION_TYPE_WAPI_PSK;
         case WIFI_AUTH_OWE: return WIFI_AUTHENTICATION_TYPE_OWE;
         case WIFI_AUTH_WPA3_ENT_192: return WIFI_AUTHENTICATION_TYPE_WPA3_ENT_192;
-        case WIFI_AUTH_WPA3_EXT_PSK: return WIFI_AUTHENTICATION_TYPE_WPA3_EXT_PSK;
-        case WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE: return WIFI_AUTHENTICATION_TYPE_WPA3_EXT_PSK_MIXED_MODE;
+        case WIFI_AUTH_DUMMY_1: return WIFI_AUTHENTICATION_TYPE_WPA3_EXT_PSK;
+        case WIFI_AUTH_DUMMY_2: return WIFI_AUTHENTICATION_TYPE_WPA3_EXT_PSK_MIXED_MODE;
         default: return WIFI_AUTHENTICATION_TYPE_OPEN;
     }
 }
@@ -531,13 +535,81 @@ error_t api_remove_event_callback(Device* device, WifiEventCallback callback) {
     return ERROR_NOT_FOUND;
 }
 
+// ---- Promiscuous mode ----
+
+static void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
+    // Retrieve the context via the IDF's own rx_cb arg — IDF doesn't pass a user arg directly,
+    // so we store the device pointer in a file-scope variable set at enable time.
+    // This is safe because only one WiFi device exists on ESP32.
+    static Esp32WifiCtx* s_promisc_ctx = nullptr;
+
+    if (buf == nullptr || s_promisc_ctx == nullptr) return;
+
+    auto* pkt = static_cast<wifi_promiscuous_pkt_t*>(buf);
+    const wifi_pkt_rx_ctrl_t& rx = pkt->rx_ctrl;
+
+    WifiPromiscuousCallback cb = s_promisc_ctx->promiscuousCallback;
+    void* user_ctx = s_promisc_ctx->promiscuousContext;
+    if (cb == nullptr) return;
+
+    WifiPromiscuousPacketInfo info = {};
+    info.rssi    = rx.rssi;
+    info.channel = rx.channel;
+    switch (type) {
+        case WIFI_PKT_MGMT: info.type = WIFI_PROMISCUOUS_PACKET_TYPE_MGMT; break;
+        case WIFI_PKT_CTRL: info.type = WIFI_PROMISCUOUS_PACKET_TYPE_CTRL; break;
+        case WIFI_PKT_DATA: info.type = WIFI_PROMISCUOUS_PACKET_TYPE_DATA; break;
+        default:            info.type = WIFI_PROMISCUOUS_PACKET_TYPE_MISC; break;
+    }
+
+    cb(user_ctx, pkt->payload, rx.sig_len, info);
+}
+
+// File-scope pointer used by the IDF rx callback (IDF doesn't support a user-arg for promiscuous cb).
+static Esp32WifiCtx* s_promisc_ctx = nullptr;
+
+error_t api_set_promiscuous(Device* device, bool enable) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr) return ERROR_INVALID_STATE;
+
+    if (enable) {
+        s_promisc_ctx = ctx;
+        esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
+    }
+
+    esp_err_t err = esp_wifi_set_promiscuous(enable);
+    if (err != ESP_OK) return esp_err_to_error(err);
+
+    if (!enable) {
+        s_promisc_ctx = nullptr;
+    }
+
+    return ERROR_NONE;
+}
+
+error_t api_get_promiscuous(Device* /*device*/, bool* enabled) {
+    if (enabled == nullptr) return ERROR_INVALID_ARGUMENT;
+    esp_err_t err = esp_wifi_get_promiscuous(enabled);
+    return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
+}
+
+error_t api_set_promiscuous_callback(Device* device, WifiPromiscuousCallback callback, void* context) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr) return ERROR_INVALID_STATE;
+    ctx->promiscuousCallback = callback;
+    ctx->promiscuousContext  = context;
+    // Re-register with IDF so it picks up a null callback (effectively a no-op filter) too.
+    esp_wifi_set_promiscuous_rx_cb(callback != nullptr ? promiscuous_rx_cb : nullptr);
+    return ERROR_NONE;
+}
+
 error_t api_get_firmware_ops(Device* /*device*/, const FirmwareOps** ops, void** ctx) {
     // ops/ctx are caller-supplied output pointers, reachable from external (ELF) apps via
     // wifi_get_firmware_ops() - validate at this API boundary rather than trusting the caller.
     if (ops == nullptr || ctx == nullptr) {
         return ERROR_INVALID_ARGUMENT;
     }
-#if defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
+#if defined(CONFIG_ESP_HOSTED_ENABLED)
     // Only meaningful on a hosted board (P4+C6/C5 etc.) - this wifi device is backed by a real
     // co-processor with its own updatable firmware there. On a native (non-hosted) chip, this
     // device's "radio" is the chip's own built-in WiFi, nothing to update via this interface.
@@ -563,7 +635,10 @@ const WifiApi esp32_wifi_api = {
     .station_get_rssi = api_station_get_rssi,
     .add_event_callback = api_add_event_callback,
     .remove_event_callback = api_remove_event_callback,
-    .get_firmware_ops = api_get_firmware_ops
+    .get_firmware_ops = api_get_firmware_ops,
+    .set_promiscuous = api_set_promiscuous,
+    .get_promiscuous = api_get_promiscuous,
+    .set_promiscuous_callback = api_set_promiscuous_callback,
 };
 
 // ---- Driver lifecycle ----

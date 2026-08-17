@@ -336,7 +336,7 @@ void startUsbHidInput() {
 
     ctx->running = true;
 
-    static constexpr MemoryPolicy STACK_POLICY = { 0, MEMORY_CAPABILITY_EXTERNAL, 0 };
+    static constexpr MemoryPolicy STACK_POLICY = { MEMORY_CAPABILITY_INTERNAL, 0, 0 };
     ctx->task_stack = static_cast<StackType_t*>(memory_alloc_with_policy(TASK_STACK * sizeof(StackType_t), &STACK_POLICY));
     if (ctx->task_stack != nullptr) {
         static constexpr MemoryPolicy TCB_POLICY = { MEMORY_CAPABILITY_INTERNAL, 0, 0 };

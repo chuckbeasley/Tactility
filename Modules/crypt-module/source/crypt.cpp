@@ -4,9 +4,8 @@
 #include <tactility/check.h>
 #include <tactility/log.h>
 
-#include <mbedtls/aes.h>
+#include <psa/crypto.h>
 #include <mbedtls/platform_util.h>
-#include <mbedtls/sha256.h>
 #include <cstring>
 #include <cstdint>
 
@@ -147,7 +146,8 @@ static void getKey(uint8_t key[32]) {
 
 void crypt_get_iv(const void* data, size_t dataLength, uint8_t iv[16]) {
     uint8_t hash[32];
-    mbedtls_sha256(static_cast<const unsigned char*>(data), dataLength, hash, 0);
+    size_t hash_len = 0;
+    psa_hash_compute(PSA_ALG_SHA_256, static_cast<const uint8_t*>(data), dataLength, hash, sizeof(hash), &hash_len);
     memcpy(iv, hash, 16);
     mbedtls_platform_zeroize(hash, sizeof(hash));
 }
@@ -156,56 +156,76 @@ void crypt_generate_iv(uint8_t iv[16]) {
     fill_random(iv, 16);
 }
 
-static int aes256CryptCbc(
+static int aes256CryptCbcPsa(
     const uint8_t key[32],
-    int mode,
+    bool encrypt,
     size_t length,
-    unsigned char iv[16],
-    const unsigned char* input,
-    unsigned char* output
+    const uint8_t iv[16],
+    const uint8_t* input,
+    uint8_t* output
 ) {
     check(key && iv && input && output);
 
     if ((length % 16) || (length == 0)) {
-        return -1; // TODO: Proper error code from mbed lib?
+        return -1;
     }
 
-    mbedtls_aes_context master;
-    mbedtls_aes_init(&master);
-    if (mode == MBEDTLS_AES_ENCRYPT) {
-        mbedtls_aes_setkey_enc(&master, key, 256);
+    psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attrs, 256);
+    psa_set_key_usage_flags(&attrs, encrypt ? PSA_KEY_USAGE_ENCRYPT : PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attrs, PSA_ALG_CBC_NO_PADDING);
+
+    psa_key_id_t key_id = PSA_KEY_ID_NULL;
+    psa_status_t status = psa_import_key(&attrs, key, 32, &key_id);
+    psa_reset_key_attributes(&attrs);
+    if (status != PSA_SUCCESS) return -1;
+
+    psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
+    if (encrypt) {
+        status = psa_cipher_encrypt_setup(&op, key_id, PSA_ALG_CBC_NO_PADDING);
     } else {
-        mbedtls_aes_setkey_dec(&master, key, 256);
+        status = psa_cipher_decrypt_setup(&op, key_id, PSA_ALG_CBC_NO_PADDING);
     }
-    int result = mbedtls_aes_crypt_cbc(&master, mode, length, iv, input, output);
-    mbedtls_aes_free(&master);
-    return result;
+    if (status != PSA_SUCCESS) {
+        psa_destroy_key(key_id);
+        return -1;
+    }
+
+    status = psa_cipher_set_iv(&op, iv, 16);
+    if (status != PSA_SUCCESS) {
+        psa_cipher_abort(&op);
+        psa_destroy_key(key_id);
+        return -1;
+    }
+
+    size_t out_len = 0;
+    status = psa_cipher_update(&op, input, length, output, length, &out_len);
+    if (status != PSA_SUCCESS) {
+        psa_cipher_abort(&op);
+        psa_destroy_key(key_id);
+        return -1;
+    }
+
+    size_t finish_len = 0;
+    status = psa_cipher_finish(&op, output + out_len, length - out_len, &finish_len);
+    psa_cipher_abort(&op);
+    psa_destroy_key(key_id);
+    return status == PSA_SUCCESS ? 0 : -1;
 }
 
 int crypt_encrypt(const uint8_t iv[16], const uint8_t* inData, uint8_t* outData, size_t dataLength) {
     uint8_t key[32];
     getKey(key);
-
-    // TODO: Is this still needed after switching to regular AES functions?
-    uint8_t iv_copy[16];
-    memcpy(iv_copy, iv, sizeof(iv_copy));
-
-    int result = aes256CryptCbc(key, MBEDTLS_AES_ENCRYPT, dataLength, iv_copy, inData, outData);
+    int result = aes256CryptCbcPsa(key, true, dataLength, iv, inData, outData);
     mbedtls_platform_zeroize(key, sizeof(key));
-    mbedtls_platform_zeroize(iv_copy, sizeof(iv_copy));
     return result;
 }
 
 int crypt_decrypt(const uint8_t iv[16], const uint8_t* inData, uint8_t* outData, size_t dataLength) {
     uint8_t key[32];
     getKey(key);
-
-    // TODO: Is this still needed after switching to regular AES functions?
-    uint8_t iv_copy[16];
-    memcpy(iv_copy, iv, sizeof(iv_copy));
-
-    int result = aes256CryptCbc(key, MBEDTLS_AES_DECRYPT, dataLength, iv_copy, inData, outData);
+    int result = aes256CryptCbcPsa(key, false, dataLength, iv, inData, outData);
     mbedtls_platform_zeroize(key, sizeof(key));
-    mbedtls_platform_zeroize(iv_copy, sizeof(iv_copy));
     return result;
 }

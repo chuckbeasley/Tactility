@@ -76,6 +76,24 @@ error_t wifi_get_firmware_ops(struct Device* device, const struct FirmwareOps** 
     return api->get_firmware_ops(device, ops, ctx);
 }
 
+error_t wifi_set_promiscuous(struct Device* device, bool enable) {
+    auto* api = WIFI_API(device);
+    if (api->set_promiscuous == nullptr) return ERROR_NOT_SUPPORTED;
+    return api->set_promiscuous(device, enable);
+}
+
+error_t wifi_get_promiscuous(struct Device* device, bool* enabled) {
+    auto* api = WIFI_API(device);
+    if (api->get_promiscuous == nullptr) return ERROR_NOT_SUPPORTED;
+    return api->get_promiscuous(device, enabled);
+}
+
+error_t wifi_set_promiscuous_callback(struct Device* device, WifiPromiscuousCallback callback, void* context) {
+    auto* api = WIFI_API(device);
+    if (api->set_promiscuous_callback == nullptr) return ERROR_NOT_SUPPORTED;
+    return api->set_promiscuous_callback(device, callback, context);
+}
+
 const struct DeviceType WIFI_TYPE = {
     .name = "wifi"
 };

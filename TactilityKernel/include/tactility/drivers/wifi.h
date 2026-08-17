@@ -92,6 +92,37 @@ struct WifiEvent {
 
 typedef void (*WifiEventCallback)(struct Device* device, void* callback_context, struct WifiEvent event);
 
+/** Packet types that can be captured in promiscuous mode. */
+enum WifiPromiscuousPacketType {
+    WIFI_PROMISCUOUS_PACKET_TYPE_MGMT  = 0, /**< Management frames */
+    WIFI_PROMISCUOUS_PACKET_TYPE_CTRL  = 1, /**< Control frames */
+    WIFI_PROMISCUOUS_PACKET_TYPE_DATA  = 2, /**< Data frames */
+    WIFI_PROMISCUOUS_PACKET_TYPE_MISC  = 3, /**< Other/unclassified */
+};
+
+/** Metadata delivered with each promiscuous-mode packet. */
+struct WifiPromiscuousPacketInfo {
+    int8_t  rssi;           /**< Signal strength in dBm */
+    uint8_t channel;        /**< Received on channel */
+    enum WifiPromiscuousPacketType type; /**< 802.11 frame class */
+};
+
+/**
+ * Callback invoked for every raw 802.11 frame captured in promiscuous mode.
+ * @param[in] context  User-supplied pointer passed to set_promiscuous.
+ * @param[in] payload  Raw frame bytes (header + body; no FCS).
+ * @param[in] length   Byte length of @p payload.
+ * @param[in] info     Per-packet metadata (RSSI, channel, frame type).
+ *
+ * Called from an ESP-IDF Wi-Fi task — keep the handler short and non-blocking.
+ */
+typedef void (*WifiPromiscuousCallback)(
+    void* context,
+    const uint8_t* payload,
+    size_t length,
+    struct WifiPromiscuousPacketInfo info
+);
+
 struct WifiApi {
     /**
      * Get the radio state of the device.
@@ -206,6 +237,35 @@ struct WifiApi {
      * co-processor (ops is left untouched in that case)
      */
     error_t (*get_firmware_ops)(struct Device* device, const struct FirmwareOps** ops, void** ctx);
+
+    /**
+     * Enable or disable promiscuous (monitor) mode.
+     * When enabled, the driver captures all 802.11 frames on the current channel and
+     * delivers them to the callback registered via set_promiscuous_callback.
+     * The radio must be on (WIFI_RADIO_STATE_ON) before calling this.
+     * @param[in] device   the wifi device
+     * @param[in] enable   true to enable, false to disable
+     * @return ERROR_NONE on success, ERROR_NOT_SUPPORTED if unavailable
+     */
+    error_t (*set_promiscuous)(struct Device* device, bool enable);
+
+    /**
+     * Query whether promiscuous mode is currently active.
+     * @param[in]  device  the wifi device
+     * @param[out] enabled set to true if promiscuous mode is on
+     * @return ERROR_NONE on success
+     */
+    error_t (*get_promiscuous)(struct Device* device, bool* enabled);
+
+    /**
+     * Register a raw-frame callback for promiscuous mode.
+     * Pass NULL to clear the callback.
+     * @param[in] device    the wifi device
+     * @param[in] callback  function called for each captured frame, or NULL to clear
+     * @param[in] context   opaque pointer forwarded to every callback invocation
+     * @return ERROR_NONE on success
+     */
+    error_t (*set_promiscuous_callback)(struct Device* device, WifiPromiscuousCallback callback, void* context);
 };
 
 extern const struct DeviceType WIFI_TYPE;
@@ -227,6 +287,9 @@ error_t wifi_station_get_rssi(struct Device* device, int32_t* rssi);
 error_t wifi_add_event_callback(struct Device* device, void* callback_context, WifiEventCallback callback);
 error_t wifi_remove_event_callback(struct Device* device, WifiEventCallback callback);
 error_t wifi_get_firmware_ops(struct Device* device, const struct FirmwareOps** ops, void** ctx);
+error_t wifi_set_promiscuous(struct Device* device, bool enable);
+error_t wifi_get_promiscuous(struct Device* device, bool* enabled);
+error_t wifi_set_promiscuous_callback(struct Device* device, WifiPromiscuousCallback callback, void* context);
 
 #ifdef __cplusplus
 }

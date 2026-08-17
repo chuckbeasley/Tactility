@@ -16,6 +16,7 @@
 #include <Tactility/Tactility.h>
 
 #include <tactility/check.h>
+#include <format>
 #include <tactility/device.h>
 #include <tactility/drivers/usb_host_msc.h>
 #include <tactility/filesystem/file_mutex.h>

@@ -13,7 +13,7 @@ list(APPEND PRIV_REQUIRES_LIST
 )
 
 if (DEFINED ENV{ESP_IDF_VERSION})
-    list(APPEND PRIV_REQUIRES_LIST elf_loader)
+    list(APPEND PRIV_REQUIRES_LIST elf_loader esp_driver_i2s esp_driver_ledc)
 endif ()
 
 if (IDF_TARGET STREQUAL "esp32p4")

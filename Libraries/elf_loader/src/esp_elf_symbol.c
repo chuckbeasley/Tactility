@@ -9,7 +9,6 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
-#include <reent.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <getopt.h>
@@ -84,15 +83,6 @@ static const struct esp_elfsym g_esp_libc_elfsyms[] = {
     ESP_ELFSYM_EXPORT(pthread_join),
     ESP_ELFSYM_EXPORT(pthread_exit),
 
-    /* newlib */
-
-    ESP_ELFSYM_EXPORT(__errno),
-    ESP_ELFSYM_EXPORT(__getreent),
-#ifdef __HAVE_LOCALE_INFO__
-    ESP_ELFSYM_EXPORT(__locale_ctype_ptr),
-#else
-    ESP_ELFSYM_EXPORT(_ctype_),
-#endif
 
     /* math */
 
