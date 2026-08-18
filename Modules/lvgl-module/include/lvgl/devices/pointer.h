@@ -27,15 +27,17 @@ extern "C" {
  * @brief Linear per-axis calibration range for raw pointer coordinates.
  *
  * Values are the raw (pre-calibration) coordinates that should map to the display's
- * [0, hor_res-1] / [0, ver_res-1] range. Corrects scale+offset error only; axis
- * swap/mirror is handled separately by PointerApi and applied by the driver before
- * lvgl_pointer_read_cb() sees the coordinates.
+ * [0, hor_res-1] / [0, ver_res-1] range, with optional rotate/invert flags matching
+ * TFT_eSPI Touch_calibrate semantics.
  */
 struct LvglPointerCalibration {
     int32_t x_min;
     int32_t x_max;
     int32_t y_min;
     int32_t y_max;
+    bool rotate_xy;
+    bool invert_x;
+    bool invert_y;
 };
 
 /**

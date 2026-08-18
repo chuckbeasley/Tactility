@@ -42,6 +42,11 @@ public:
         lock.lock();
         return apRecords;
     }
+    size_t getApRecordCount() const {
+        auto lock = mutex.asScopedLock();
+        lock.lock();
+        return apRecords.size();
+    }
 
     void setConnectSsid(const std::string& ssid);
     std::string getConnectSsid() const;

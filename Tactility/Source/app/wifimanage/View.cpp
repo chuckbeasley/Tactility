@@ -1,6 +1,6 @@
-#include <format>
 #include <string>
-#include <set>
+#include <cstdio>
+#include <cstring>
 
 #include <Tactility/network/HttpdReq.h>
 #include <Tactility/app/wifimanage/View.h>
@@ -20,6 +20,7 @@
 namespace tt::app::wifimanage {
 
 constexpr auto* TAG = "WifiManageView";
+static constexpr size_t WIFI_LIST_PAGE_SIZE = 8;
 
 static void onBackPressed(lv_event_t* event) {
     auto* appInstanceId = static_cast<uint32_t*>(lv_event_get_user_data(event));
@@ -113,21 +114,26 @@ void View::showDetails(lv_event_t* event) {
     }
 }
 
+void View::onShowMoreClicked(lv_event_t* event) {
+    auto* self = static_cast<View*>(lv_event_get_user_data(event));
+    self->visibleNetworksLimit += WIFI_LIST_PAGE_SIZE;
+    self->updateNetworkList();
+    self->updateConnectToHidden();
+}
+
 void View::createSsidListItem(const WifiApRecord& record, bool isConnecting, size_t index) {
     if (isConnecting) {
         auto* button = lv_list_add_button(networks_list, LV_SYMBOL_WIFI, record.ssid);
         lv_obj_add_event_cb(button, showDetails, LV_EVENT_SHORT_CLICKED, this);
     } else {
-        const std::string auth_info = (record.authentication_type == WIFI_AUTHENTICATION_TYPE_OPEN) ? "(open) " : " ";
+        const char* auth_info = (record.authentication_type == WIFI_AUTHENTICATION_TYPE_OPEN) ? "(open) " : "";
         const auto percentage = mapRssiToPercentage(record.rssi);
-        const auto label = std::format("{} {}{}%", std::string(record.ssid), auth_info, percentage);
-        auto* button = lv_list_add_button(networks_list, nullptr, label.c_str());
+        char label[96];
+        std::snprintf(label, sizeof(label), "%s %s%u%%", record.ssid, auth_info, percentage);
+        auto* button = lv_list_add_button(networks_list, nullptr, label);
         lv_obj_set_user_data(button, reinterpret_cast<void*>(index));
-        if (service::wifi::settings::contains(record.ssid)) {
-            lv_obj_add_event_cb(button, showDetails, LV_EVENT_SHORT_CLICKED, this);
-        } else {
-            lv_obj_add_event_cb(button, connect, LV_EVENT_SHORT_CLICKED, this);
-        }
+        // Avoid filesystem checks in the LVGL render path; onConnect handles known/unknown SSIDs.
+        lv_obj_add_event_cb(button, connect, LV_EVENT_SHORT_CLICKED, this);
     }
 }
 
@@ -185,43 +191,70 @@ void View::updateNetworkList() {
         case On:
         case ConnectionPending:
         case ConnectionActive: {
+            const auto ui_radio_state = state->getRadioState();
+            const std::string connection_target = service::wifi::getConnectionTarget();
+            const bool is_connected = !connection_target.empty() && ui_radio_state == ConnectionActive;
+            const bool is_connecting_state = ui_radio_state == ConnectionPending && !connection_target.empty();
 
-            std::string connection_target = service::wifi::getConnectionTarget();
-
-            // Make safe copy
-            auto ap_records = state->getApRecords();
-
-            bool is_connected = !connection_target.empty() &&
-                state->getRadioState() == ConnectionActive;
             bool added_connected = false;
-            if (is_connected && !ap_records.empty()) {
-                for (int i = 0; i < ap_records.size(); ++i) {
-                    auto& record = ap_records[i];
-                    if (record.ssid == connection_target) {
-                        lv_list_add_text(networks_list, "Connected");
-                        createSsidListItem(record, false, i);
-                        added_connected = true;
-                        break;
+            bool has_records = false;
+            size_t shown_networks = 0;
+            bool truncated = false;
+
+            state->withApRecords([&](const std::vector<WifiApRecord>& ap_records) {
+                has_records = !ap_records.empty();
+                if (!has_records) {
+                    return;
+                }
+
+                if (is_connected) {
+                    for (size_t i = 0; i < ap_records.size(); ++i) {
+                        const auto& record = ap_records[i];
+                        if (record.ssid == connection_target) {
+                            lv_list_add_text(networks_list, "Connected");
+                            createSsidListItem(record, false, i);
+                            added_connected = true;
+                            break;
+                        }
                     }
                 }
-            }
 
-            lv_list_add_text(networks_list, "Other networks");
-            std::set<std::string> used_ssids;
-            if (!ap_records.empty()) {
-                for (int i = 0; i < ap_records.size(); ++i) {
-                    auto& record = ap_records[i];
-                    if (!used_ssids.contains(record.ssid)) {
-                        bool connection_target_match = (record.ssid == connection_target);
-                        bool is_connecting = connection_target_match
-                            && state->getRadioState() == ConnectionPending &&
-                            !connection_target.empty();
-                        bool skip = connection_target_match && added_connected;
-                        if (!skip) {
-                            createSsidListItem(record, is_connecting, i);
+                lv_list_add_text(networks_list, "Other networks");
+                for (size_t i = 0; i < ap_records.size(); ++i) {
+                    const auto& record = ap_records[i];
+
+                    // De-duplicate SSIDs without heap allocations.
+                    bool seen = false;
+                    for (size_t j = 0; j < i; ++j) {
+                        if (std::strcmp(ap_records[j].ssid, record.ssid) == 0) {
+                            seen = true;
+                            break;
                         }
-                        used_ssids.insert(record.ssid);
                     }
+                    if (seen) {
+                        continue;
+                    }
+
+                    const bool connection_target_match = (record.ssid == connection_target);
+                    const bool is_connecting = connection_target_match && is_connecting_state;
+                    const bool skip = connection_target_match && added_connected;
+                    if (skip) {
+                        continue;
+                    }
+
+                    if (shown_networks >= visibleNetworksLimit) {
+                        truncated = true;
+                        break;
+                    }
+                    createSsidListItem(record, is_connecting, i);
+                    shown_networks++;
+                }
+            });
+
+            if (has_records) {
+                if (truncated) {
+                    auto* show_more = lv_list_add_button(networks_list, nullptr, "Show more networks");
+                    lv_obj_add_event_cb(show_more, onShowMoreClicked, LV_EVENT_SHORT_CLICKED, this);
                 }
                 lv_obj_clear_flag(networks_list, LV_OBJ_FLAG_HIDDEN);
             } else if (!state->hasScannedAfterRadioOn() || state->isScanning()) {
@@ -299,6 +332,7 @@ void View::updateEnableOnBootToggle() {
 
 void View::init(uint32_t newAppInstanceId, lv_obj_t* parent) {
     appInstanceId = newAppInstanceId;
+    visibleNetworksLimit = WIFI_LIST_PAGE_SIZE;
 
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
@@ -327,10 +361,27 @@ void View::update() {
         // Buried (or not yet built) - see reset().
         return;
     }
+    auto current_radio = state->getRadioState();
+    auto current_scanning = state->isScanning();
+    auto current_ap_count = state->getApRecordCount();
+    auto current_connection_target = service::wifi::getConnectionTarget();
+
     updateWifiToggle();
     updateScanning();
-    updateNetworkList();
-    updateConnectToHidden();
+
+    const bool list_changed = !hasRenderedList ||
+        current_radio != lastListRadioState ||
+        current_ap_count != lastApCount ||
+        current_connection_target != lastConnectionTarget;
+    if (list_changed) {
+        updateNetworkList();
+        updateConnectToHidden();
+        hasRenderedList = true;
+        lastListRadioState = current_radio;
+        lastListScanning = current_scanning;
+        lastApCount = current_ap_count;
+        lastConnectionTarget = current_connection_target;
+    }
 }
 
 void View::reset() {
@@ -340,6 +391,9 @@ void View::reset() {
     scanning_spinner = nullptr;
     networks_list = nullptr;
     connect_to_hidden = nullptr;
+    visibleNetworksLimit = WIFI_LIST_PAGE_SIZE;
+    hasRenderedList = false;
+    lastConnectionTarget.clear();
 }
 
 } // namespace

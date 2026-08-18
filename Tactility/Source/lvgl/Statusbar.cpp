@@ -16,6 +16,7 @@
 #include <lvgl/fonts.h>
 #include <lvgl/lvgl.h>
 
+#include <algorithm>
 #include <memory>
 
 namespace tt::lvgl {
@@ -292,8 +293,9 @@ void statusbar_icon_set_visibility(int8_t id, bool visible) {
 
 int statusbar_get_height() {
     const auto icon_size = lvgl_get_statusbar_icon_font_height();
-    const auto vertical_padding = static_cast<uint32_t>((static_cast<float>(icon_size) * 0.1f));
-    return icon_size + (2 * vertical_padding);
+    const auto vertical_padding = static_cast<uint32_t>((static_cast<float>(icon_size) * 0.35f));
+    const int calculated = icon_size + (2 * vertical_padding);
+    return std::max(calculated, 20);
 }
 
 } // namespace

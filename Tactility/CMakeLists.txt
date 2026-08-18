@@ -24,6 +24,7 @@ if (DEFINED ENV{ESP_IDF_VERSION})
     list(APPEND REQUIRES_LIST
         app-esp32-module
         platform-esp32
+        xpt2046-softspi-module
         driver
         elf_loader
         QRCode

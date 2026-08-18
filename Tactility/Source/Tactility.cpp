@@ -399,6 +399,10 @@ static lv_obj_t* windowManagerScreenInit(lv_obj_t* root) {
 // Applies the calibration persisted by the touch calibration app to the live pointer indev.
 // lvgl_devices_attach() runs before onLvglStarted(), so the default indev already exists here.
 static void applySavedTouchCalibration() {
+    if (settings::touch::shouldRunCalibration()) {
+        return;
+    }
+
     settings::touch::TouchCalibrationSettings settings = settings::touch::loadOrGetDefault();
     if (!settings.enabled || !settings::touch::isValid(settings)) {
         return;
@@ -409,6 +413,9 @@ static void applySavedTouchCalibration() {
         .x_max = settings.xMax,
         .y_min = settings.yMin,
         .y_max = settings.yMax,
+        .rotate_xy = settings.rotateXy,
+        .invert_x = settings.invertX,
+        .invert_y = settings.invertY,
     };
 
     lvgl_lock();

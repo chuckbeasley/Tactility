@@ -19,11 +19,13 @@
 #include <lvgl/fonts.h>
 #include <lvgl/widgets/toolbar.h>
 
+#include <inttypes.h>
 #include <memory>
 
 namespace tt::app::timezone {
 
 constexpr auto* TAG = "TimeZone";
+static constexpr uint32_t TIMEZONE_LIST_MAX_ITEMS = 25;
 
 extern const ::AppManifest manifest;
 
@@ -38,6 +40,8 @@ struct Context {
     uint32_t appInstanceId;
     Mutex mutex;
     std::vector<TimeZoneEntry> entries;
+    std::string lastFilter;
+    bool hasLoadedFilter = false;
     std::unique_ptr<Timer> updateTimer;
     lv_obj_t* listWidget = nullptr;
     lv_obj_t* filterTextareaWidget = nullptr;
@@ -80,13 +84,14 @@ void onTextareaValueChanged(lv_event_t* e) {
     }
 }
 
-void createListItem(Context* ctx, lv_obj_t* list, const std::string& title, size_t index) {
-    auto* btn = lv_list_add_button(list, nullptr, title.c_str());
+void createListItem(Context* ctx, lv_obj_t* list, const TimeZoneEntry& entry) {
+    auto* btn = lv_list_add_button(list, nullptr, entry.name.c_str());
     struct ButtonContext {
         Context* ctx;
-        size_t index;
+        std::string name;
+        std::string code;
     };
-    auto* buttonCtx = new ButtonContext { ctx, index };
+    auto* buttonCtx = new ButtonContext { ctx, entry.name, entry.code };
     lv_obj_add_event_cb(btn, [](lv_event_t* e) {
         auto* buttonCtx = static_cast<ButtonContext*>(lv_event_get_user_data(e));
         delete buttonCtx;
@@ -94,17 +99,14 @@ void createListItem(Context* ctx, lv_obj_t* list, const std::string& title, size
     lv_obj_add_event_cb(btn, [](lv_event_t* e) {
         auto* buttonCtx = static_cast<ButtonContext*>(lv_event_get_user_data(e));
         auto* ctx = buttonCtx->ctx;
-        auto index = buttonCtx->index;
-        LOG_I(TAG, "Selected item at index %d", (int)index);
-
-        auto& entry = ctx->entries[index];
+        LOG_I(TAG, "Selected time zone: %s", buttonCtx->name.c_str());
 
         if (ctx->saveTimeZone) {
-            settings::setTimeZone(entry.name, entry.code);
+            settings::setTimeZone(buttonCtx->name, buttonCtx->code);
         }
 
-        lastName = entry.name;
-        lastCode = entry.code;
+        lastName = buttonCtx->name;
+        lastCode = buttonCtx->code;
 
         ctx->result = 0; // Ok
         AppEvent closeEvent { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
@@ -131,13 +133,13 @@ void readTimeZones(Context* ctx, std::string filter) {
                 new_entries.push_back({.name = name, .code = code});
 
                 // Safety guard
-                if (count > 50) {
+                if (count >= TIMEZONE_LIST_MAX_ITEMS) {
                     // TODO: Show warning that we're not displaying a complete list
                     break;
                 }
             }
         } else {
-            LOG_E(TAG, "Parse error at line %llu", count);
+            LOG_E(TAG, "Parse error at line %" PRIu32, count);
         }
     }
 
@@ -150,30 +152,44 @@ void readTimeZones(Context* ctx, std::string filter) {
         LOG_E(TAG, LOG_MESSAGE_MUTEX_LOCK_FAILED);
     }
 
-    LOG_I(TAG, "Processed %llu entries", count);
+    LOG_I(TAG, "Processed %" PRIu32 " entries", count);
 }
 
 void updateList(Context* ctx) {
+    std::string filter;
     if (lvgl_try_lock(200 / portTICK_PERIOD_MS)) {
-        std::string filter = string::lowercase(std::string(lv_textarea_get_text(ctx->filterTextareaWidget)));
+        filter = string::lowercase(std::string(lv_textarea_get_text(ctx->filterTextareaWidget)));
         lvgl_unlock();
-        readTimeZones(ctx, filter);
     } else {
         LOG_E(TAG, LOG_MESSAGE_MUTEX_LOCK_FAILED_FMT, "TimeZone LVGL");
         return;
     }
 
-    if (lvgl_try_lock(200 / portTICK_PERIOD_MS)) {
-        if (ctx->mutex.lock(100 / portTICK_PERIOD_MS)) {
-            lv_obj_clean(ctx->listWidget);
-
-            uint32_t index = 0;
-            for (auto& entry : ctx->entries) {
-                createListItem(ctx, ctx->listWidget, entry.name, index);
-                index++;
-            }
-
+    if (ctx->mutex.lock(100 / portTICK_PERIOD_MS)) {
+        if (ctx->hasLoadedFilter && ctx->lastFilter == filter) {
             ctx->mutex.unlock();
+            return;
+        }
+        ctx->mutex.unlock();
+    }
+
+    readTimeZones(ctx, filter);
+
+    std::vector<TimeZoneEntry> entries_snapshot;
+    if (ctx->mutex.lock(100 / portTICK_PERIOD_MS)) {
+        entries_snapshot = ctx->entries;
+        ctx->lastFilter = filter;
+        ctx->hasLoadedFilter = true;
+        ctx->mutex.unlock();
+    } else {
+        LOG_E(TAG, LOG_MESSAGE_MUTEX_LOCK_FAILED);
+        return;
+    }
+
+    if (lvgl_try_lock(200 / portTICK_PERIOD_MS)) {
+        lv_obj_clean(ctx->listWidget);
+        for (const auto& entry : entries_snapshot) {
+            createListItem(ctx, ctx->listWidget, entry);
         }
 
         lvgl_unlock();

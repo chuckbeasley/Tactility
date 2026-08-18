@@ -3,6 +3,7 @@
 
 #include <Tactility/app/wifiapsettings/WifiApSettings.h>
 #include <Tactility/app/wificonnect/WifiConnect.h>
+#include <Tactility/settings/TouchCalibrationSettings.h>
 
 #include <app/event.h>
 #include <app/manager.h>
@@ -14,6 +15,10 @@
 
 #include <lvgl/lvgl.h>
 
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+#include <Tactility/app/touchcalibration/TouchCalibration.h>
+#endif
+
 namespace tt::app::wifimanage {
 
 constexpr auto* TAG = "WifiManage";
@@ -24,6 +29,7 @@ namespace {
 
 struct Context {
     uint32_t appInstanceId;
+    uint32_t pendingCalibrationDialogId = 0;
     PubSub<service::wifi::WifiEvent>::SubscriptionHandle wifiSubscription = nullptr;
     Mutex mutex;
     Bindings bindings {};
@@ -33,7 +39,6 @@ struct Context {
     void lock() { mutex.lock(); }
     void unlock() { mutex.unlock(); }
 };
-
 
 static void onConnect(const std::string& ssid) {
     service::wifi::settings::WifiApSettings settings;
@@ -63,37 +68,47 @@ static void onConnectToHidden() {
 }
 
 void requestViewUpdate(Context* ctx) {
-    ctx->lock();
     lvgl_lock();
+    ctx->lock();
     // Safe even while buried (e.g. WifiApSettings/WifiConnect opened on top): destroyWidgets()
     // nulls the view's widget pointers before they're deleted, and update() no-ops on that.
     ctx->view.update();
-    lvgl_unlock();
     ctx->unlock();
+    lvgl_unlock();
 }
 
 void onWifiEvent(Context* ctx, service::wifi::WifiEvent event) {
+    bool should_update_view = false;
     auto radio_state = service::wifi::getRadioState();
     LOG_I(TAG, "Update with state %s", service::wifi::radioStateToString(radio_state));
     ctx->state.setRadioState(radio_state);
     switch (event.type) {
         case WIFI_EVENT_TYPE_SCAN_STARTED:
             ctx->state.setScanning(true);
+            should_update_view = true;
             break;
         case WIFI_EVENT_TYPE_SCAN_FINISHED:
             ctx->state.setScanning(false);
             ctx->state.updateApRecords();
+            should_update_view = true;
             break;
         case WIFI_EVENT_TYPE_RADIO_STATE_CHANGED:
             if (event.radio_state == WIFI_RADIO_STATE_ON && !service::wifi::isScanning()) {
                 service::wifi::scan();
             }
+            should_update_view = true;
+            break;
+        case WIFI_EVENT_TYPE_STATION_STATE_CHANGED:
+        case WIFI_EVENT_TYPE_STATION_CONNECTION_RESULT:
+            should_update_view = true;
             break;
         default:
             break;
     }
 
-    requestViewUpdate(ctx);
+    if (should_update_view) {
+        requestViewUpdate(ctx);
+    }
 }
 
 void createWidgets(lv_obj_t* parent, void* userData) {
@@ -137,6 +152,13 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     app_event_subscribe(&sub);
 
     WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
+    service::wifi::setAutoScanPaused(true);
+
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+    if (settings::touch::shouldRunCalibration()) {
+        ctx.pendingCalibrationDialogId = touchcalibration::start(appInstanceId);
+    }
+#endif
 
     service::wifi::RadioState radio_state = service::wifi::getRadioState();
     bool can_scan = radio_state == service::wifi::RadioState::On ||
@@ -148,10 +170,6 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
         (int)service::wifi::isScanning(),
         connection_target.empty() ? "(none)" : connection_target.c_str(),
         (int)can_scan);
-    if (can_scan && !service::wifi::isScanning()) {
-        service::wifi::scan();
-    }
-
     bool shouldClose = false;
     while (!shouldClose) {
         AppEvent event {};
@@ -163,6 +181,12 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
                 app_manager_finish(appInstanceId);
                 shouldClose = true;
                 break;
+            case APP_EVENT_RESULT:
+                if (event.result.launch_id == ctx.pendingCalibrationDialogId) {
+                    ctx.pendingCalibrationDialogId = 0;
+                }
+                app_manager_stop(event.result.launch_id);
+                break;
             default:
                 break;
         }
@@ -172,6 +196,7 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     service::wifi::getPubsub()->unsubscribe(ctx.wifiSubscription);
     ctx.wifiSubscription = nullptr;
     ctx.unlock();
+    service::wifi::setAutoScanPaused(false);
 
     window_manager_remove(window);
     app_event_unsubscribe(&sub);

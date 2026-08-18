@@ -5,6 +5,7 @@
 #include <Tactility/app/wifimanage/WifiManage.h>
 #include <Tactility/file/File.h>
 #include <Tactility/service/wifi/Wifi.h>
+#include <Tactility/settings/TouchCalibrationSettings.h>
 
 #include <app/event.h>
 #include <app/manager.h>
@@ -26,7 +27,7 @@
 #include <sdkconfig.h>
 #endif
 
-#ifdef CONFIG_TT_TOUCH_CALIBRATION_REQUIRED
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
 #include <Tactility/app/touchcalibration/TouchCalibration.h>
 #endif
 
@@ -206,11 +207,16 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     Context ctx {};
     ctx.appInstanceId = appInstanceId;
     ctx.steps = {
-#if defined(CONFIG_TT_TOUCH_CALIBRATION_REQUIRED)
-        {
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+        // Run calibration whenever there's no valid saved calibration so touch aligns before setup actions.
+        settings::touch::shouldRunCalibration() ? StepConfiguration {
             .title = "Touch Calibration",
             .description = "Let's calibrate the touch screen.",
             .run = [&ctx] { ctx.pendingStepDialogId = touchcalibration::start(ctx.appInstanceId); }
+        } : StepConfiguration {
+            .title = "",
+            .description = "",
+            .run = [] {}
         },
 #endif
         {
@@ -227,6 +233,12 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
             }
         }
     };
+
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+    if (!ctx.steps.empty() && ctx.steps.front().title.empty()) {
+        ctx.steps.erase(ctx.steps.begin());
+    }
+#endif
 
     AppEventSubscription sub {};
     sub.app_instance_id = appInstanceId;

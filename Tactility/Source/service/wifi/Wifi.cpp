@@ -22,6 +22,10 @@
 #include <algorithm>
 #include <atomic>
 
+#ifdef ESP_PLATFORM
+#include <esp_heap_caps.h>
+#endif
+
 namespace tt::service::wifi {
 
 constexpr auto* TAG = "WifiService";
@@ -129,6 +133,10 @@ void dispatchSetEnabled(bool enabled) {
     if (enabled) {
         publishRadioState(WIFI_RADIO_STATE_ON_PENDING);
 
+#ifdef ESP_PLATFORM
+        LOG_I(TAG, "WiFi init headroom: internal_free=%u internal_largest=%u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+#endif
         if (device_start(state.device) != ERROR_NONE) {
             LOG_E(TAG, "Failed to start WiFi device");
             publishRadioState(WIFI_RADIO_STATE_OFF);

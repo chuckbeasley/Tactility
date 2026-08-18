@@ -19,14 +19,24 @@
 #include <tactility/log.h>
 
 #include <Tactility/app/setup/Setup.h>
+#include <Tactility/settings/TouchCalibrationSettings.h>
 #include <Tactility/settings/BootSettings.h>
 #include <Tactility/Tactility.h>
+
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+#include <Tactility/app/touchcalibration/TouchCalibration.h>
+#endif
 
 namespace tt::app::launcher {
 
 constexpr auto* TAG = "Launcher";
+constexpr int32_t ICON_BUTTON_HIT_SLOP = 14;
 
 namespace {
+
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+uint32_t pendingCalibrationDialogId = 0;
+#endif
 
 uint32_t getButtonPadding(UiDensity density, uint32_t buttonSize) {
     if (density == LVGL_UI_DENSITY_COMPACT) {
@@ -51,6 +61,7 @@ lv_obj_t* createAppButton(lv_obj_t* parent, UiDensity uiDensity, const char* ima
     const auto button_size = lvgl_get_launcher_icon_font_height();
     const auto button_padding = getButtonPadding(uiDensity, button_size);
     auto* apps_button = lv_button_create(parent);
+    lv_obj_set_ext_click_area(apps_button, ICON_BUTTON_HIT_SLOP);
 
     lv_obj_set_style_pad_all(apps_button, static_cast<int32_t>(button_padding), LV_STATE_DEFAULT);
     if (isLandscape) {
@@ -182,6 +193,7 @@ void createWidgets(lv_obj_t* parent, void*) {
     // button stays in the launcher; the confirmation flow lives in the PowerOff app.
     if (shouldShowPowerButton()) {
         auto* power_button = lv_button_create(parent);
+        lv_obj_set_ext_click_area(power_button, ICON_BUTTON_HIT_SLOP);
         lv_obj_set_style_pad_all(power_button, 8, 0);
         lv_obj_align(power_button, LV_ALIGN_BOTTOM_MID, 0, -10);
         lv_obj_add_event_cb(power_button, onAppPressed, LV_EVENT_SHORT_CLICKED, (void*)"PowerOff");
@@ -203,7 +215,14 @@ void createWidgets(lv_obj_t* parent, void*) {
     }
 }
 
-void runAutoStart() {
+void runAutoStart(uint32_t appInstanceId) {
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+    if (pendingCalibrationDialogId == 0 && settings::touch::shouldRunCalibration()) {
+        pendingCalibrationDialogId = touchcalibration::start(appInstanceId);
+        return;
+    }
+#endif
+
     settings::BootSettings boot_properties;
     AppManifest manifest;
     if (
@@ -232,13 +251,12 @@ void runAutoStart() {
 }
 
 int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
-    runAutoStart();
-
     AppEventSubscription sub {};
     sub.app_instance_id = appInstanceId;
     app_event_subscribe(&sub);
 
     WindowId window = window_manager_create(appInstanceId, createWidgets, nullptr);
+    runAutoStart(appInstanceId);
 
     // The launcher is meant to stay resident (it's the home screen) - it only gives up its
     // thread when app-module's scheduler asks it to (e.g. another new-model app is started).
@@ -247,8 +265,23 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
         if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
             break;
         }
+        switch (event.type) {
+            case APP_EVENT_CLOSE:
+                app_manager_finish(appInstanceId);
+                break;
+            case APP_EVENT_RESULT:
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+                if (event.result.launch_id == pendingCalibrationDialogId) {
+                    pendingCalibrationDialogId = 0;
+                    runAutoStart(appInstanceId);
+                }
+#endif
+                app_manager_stop(event.result.launch_id);
+                break;
+            default:
+                break;
+        }
         if (event.type == APP_EVENT_CLOSE) {
-            app_manager_finish(appInstanceId);
             break;
         }
     }

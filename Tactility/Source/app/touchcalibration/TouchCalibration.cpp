@@ -12,11 +12,15 @@
 #include <lvgl_window_manager/window_manager.h>
 
 #include <tactility/log.h>
+#include <tactility/device.h>
+#include <tactility/drivers/pointer.h>
+#include <drivers/xpt2046_softspi.h>
 #include <lvgl/lvgl.h>
 #include <lvgl/devices/pointer.h>
 
 #include <algorithm>
 #include <lvgl.h>
+#include <tactility/error.h>
 
 namespace tt::app::touchcalibration {
 
@@ -26,7 +30,16 @@ extern const ::AppManifest manifest;
 
 namespace {
 
-constexpr int32_t TARGET_MARGIN = 24;
+// Touch_Calibrate assumes corner samples are taken near the true display corners.
+// Keep this tight to avoid shrinking the measured span (which biases bottom/right inward).
+constexpr int32_t TARGET_MARGIN = 6;
+constexpr int32_t TARGET_SIZE = 28;
+constexpr int32_t TARGET_HALF = TARGET_SIZE / 2;
+constexpr int32_t TARGET_SAFE_INSET = 36;
+constexpr uint8_t RAW_SAMPLE_COUNT = 8;
+constexpr TickType_t RAW_SAMPLE_ATTEMPT_TIMEOUT = pdMS_TO_TICKS(12);
+constexpr TickType_t RAW_SAMPLE_CAPTURE_WINDOW = pdMS_TO_TICKS(350);
+constexpr uint16_t CALIBRATION_TOUCH_THRESHOLD = 175; // Touch_Calibrate uses Z_THRESHOLD/2
 
 struct Sample {
     uint16_t x;
@@ -37,6 +50,7 @@ struct Context {
     uint32_t appInstanceId;
 
     Sample samples[4] = {};
+    lv_point_t targetScreenPoints[4] = {};
     uint8_t sampleCount = 0;
     bool calibrationApplied = false;
 
@@ -44,20 +58,133 @@ struct Context {
     lv_obj_t* target = nullptr;
     lv_obj_t* titleLabel = nullptr;
     lv_obj_t* hintLabel = nullptr;
+    bool touchLatch = false;
 };
+
+lv_point_t getTargetPoint(uint8_t index, lv_coord_t width, lv_coord_t height);
+
+static bool readRawTouchPoint(lv_point_t* outPoint) {
+    Device* pointerDevice = nullptr;
+    if (device_get_first_by_type(&POINTER_TYPE, &pointerDevice) != ERROR_NONE || pointerDevice == nullptr) {
+        return false;
+    }
+
+    bool touched = false;
+    if (pointer_read_data(pointerDevice, RAW_SAMPLE_ATTEMPT_TIMEOUT) == ERROR_NONE) {
+        uint16_t x = 0;
+        uint16_t y = 0;
+        uint8_t pointCount = 0;
+        touched = pointer_get_touched_points(pointerDevice, &x, &y, nullptr, &pointCount, 1) && pointCount > 0;
+        if (touched) {
+            outPoint->x = static_cast<lv_coord_t>(x);
+            outPoint->y = static_cast<lv_coord_t>(y);
+        }
+    }
+
+    device_put(pointerDevice);
+    return touched;
+}
+
+static bool captureStableRawSample(lv_point_t* outPoint) {
+    Device* pointerDevice = nullptr;
+    if (device_get_first_by_type(&POINTER_TYPE, &pointerDevice) != ERROR_NONE || pointerDevice == nullptr) {
+        return false;
+    }
+
+    int32_t sumX = 0;
+    int32_t sumY = 0;
+    uint8_t captured = 0;
+    const uint16_t thresholds[] = { CALIBRATION_TOUCH_THRESHOLD, 100, 60, 20 };
+    const TickType_t startTick = xTaskGetTickCount();
+
+    while (captured < RAW_SAMPLE_COUNT && (xTaskGetTickCount() - startTick) < RAW_SAMPLE_CAPTURE_WINDOW) {
+        bool accepted = false;
+        uint16_t x = 0;
+        uint16_t y = 0;
+        for (uint16_t threshold : thresholds) {
+            if (xpt2046_softspi_read_valid_touch(pointerDevice, &x, &y, threshold, RAW_SAMPLE_ATTEMPT_TIMEOUT) == ERROR_NONE) {
+                accepted = true;
+                break;
+            }
+        }
+        if (!accepted) {
+            if (pointer_read_data(pointerDevice, RAW_SAMPLE_ATTEMPT_TIMEOUT) == ERROR_NONE) {
+                uint8_t pointCount = 0;
+                accepted = pointer_get_touched_points(pointerDevice, &x, &y, nullptr, &pointCount, 1) && pointCount > 0;
+            }
+        }
+        if (!accepted) break;
+
+        sumX += x;
+        sumY += y;
+        captured++;
+    }
+
+    device_put(pointerDevice);
+
+    if (captured < 1) {
+        return false;
+    }
+
+    outPoint->x = static_cast<lv_coord_t>(sumX / captured);
+    outPoint->y = static_cast<lv_coord_t>(sumY / captured);
+    return true;
+}
 
 
 lv_point_t getTargetPoint(uint8_t index, lv_coord_t width, lv_coord_t height) {
+    const lv_coord_t left = std::max<lv_coord_t>(TARGET_MARGIN, TARGET_SAFE_INSET);
+    const lv_coord_t top = std::max<lv_coord_t>(TARGET_MARGIN, TARGET_SAFE_INSET);
+    const lv_coord_t right = std::max<lv_coord_t>(left, width - 1 - left);
+    const lv_coord_t bottom = std::max<lv_coord_t>(top, height - 1 - top);
+
     switch (index) {
         case 0:
-            return {.x = TARGET_MARGIN, .y = TARGET_MARGIN};
+            return {.x = left, .y = top};
         case 1:
-            return {.x = width - TARGET_MARGIN, .y = TARGET_MARGIN};
+            return {.x = left, .y = bottom};
         case 2:
-            return {.x = width - TARGET_MARGIN, .y = height - TARGET_MARGIN};
+            return {.x = right, .y = top};
         default:
-            return {.x = TARGET_MARGIN, .y = height - TARGET_MARGIN};
+            return {.x = right, .y = bottom};
     }
+}
+
+static bool solveAxisFromTargetPositions(
+    int32_t rawMin,
+    int32_t rawMax,
+    int32_t screenMin,
+    int32_t screenMax,
+    int32_t targetMax,
+    int32_t* outCalMin,
+    int32_t* outCalMax
+) {
+    if (outCalMin == nullptr || outCalMax == nullptr) {
+        return false;
+    }
+    if (rawMax <= rawMin || screenMax <= screenMin || targetMax <= 0) {
+        return false;
+    }
+
+    // Solve calibration-space min/max so:
+    // map(rawMin) == screenMin and map(rawMax) == screenMax
+    // for map(raw) = (raw - calMin) * targetMax / (calMax - calMin).
+    const int64_t rawSpan = (int64_t)rawMax - rawMin;
+    const int64_t screenSpan = (int64_t)screenMax - screenMin;
+    const int64_t calSpan = (rawSpan * targetMax) / screenSpan;
+    if (calSpan <= 0) {
+        return false;
+    }
+
+    const int64_t calMin = (int64_t)rawMin - ((int64_t)screenMin * calSpan) / targetMax;
+    const int64_t calMax = calMin + calSpan;
+    if (calMax <= calMin) {
+        return false;
+    }
+
+    *outCalMin = (int32_t)calMin;
+    *outCalMax = (int32_t)calMax;
+    return true;
 }
 
 void updateUi(Context* ctx) {
@@ -70,7 +197,7 @@ void updateUi(Context* ctx) {
 
     if (ctx->sampleCount < 4) {
         const auto point = getTargetPoint(ctx->sampleCount, width, height);
-        lv_obj_set_pos(ctx->target, point.x - 14, point.y - 14);
+        lv_obj_set_pos(ctx->target, point.x - TARGET_HALF, point.y - TARGET_HALF);
         lv_label_set_text(ctx->titleLabel, "Touchscreen Calibration");
         lv_label_set_text_fmt(ctx->hintLabel, "Tap target %u/4", static_cast<unsigned>(ctx->sampleCount + 1));
     }
@@ -79,32 +206,80 @@ void updateUi(Context* ctx) {
 // Drives the on-screen outcome text/state; the actual result (Ok/Error) is reported to the
 // caller from onPress() below, via ctx->calibrationApplied, once the user taps to dismiss.
 void finishCalibration(Context* ctx) {
-    const int32_t xLow = (static_cast<int32_t>(ctx->samples[0].x) + static_cast<int32_t>(ctx->samples[3].x)) / 2;
-    const int32_t xHigh = (static_cast<int32_t>(ctx->samples[1].x) + static_cast<int32_t>(ctx->samples[2].x)) / 2;
-    const int32_t yLow = (static_cast<int32_t>(ctx->samples[0].y) + static_cast<int32_t>(ctx->samples[1].y)) / 2;
-    const int32_t yHigh = (static_cast<int32_t>(ctx->samples[2].y) + static_cast<int32_t>(ctx->samples[3].y)) / 2;
+    // Full TFT_eSPI Touch_calibrate math port:
+    // sample order: up-left, bottom-left, up-right, bottom-right.
+    const int32_t values[8] = {
+        static_cast<int32_t>(ctx->samples[0].x), static_cast<int32_t>(ctx->samples[0].y),
+        static_cast<int32_t>(ctx->samples[1].x), static_cast<int32_t>(ctx->samples[1].y),
+        static_cast<int32_t>(ctx->samples[2].x), static_cast<int32_t>(ctx->samples[2].y),
+        static_cast<int32_t>(ctx->samples[3].x), static_cast<int32_t>(ctx->samples[3].y),
+    };
 
-    // Targets sit TARGET_MARGIN in from each edge (see getTargetPoint()), not at the screen
-    // edges themselves - xLow/xHigh/yLow/yHigh are raw samples at those inset positions, not
-    // at 0/width or 0/height. Extrapolate them out to the true edges so the saved range (which
-    // lvgl_pointer.h maps onto the full [0, resolution) display range) lines up correctly
-    // across the whole screen instead of being off by a margin's worth of scale and offset.
-    const auto width = lv_obj_get_content_width(ctx->root);
-    const auto height = lv_obj_get_content_height(ctx->root);
-    const int32_t xSpan = static_cast<int32_t>(width) - 2 * TARGET_MARGIN;
-    const int32_t ySpan = static_cast<int32_t>(height) - 2 * TARGET_MARGIN;
+    bool rotate_xy = false;
+    bool invert_x = false;
+    bool invert_y = false;
+    int32_t rawXMin = 0;
+    int32_t rawXMax = 0;
+    int32_t rawYMin = 0;
+    int32_t rawYMax = 0;
 
-    if (xSpan <= 0 || ySpan <= 0) {
+    if (std::abs(values[0] - values[2]) > std::abs(values[1] - values[3])) {
+        rotate_xy = true;
+        rawXMin = (values[1] + values[3]) / 2;
+        rawXMax = (values[5] + values[7]) / 2;
+        rawYMin = (values[0] + values[4]) / 2;
+        rawYMax = (values[2] + values[6]) / 2;
+    } else {
+        rotate_xy = false;
+        rawXMin = (values[0] + values[2]) / 2;
+        rawXMax = (values[4] + values[6]) / 2;
+        rawYMin = (values[1] + values[5]) / 2;
+        rawYMax = (values[3] + values[7]) / 2;
+    }
+
+    if (rawXMin > rawXMax) {
+        std::swap(rawXMin, rawXMax);
+        invert_x = true;
+    }
+    if (rawYMin > rawYMax) {
+        std::swap(rawYMin, rawYMax);
+        invert_y = true;
+    }
+
+    auto* display = lv_display_get_default();
+    const int32_t targetXMax = display != nullptr ? lv_display_get_horizontal_resolution(display) - 1 : 0;
+    const int32_t targetYMax = display != nullptr ? lv_display_get_vertical_resolution(display) - 1 : 0;
+
+    const int32_t screenXMin = (ctx->targetScreenPoints[0].x + ctx->targetScreenPoints[1].x) / 2;
+    const int32_t screenXMax = (ctx->targetScreenPoints[2].x + ctx->targetScreenPoints[3].x) / 2;
+    const int32_t screenYMin = (ctx->targetScreenPoints[0].y + ctx->targetScreenPoints[2].y) / 2;
+    const int32_t screenYMax = (ctx->targetScreenPoints[1].y + ctx->targetScreenPoints[3].y) / 2;
+
+    int32_t xSolveAtRawMin = invert_x ? screenXMax : screenXMin;
+    int32_t xSolveAtRawMax = invert_x ? screenXMin : screenXMax;
+    int32_t ySolveAtRawMin = invert_y ? screenYMax : screenYMin;
+    int32_t ySolveAtRawMax = invert_y ? screenYMin : screenYMax;
+    if (invert_x) {
+        xSolveAtRawMin = targetXMax - xSolveAtRawMin;
+        xSolveAtRawMax = targetXMax - xSolveAtRawMax;
+    }
+    if (invert_y) {
+        ySolveAtRawMin = targetYMax - ySolveAtRawMin;
+        ySolveAtRawMax = targetYMax - ySolveAtRawMax;
+    }
+
+    int32_t xMin = rawXMin;
+    int32_t xMax = rawXMax;
+    int32_t yMin = rawYMin;
+    int32_t yMax = rawYMax;
+    const bool solvedX = solveAxisFromTargetPositions(rawXMin, rawXMax, xSolveAtRawMin, xSolveAtRawMax, targetXMax, &xMin, &xMax);
+    const bool solvedY = solveAxisFromTargetPositions(rawYMin, rawYMax, ySolveAtRawMin, ySolveAtRawMax, targetYMax, &yMin, &yMax);
+    if (!solvedX || !solvedY) {
         lv_label_set_text(ctx->titleLabel, "Calibration Failed");
-        lv_label_set_text(ctx->hintLabel, "Screen too small. Tap to close.");
+        lv_label_set_text(ctx->hintLabel, "Target solve failed. Tap to close.");
         lv_obj_add_flag(ctx->target, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-
-    const int32_t xMin = xLow - (xHigh - xLow) * TARGET_MARGIN / xSpan;
-    const int32_t xMax = xHigh + (xHigh - xLow) * TARGET_MARGIN / xSpan;
-    const int32_t yMin = yLow - (yHigh - yLow) * TARGET_MARGIN / ySpan;
-    const int32_t yMax = yHigh + (yHigh - yLow) * TARGET_MARGIN / ySpan;
 
     settings::touch::TouchCalibrationSettings settings = settings::touch::getDefault();
     settings.enabled = true;
@@ -112,6 +287,9 @@ void finishCalibration(Context* ctx) {
     settings.xMax = xMax;
     settings.yMin = yMin;
     settings.yMax = yMax;
+    settings.rotateXy = rotate_xy;
+    settings.invertX = invert_x;
+    settings.invertY = invert_y;
 
     if (!settings::touch::isValid(settings)) {
         lv_label_set_text(ctx->titleLabel, "Calibration Failed");
@@ -132,43 +310,56 @@ void finishCalibration(Context* ctx) {
         .x_max = xMax,
         .y_min = yMin,
         .y_max = yMax,
+        .rotate_xy = rotate_xy,
+        .invert_x = invert_x,
+        .invert_y = invert_y,
     };
-    lvgl_lock();
     auto* indev = lvgl_pointer_get_default();
     if (indev != nullptr) {
         lvgl_pointer_set_calibration(indev, &calibration);
     }
-    lvgl_unlock();
     ctx->calibrationApplied = true;
 
-    LOG_I(TAG, "Saved calibration x=[%d, %d] y=[%d, %d]", xMin, xMax, yMin, yMax);
+    LOG_I(TAG, "Saved calibration x=[%d, %d] y=[%d, %d] flags rotate=%d invertX=%d invertY=%d",
+        xMin, xMax, yMin, yMax, (int)rotate_xy, (int)invert_x, (int)invert_y);
     lv_label_set_text(ctx->titleLabel, "Calibration Complete");
     lv_label_set_text(ctx->hintLabel, "Touch anywhere to continue.");
     lv_obj_add_flag(ctx->target, LV_OBJ_FLAG_HIDDEN);
 }
 
-void onPress(lv_event_t* event) {
-    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    auto* indev = lv_event_get_indev(event);
-    if (indev == nullptr) {
+static void recordSample(Context* ctx, const lv_point_t& sampledRaw) {
+    if (ctx->sampleCount >= 4) {
         return;
     }
+    const uint8_t sampleIndex = ctx->sampleCount;
+    if (ctx->root != nullptr) {
+        lv_area_t rootArea {};
+        lv_obj_get_coords(ctx->root, &rootArea);
+        const auto localPoint = getTargetPoint(sampleIndex, lv_obj_get_content_width(ctx->root), lv_obj_get_content_height(ctx->root));
+        ctx->targetScreenPoints[sampleIndex] = {
+            .x = static_cast<lv_coord_t>(rootArea.x1 + localPoint.x),
+            .y = static_cast<lv_coord_t>(rootArea.y1 + localPoint.y),
+        };
+    }
+    ctx->samples[sampleIndex] = {
+        .x = static_cast<uint16_t>(sampledRaw.x),
+        .y = static_cast<uint16_t>(sampledRaw.y),
+    };
+    ctx->sampleCount++;
 
-    lv_point_t point = {0, 0};
-    lv_indev_get_point(indev, &point);
+    lvgl_lock();
+    if (ctx->sampleCount < 4) {
+        updateUi(ctx);
+    } else {
+        finishCalibration(ctx);
+    }
+    lvgl_unlock();
+}
+
+void onPress(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
 
     if (ctx->sampleCount < 4) {
-        ctx->samples[ctx->sampleCount] = {
-            .x = static_cast<uint16_t>(std::max(static_cast<lv_coord_t>(0), point.x)),
-            .y = static_cast<uint16_t>(std::max(static_cast<lv_coord_t>(0), point.y)),
-        };
-        ctx->sampleCount++;
-
-        if (ctx->sampleCount < 4) {
-            updateUi(ctx);
-        } else {
-            finishCalibration(ctx);
-        }
         return;
     }
 
@@ -205,7 +396,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_label_set_text(ctx->hintLabel, "Tap target 1/4");
 
     ctx->target = lv_button_create(ctx->root);
-    lv_obj_set_size(ctx->target, 28, 28);
+    lv_obj_set_size(ctx->target, TARGET_SIZE, TARGET_SIZE);
     lv_obj_set_style_radius(ctx->target, LV_RADIUS_CIRCLE, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(ctx->target, lv_palette_main(LV_PALETTE_RED), LV_STATE_DEFAULT);
     // Ensure root receives all presses for sampling.
@@ -216,6 +407,8 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_center(targetLabel);
 
     lv_obj_add_flag(ctx->root, LV_OBJ_FLAG_CLICKABLE);
+    // Use initial press point; release tends to drift toward the center on resistive panels,
+    // which biases bottom/right targets upward/leftward.
     lv_obj_add_event_cb(ctx->root, onPress, LV_EVENT_PRESSED, ctx);
 
     updateUi(ctx);
@@ -242,16 +435,32 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     bool shouldClose = false;
     while (!shouldClose) {
         AppEvent event {};
-        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
+        error_t eventError = app_event_await(&sub, &event, pdMS_TO_TICKS(20));
+        if (eventError == ERROR_NONE) {
+            switch (event.type) {
+                case APP_EVENT_CLOSE:
+                    app_manager_finish(appInstanceId);
+                    shouldClose = true;
+                    break;
+                default:
+                    break;
+            }
+        } else if (eventError != ERROR_TIMEOUT) {
             break;
         }
-        switch (event.type) {
-            case APP_EVENT_CLOSE:
-                app_manager_finish(appInstanceId);
-                shouldClose = true;
-                break;
-            default:
-                break;
+
+        if (!shouldClose && ctx.sampleCount < 4) {
+            lv_point_t currentPoint = {0, 0};
+            const bool touched = readRawTouchPoint(&currentPoint);
+            if (touched && !ctx.touchLatch) {
+                lv_point_t sampledRaw = {0, 0};
+                if (captureStableRawSample(&sampledRaw)) {
+                    recordSample(&ctx, sampledRaw);
+                    ctx.touchLatch = true;
+                }
+            } else if (!touched) {
+                ctx.touchLatch = false;
+            }
         }
     }
 
@@ -270,6 +479,9 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
                 .x_max = settings.xMax,
                 .y_min = settings.yMin,
                 .y_max = settings.yMax,
+                .rotate_xy = settings.rotateXy,
+                .invert_x = settings.invertX,
+                .invert_y = settings.invertY,
             };
             lvgl_pointer_set_calibration(endIndev, &calibration);
         }
