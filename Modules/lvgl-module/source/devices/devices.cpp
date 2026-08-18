@@ -16,6 +16,7 @@
 #include <cstddef>
 
 constexpr auto* TAG = "lvgl";
+constexpr uint8_t LVGL_POINTER_SLOTS_DEFAULT = 1;
 
 // Boards are not expected to expose more devices of a single type than this; device_for_each_of_type()
 // callbacks run under the device ledger lock, so devices are collected here and processed afterwards.
@@ -69,8 +70,8 @@ void lvgl_devices_attach() {
             display_has_capability(kernel_display_device, DISPLAY_CAPABILITY_CAP_MIRROR);
         bool prefer_external_ram_buffer = display_has_capability(kernel_display_device, DISPLAY_CAPABILITY_PREFER_EXTERNAL_RAM);
         struct LvglDisplayConfig lvgl_display_config = {
-            .buffer_height = (uint16_t)(vres > 10 ? vres / 10 : vres),
-            .double_buffer = true,
+            .buffer_height = (uint16_t)(vres > 30 ? vres / 30 : vres),
+            .double_buffer = false,
             .sw_rotate = !can_hw_rotate,
             .swap_bytes = swap_bytes,
             .force_full_frame = display_requires_full_frame,
@@ -109,12 +110,12 @@ void lvgl_devices_attach() {
         // "pool", see lvgl_pointer_add()) so LVGL can track that many simultaneous touch points -
         // touch controllers report multiple points but expose no per-point hardware max, so this
         // is a fixed ceiling rather than a per-device query.
-        lv_indev_t* lvgl_pointer_slots[LVGL_POINTER_MAX_SLOTS];
-        if (lvgl_pointer_add(kernel_pointer_device, lvgl_display, LVGL_POINTER_MAX_SLOTS, lvgl_pointer_slots) == ERROR_NONE) {
-            LOG_I(TAG, "Bound %s to LVGL (%d touch slots)", kernel_pointer_device->name, (int)LVGL_POINTER_MAX_SLOTS);
+        lv_indev_t* lvgl_pointer_slots[LVGL_POINTER_SLOTS_DEFAULT];
+        if (lvgl_pointer_add(kernel_pointer_device, lvgl_display, LVGL_POINTER_SLOTS_DEFAULT, lvgl_pointer_slots) == ERROR_NONE) {
+            LOG_I(TAG, "Bound %s to LVGL (%d touch slots)", kernel_pointer_device->name, (int)LVGL_POINTER_SLOTS_DEFAULT);
             // Slow panels cause taps to be missed due to the long update time, prevent that
             if (display_updates_slowly) {
-                for (uint8_t slot = 0; slot < LVGL_POINTER_MAX_SLOTS; slot++) {
+                for (uint8_t slot = 0; slot < LVGL_POINTER_SLOTS_DEFAULT; slot++) {
                     lv_indev_set_long_press_time(lvgl_pointer_slots[slot], 2000);
                 }
             }

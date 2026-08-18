@@ -4,6 +4,7 @@
 #include "./State.h"
 
 #include <cstdint>
+#include <string>
 #include <lvgl.h>
 
 namespace tt::app::wifimanage {
@@ -19,6 +20,12 @@ class View final {
     lv_obj_t* scanning_spinner = nullptr;
     lv_obj_t* networks_list = nullptr;
     lv_obj_t* connect_to_hidden = nullptr;
+    size_t visibleNetworksLimit = 8;
+    bool hasRenderedList = false;
+    service::wifi::RadioState lastListRadioState = service::wifi::RadioState::Off;
+    bool lastListScanning = false;
+    size_t lastApCount = 0;
+    std::string lastConnectionTarget;
 
     void updateWifiToggle();
     void updateEnableOnBootToggle();
@@ -29,6 +36,7 @@ class View final {
 
     static void showDetails(lv_event_t* event);
     static void connect(lv_event_t* event);
+    static void onShowMoreClicked(lv_event_t* event);
 
 public:
 

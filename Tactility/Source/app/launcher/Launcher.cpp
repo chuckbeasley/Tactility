@@ -1,8 +1,9 @@
+#include "tactility/drivers/pointer.h"
+
+
 #include <app/event.h>
 #include <app/manager.h>
-#include <app/start.h>
 #include <app/manifest.h>
-#include <app/scheduler.h>
 
 #include <cstring>
 
@@ -13,22 +14,29 @@
 
 #include <lvgl_window_manager/window_manager.h>
 
-#include <tactility/check.h>
 #include <tactility/device.h>
-#include <tactility/drivers/pointer.h>
 #include <tactility/drivers/power_supply.h>
 #include <tactility/log.h>
-#include <tactility/memory.h>
 
 #include <Tactility/app/setup/Setup.h>
+#include <Tactility/settings/TouchCalibrationSettings.h>
 #include <Tactility/settings/BootSettings.h>
 #include <Tactility/Tactility.h>
+
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+#include <Tactility/app/touchcalibration/TouchCalibration.h>
+#endif
 
 namespace tt::app::launcher {
 
 constexpr auto* TAG = "Launcher";
+constexpr int32_t ICON_BUTTON_HIT_SLOP = 14;
 
 namespace {
+
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+uint32_t pendingCalibrationDialogId = 0;
+#endif
 
 uint32_t getButtonPadding(UiDensity density, uint32_t buttonSize) {
     if (density == LVGL_UI_DENSITY_COMPACT) {
@@ -46,13 +54,14 @@ int32_t computeButtonMargin(int32_t available_span, int32_t total_button_size) {
 void onAppPressed(lv_event_t* e) {
     auto* appId = static_cast<const char*>(lv_event_get_user_data(e));
     uint32_t instance_id = 0;
-    app_start(appId, 0, nullptr, &instance_id);
+    app_manager_start(appId, &instance_id);
 }
 
 lv_obj_t* createAppButton(lv_obj_t* parent, UiDensity uiDensity, const char* imageFile, const char* appId, int32_t itemMargin, bool isLandscape) {
     const auto button_size = lvgl_get_launcher_icon_font_height();
     const auto button_padding = getButtonPadding(uiDensity, button_size);
     auto* apps_button = lv_button_create(parent);
+    lv_obj_set_ext_click_area(apps_button, ICON_BUTTON_HIT_SLOP);
 
     lv_obj_set_style_pad_all(apps_button, static_cast<int32_t>(button_padding), LV_STATE_DEFAULT);
     if (isLandscape) {
@@ -170,9 +179,9 @@ void createWidgets(lv_obj_t* parent, void*) {
         ? computeButtonMargin(lv_display_get_horizontal_resolution(display), total_button_size)
         : computeButtonMargin(lv_display_get_vertical_resolution(display), total_button_size);
 
-    auto* app_list_button = createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_APPS, "tactility.applist", margin, is_landscape_display);
-    createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_FOLDER, "tactility.files", margin, is_landscape_display);
-    createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_SETTINGS, "tactility.settings", margin, is_landscape_display);
+    auto* app_list_button = createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_APPS, "AppList", margin, is_landscape_display);
+    createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_FOLDER, "Files", margin, is_landscape_display);
+    createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_SETTINGS, "Settings", margin, is_landscape_display);
 
     // The launcher's container is several levels below the screen, and LVGL only sends
     // LV_EVENT_SIZE_CHANGED to the screen object itself on a resolution change - so the
@@ -184,9 +193,10 @@ void createWidgets(lv_obj_t* parent, void*) {
     // button stays in the launcher; the confirmation flow lives in the PowerOff app.
     if (shouldShowPowerButton()) {
         auto* power_button = lv_button_create(parent);
+        lv_obj_set_ext_click_area(power_button, ICON_BUTTON_HIT_SLOP);
         lv_obj_set_style_pad_all(power_button, 8, 0);
         lv_obj_align(power_button, LV_ALIGN_BOTTOM_MID, 0, -10);
-        lv_obj_add_event_cb(power_button, onAppPressed, LV_EVENT_SHORT_CLICKED, (void*)"tactility.poweroff");
+        lv_obj_add_event_cb(power_button, onAppPressed, LV_EVENT_SHORT_CLICKED, (void*)"PowerOff");
         lv_obj_set_style_shadow_width(power_button, 0, LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(power_button, 0, LV_PART_MAIN);
 
@@ -205,7 +215,14 @@ void createWidgets(lv_obj_t* parent, void*) {
     }
 }
 
-void runAutoStart() {
+void runAutoStart(uint32_t appInstanceId) {
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+    if (pendingCalibrationDialogId == 0 && settings::touch::shouldRunCalibration()) {
+        pendingCalibrationDialogId = touchcalibration::start(appInstanceId);
+        return;
+    }
+#endif
+
     settings::BootSettings boot_properties;
     AppManifest manifest;
     if (
@@ -215,7 +232,7 @@ void runAutoStart() {
     ) {
         LOG_I(TAG, "Starting %s", CONFIG_TT_AUTO_START_APP_ID);
         uint32_t app_launch_id;
-        app_start(CONFIG_TT_AUTO_START_APP_ID, 0, nullptr, &app_launch_id);
+        app_manager_start(CONFIG_TT_AUTO_START_APP_ID, &app_launch_id);
     } else if (
         // Auto-start due to user configuration
         settings::loadBootSettings(boot_properties) &&
@@ -224,7 +241,7 @@ void runAutoStart() {
     ) {
         LOG_I(TAG, "Starting %s", boot_properties.autoStartAppId.c_str());
         uint32_t app_launch_id;
-        app_start(boot_properties.autoStartAppId.c_str(), 0, nullptr, &app_launch_id);
+        app_manager_start(boot_properties.autoStartAppId.c_str(), &app_launch_id);
     } else {
         // No auto-start, consider running system setup
         if (!setup::isCompleted()) {
@@ -233,57 +250,62 @@ void runAutoStart() {
     }
 }
 
-int32_t appMain(int argc, char* argv[]) {
-    uint32_t appInstanceId = app_scheduler_current_app_id();
-    runAutoStart();
-
-    TaskEventGroup event_group {};
-    task_event_group_construct(&event_group);
-
+int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     AppEventSubscription sub {};
-    check(app_event_subscribe(&sub, &event_group) == ERROR_NONE);
+    sub.app_instance_id = appInstanceId;
+    app_event_subscribe(&sub);
 
     WindowId window = window_manager_create(appInstanceId, createWidgets, nullptr);
+    runAutoStart(appInstanceId);
 
     // The launcher is meant to stay resident (it's the home screen) - it only gives up its
     // thread when app-module's scheduler asks it to (e.g. another new-model app is started).
     while (true) {
-        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
-
-        bool shouldClose = false;
         AppEvent event {};
-        while (app_event_poll(&sub, &event) == ERROR_NONE) {
-            if (event.type == APP_EVENT_CLOSE) {
-                shouldClose = true;
-                break;
-            }
+        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
+            break;
         }
-        if (shouldClose) break;
+        switch (event.type) {
+            case APP_EVENT_CLOSE:
+                app_manager_finish(appInstanceId);
+                break;
+            case APP_EVENT_RESULT:
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+                if (event.result.launch_id == pendingCalibrationDialogId) {
+                    pendingCalibrationDialogId = 0;
+                    runAutoStart(appInstanceId);
+                }
+#endif
+                app_manager_stop(event.result.launch_id);
+                break;
+            default:
+                break;
+        }
+        if (event.type == APP_EVENT_CLOSE) {
+            break;
+        }
     }
 
     window_manager_remove(window);
-    check(app_event_unsubscribe(&sub) == ERROR_NONE);
-    task_event_group_destruct(&event_group);
+    app_event_unsubscribe(&sub);
     return 0;
 }
 
 } // namespace
 
 extern const ::AppManifest manifest = {
-    .id = "tactility.launcher",
+    .id = "Launcher",
     .name = "Launcher",
     .category = APP_CATEGORY_SYSTEM,
-    .location = { .type = APP_LOCATION_MEMORY, .location = reinterpret_cast<void*>(appMain) },
+    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
     .flags = APP_MANIFEST_FLAG_HIDDEN,
-    // No file IO, so callstack can be in external RAM
-    .stack = { .depth = 3072 , .desired_memory_capability = MEMORY_CAPABILITY_EXTERNAL }
 };
 
 // Kept for Tactility/Private/Tactility/app/launcher/Launcher.h's existing declaration (still
 // used by the old, unconverted CrashDiagnostics app to return to the launcher after a crash).
 uint32_t start() {
     uint32_t instance_id = 0;
-    app_start(manifest.id, 0, nullptr, &instance_id);
+    app_manager_start(manifest.id, &instance_id);
     return instance_id;
 }
 

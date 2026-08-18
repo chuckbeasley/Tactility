@@ -49,5 +49,7 @@
 		x-max = <480>;
 		y-max = <320>;
 		swap-xy;
+		mirror-x;
+		mirror-y;
 	};
 };

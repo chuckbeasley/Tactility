@@ -1,23 +1,20 @@
 #include <Tactility/app/setup/Setup.h>
 
-#include <tactility/paths.h>
-
 #include <Tactility/StringUtils.h>
 #include <Tactility/app/timezone/TimeZone.h>
 #include <Tactility/app/wifimanage/WifiManage.h>
 #include <Tactility/file/File.h>
 #include <Tactility/service/wifi/Wifi.h>
+#include <Tactility/settings/TouchCalibrationSettings.h>
 
 #include <app/event.h>
 #include <app/manager.h>
-#include <app/start.h>
 #include <app/manifest.h>
-#include <app/scheduler.h>
 
 #include <lvgl_window_manager/window_manager.h>
 
-#include <tactility/check.h>
 #include <tactility/log.h>
+#include <tactility/paths.h>
 
 #include <lvgl/fonts.h>
 #include <lvgl/lvgl.h>
@@ -30,7 +27,7 @@
 #include <sdkconfig.h>
 #endif
 
-#ifdef CONFIG_TT_TOUCH_CALIBRATION_REQUIRED
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
 #include <Tactility/app/touchcalibration/TouchCalibration.h>
 #endif
 
@@ -43,11 +40,11 @@ constexpr auto* TAG = "setup";
 namespace {
 
 bool getCompletedMarkerPath(std::string& outPath) {
-    char path[128];
-    if (paths_get_data_path(path, sizeof(path)) != ERROR_NONE) {
+    char root[128];
+    if (paths_get_user_data_path(root, sizeof(root)) != ERROR_NONE) {
         return false;
     }
-    outPath = std::string(path) + "/.setup_complete";
+    outPath = std::string(root) + "/.setup_complete";
     return true;
 }
 
@@ -59,6 +56,7 @@ bool isCompleted() {
         LOG_E(TAG, "Setup path not found");
         return false;
     }
+    file::FileMutexGuard guard(path);
     return file::isFile(path);
 }
 
@@ -69,6 +67,7 @@ void markCompleted() {
     if (!getCompletedMarkerPath(path)) {
         return;
     }
+    file::FileMutexGuard guard(path);
     file::writeString(path, "");
 }
 
@@ -158,7 +157,11 @@ void onContinueClicked(lv_event_t* event) {
             break;
         case Phase::Done: {
             markCompleted();
-            app_event_emit_close(ctx->appInstanceId);
+            // Async, non-blocking - must NOT call app_manager_stop()/app_manager_finish()
+            // directly here: this callback runs ON the LVGL task, and app-lifecycle
+            // transitions must happen on this app's own thread (woken via app_event_await()).
+            AppEvent closeEvent { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
+            app_event_emit(ctx->appInstanceId, &closeEvent);
             break;
         }
     }
@@ -200,16 +203,20 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     renderCurrent(ctx);
 }
 
-int32_t appMain(int argc, char* argv[]) {
-    uint32_t appInstanceId = app_scheduler_current_app_id();
+int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     Context ctx {};
     ctx.appInstanceId = appInstanceId;
     ctx.steps = {
-#if defined(CONFIG_TT_TOUCH_CALIBRATION_REQUIRED)
-        {
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+        // Run calibration whenever there's no valid saved calibration so touch aligns before setup actions.
+        settings::touch::shouldRunCalibration() ? StepConfiguration {
             .title = "Touch Calibration",
             .description = "Let's calibrate the touch screen.",
             .run = [&ctx] { ctx.pendingStepDialogId = touchcalibration::start(ctx.appInstanceId); }
+        } : StepConfiguration {
+            .title = "",
+            .description = "",
+            .run = [] {}
         },
 #endif
         {
@@ -227,41 +234,43 @@ int32_t appMain(int argc, char* argv[]) {
         }
     };
 
-    TaskEventGroup event_group {};
-    task_event_group_construct(&event_group);
+#if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
+    if (!ctx.steps.empty() && ctx.steps.front().title.empty()) {
+        ctx.steps.erase(ctx.steps.begin());
+    }
+#endif
 
     AppEventSubscription sub {};
-    check(app_event_subscribe(&sub, &event_group) == ERROR_NONE);
+    sub.app_instance_id = appInstanceId;
+    app_event_subscribe(&sub);
 
     WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
 
     bool shouldClose = false;
     while (!shouldClose) {
-        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
-
         AppEvent event {};
-        while (app_event_poll(&sub, &event) == ERROR_NONE) {
-            switch (event.type) {
-                case APP_EVENT_CLOSE:
-                    shouldClose = true;
-                    break;
-                case APP_EVENT_RESULT:
-                    if (event.result.launch_id == ctx.pendingStepDialogId) {
-                        ctx.pendingStepDialogId = 0;
-                        advanceTo(&ctx, ctx.stepIndex + 1);
-                    }
-                    app_manager_stop(event.result.launch_id);
-                    break;
-                default:
-                    break;
-            }
-            if (shouldClose) break;
+        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
+            break;
+        }
+        switch (event.type) {
+            case APP_EVENT_CLOSE:
+                app_manager_finish(appInstanceId);
+                shouldClose = true;
+                break;
+            case APP_EVENT_RESULT:
+                if (event.result.launch_id == ctx.pendingStepDialogId) {
+                    ctx.pendingStepDialogId = 0;
+                    advanceTo(&ctx, ctx.stepIndex + 1);
+                }
+                app_manager_stop(event.result.launch_id);
+                break;
+            default:
+                break;
         }
     }
 
     window_manager_remove(window);
-    check(app_event_unsubscribe(&sub) == ERROR_NONE);
-    task_event_group_destruct(&event_group);
+    app_event_unsubscribe(&sub);
 
     return 0;
 }
@@ -270,11 +279,11 @@ int32_t appMain(int argc, char* argv[]) {
 
 void start() {
     uint32_t instanceId = 0;
-    app_start(manifest.id, 0, nullptr, &instanceId);
+    app_manager_start(manifest.id, &instanceId);
 }
 
 extern const ::AppManifest manifest = {
-    .id = "tactility.setup",
+    .id = "Setup",
     .name = "Setup",
     .category = APP_CATEGORY_SYSTEM,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },

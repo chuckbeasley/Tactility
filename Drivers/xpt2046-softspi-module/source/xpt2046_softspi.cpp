@@ -28,17 +28,21 @@ constexpr auto* TAG = "XPT2046SoftSPI";
 
 namespace {
 
-constexpr uint8_t CMD_READ_X = 0xD0;
-constexpr uint8_t CMD_READ_Y = 0x90;
+// Match esp_lcd_touch_xpt2046 defaults: PD0=1 (IRQ disabled between conversions), PD1=0.
+constexpr uint8_t CMD_READ_X = 0xD1;
+constexpr uint8_t CMD_READ_Y = 0x91;
+constexpr uint8_t CMD_READ_Z1 = 0xB1;
+constexpr uint8_t CMD_READ_Z2 = 0xC1;
 // BATTERY register (start=1, addr=010, 12-bit mode, single-ended, PD1=0/PD0=1 i.e. IRQ disabled
 // between conversions), same encoding as the hardware-SPI XPT2046 driver's default mode.
 constexpr uint8_t CMD_READ_BATTERY = 0xA7;
 
-constexpr int RAW_MIN_DEFAULT = 100;
-constexpr int RAW_MAX_DEFAULT = 1900;
+constexpr int ADC_LIMIT = 4096;
 constexpr int RAW_VALID_MIN = 50;
-constexpr int RAW_VALID_MAX = 3900;
+constexpr int RAW_VALID_MAX = ADC_LIMIT - 50;
 constexpr int SAMPLE_COUNT = 8;
+constexpr int Z_TOUCH_THRESHOLD = 400;
+constexpr uint16_t RAW_TOUCH_ERR_MAX = 20;
 
 } // namespace
 
@@ -144,7 +148,7 @@ static error_t stop(Device* device) {
 static int read_spi_command(Xpt2046SoftSpiInternal* internal, uint8_t command) {
     int result = 0;
 
-    gpio_descriptor_set_level(internal->cs, false); // assert CS (active-low)
+    gpio_descriptor_set_level(internal->cs, true); // assert CS (active-low)
     delay_micros(1);
 
     for (int i = 7; i >= 0; i--) {
@@ -155,14 +159,10 @@ static int read_spi_command(Xpt2046SoftSpiInternal* internal, uint8_t command) {
         delay_micros(1);
     }
 
-    // XPT2046 requires one busy clock cycle after the last command bit before data is valid.
+    // Keep MOSI low during the read phase.
     gpio_set_level(internal->mosi_pin, 0);
-    gpio_descriptor_set_level(internal->sck, true);
-    delay_micros(2);
-    gpio_descriptor_set_level(internal->sck, false);
-    delay_micros(2);
 
-    for (int i = 11; i >= 0; i--) {
+    for (int i = 15; i >= 0; i--) {
         gpio_descriptor_set_level(internal->sck, true);
         delay_micros(1);
         bool level = false;
@@ -174,9 +174,62 @@ static int read_spi_command(Xpt2046SoftSpiInternal* internal, uint8_t command) {
         delay_micros(1);
     }
 
-    gpio_descriptor_set_level(internal->cs, true); // deassert CS
+    gpio_descriptor_set_level(internal->cs, false); // deassert CS
 
     return result;
+}
+
+static uint16_t read_raw_z(Xpt2046SoftSpiInternal* internal) {
+    const int z1 = (read_spi_command(internal, CMD_READ_Z1) >> 3) & 0x0FFF;
+    const int z2 = (read_spi_command(internal, CMD_READ_Z2) >> 3) & 0x0FFF;
+    return static_cast<uint16_t>(z1 + (ADC_LIMIT - z2));
+}
+
+static void read_raw_xy(Xpt2046SoftSpiInternal* internal, uint16_t* out_x, uint16_t* out_y) {
+    (void)read_spi_command(internal, CMD_READ_X);
+    const uint16_t raw_x = static_cast<uint16_t>((read_spi_command(internal, CMD_READ_X) >> 3) & 0x0FFF);
+    (void)read_spi_command(internal, CMD_READ_Y);
+    const uint16_t raw_y = static_cast<uint16_t>((read_spi_command(internal, CMD_READ_Y) >> 3) & 0x0FFF);
+    *out_x = raw_x;
+    *out_y = raw_y;
+}
+
+static bool read_valid_raw_touch(Xpt2046SoftSpiInternal* internal, uint16_t* out_x, uint16_t* out_y, uint16_t threshold) {
+    uint16_t z1 = 1;
+    uint16_t z2 = 0;
+    uint8_t guard = 20;
+    while (z1 > z2 && guard--) {
+        z2 = z1;
+        z1 = read_raw_z(internal);
+        delay_millis(1);
+    }
+    if (z1 <= threshold) {
+        return false;
+    }
+
+    uint16_t x1 = 0;
+    uint16_t y1 = 0;
+    read_raw_xy(internal, &x1, &y1);
+    delay_millis(1);
+    if (read_raw_z(internal) <= threshold) {
+        return false;
+    }
+
+    delay_millis(2);
+    uint16_t x2 = 0;
+    uint16_t y2 = 0;
+    read_raw_xy(internal, &x2, &y2);
+
+    if (std::abs((int)x1 - (int)x2) > RAW_TOUCH_ERR_MAX) {
+        return false;
+    }
+    if (std::abs((int)y1 - (int)y2) > RAW_TOUCH_ERR_MAX) {
+        return false;
+    }
+
+    *out_x = x1;
+    *out_y = y1;
+    return true;
 }
 
 // endregion
@@ -193,7 +246,7 @@ static int read_spi_command(Xpt2046SoftSpiInternal* internal, uint8_t command) {
 static int read_battery_mv(Xpt2046SoftSpiInternal* internal) {
     int64_t raw_sum = 0;
     for (int i = 0; i < POWER_SUPPLY_SAMPLE_COUNT; i++) {
-        raw_sum += read_spi_command(internal, CMD_READ_BATTERY);
+        raw_sum += ((read_spi_command(internal, CMD_READ_BATTERY) >> 3) & 0x0FFF);
     }
 
     int64_t raw_avg = raw_sum / POWER_SUPPLY_SAMPLE_COUNT;
@@ -318,15 +371,23 @@ static error_t xpt2046_softspi_exit_sleep(Device*) {
 static error_t xpt2046_softspi_read_data(Device* device, TickType_t timeout) {
     (void)timeout;
     auto* internal = static_cast<Xpt2046SoftSpiInternal*>(device_get_driver_data(device));
-    const auto* config = GET_CONFIG(device);
 
     int total_x = 0;
     int total_y = 0;
     int valid_samples = 0;
+    const int z = read_raw_z(internal);
+
+    if (z < Z_TOUCH_THRESHOLD) {
+        internal->touched = false;
+        return ERROR_NONE;
+    }
 
     for (int i = 0; i < SAMPLE_COUNT; i++) {
-        const int raw_x = read_spi_command(internal, CMD_READ_X);
-        const int raw_y = read_spi_command(internal, CMD_READ_Y);
+        // First conversion after switching channel can be stale; do dummy+real per axis.
+        (void)read_spi_command(internal, CMD_READ_X);
+        const int raw_x = (read_spi_command(internal, CMD_READ_X) >> 3) & 0x0FFF;
+        (void)read_spi_command(internal, CMD_READ_Y);
+        const int raw_y = (read_spi_command(internal, CMD_READ_Y) >> 3) & 0x0FFF;
         if (raw_x > RAW_VALID_MIN && raw_x < RAW_VALID_MAX && raw_y > RAW_VALID_MIN && raw_y < RAW_VALID_MAX) {
             total_x += raw_x;
             total_y += raw_y;
@@ -341,41 +402,31 @@ static error_t xpt2046_softspi_read_data(Device* device, TickType_t timeout) {
         return ERROR_NONE;
     }
 
-    const int raw_x = total_x / valid_samples;
-    const int raw_y = total_y / valid_samples;
-
-    const int display_x_max = static_cast<int>(config->x_max);
-    const int display_y_max = static_cast<int>(config->y_max);
-
-    // When swap_xy is set, physical X maps to screen Y and physical Y maps to screen X.
-    // Map to the pre-swap space so the values land in the correct range after the swap below.
-    const int pre_x_max = internal->swap_xy ? display_y_max : display_x_max;
-    const int pre_y_max = internal->swap_xy ? display_x_max : display_y_max;
-
-    int mapped_x = (raw_x - RAW_MIN_DEFAULT) * pre_x_max /
-                   (RAW_MAX_DEFAULT - RAW_MIN_DEFAULT);
-    int mapped_y = (raw_y - RAW_MIN_DEFAULT) * pre_y_max /
-                   (RAW_MAX_DEFAULT - RAW_MIN_DEFAULT);
-
-    if (internal->swap_xy) {
-        std::swap(mapped_x, mapped_y);
-    }
-    if (internal->mirror_x) {
-        mapped_x = display_x_max - mapped_x;
-    }
-    if (internal->mirror_y) {
-        mapped_y = display_y_max - mapped_y;
-    }
-
-    if (mapped_x < 0) mapped_x = 0;
-    if (mapped_x > display_x_max) mapped_x = display_x_max;
-    if (mapped_y < 0) mapped_y = 0;
-    if (mapped_y > display_y_max) mapped_y = display_y_max;
-
-    internal->x = static_cast<uint16_t>(mapped_x);
-    internal->y = static_cast<uint16_t>(mapped_y);
+    // Feed LVGL calibration with raw controller space coordinates, exactly like
+    // TFT_eSPI Touch_Calibrate -> convertRawXY pipeline.
+    internal->x = static_cast<uint16_t>(total_x / valid_samples);
+    internal->y = static_cast<uint16_t>(total_y / valid_samples);
     internal->touched = true;
     return ERROR_NONE;
+}
+
+error_t xpt2046_softspi_read_valid_touch(Device* device, uint16_t* x, uint16_t* y, uint16_t threshold, TickType_t timeout) {
+    if (device == nullptr || x == nullptr || y == nullptr) {
+        return ERROR_INVALID_ARGUMENT;
+    }
+    auto* internal = static_cast<Xpt2046SoftSpiInternal*>(device_get_driver_data(device));
+    if (internal == nullptr) {
+        return ERROR_INVALID_STATE;
+    }
+
+    const TickType_t attempts = timeout == 0 ? 1 : timeout;
+    for (TickType_t i = 0; i < attempts; i++) {
+        if (read_valid_raw_touch(internal, x, y, threshold)) {
+            return ERROR_NONE;
+        }
+        vTaskDelay(1);
+    }
+    return ERROR_TIMEOUT;
 }
 
 static bool xpt2046_softspi_get_touched_points(Device* device, uint16_t* x, uint16_t* y, uint16_t* strength, uint8_t* point_count, uint8_t max_point_count) {

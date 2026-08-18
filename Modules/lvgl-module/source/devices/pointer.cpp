@@ -93,27 +93,43 @@ static void lvgl_pointer_calibration_apply(
     uint16_t* x,
     uint16_t* y
 ) {
-    int64_t mapped_x = ((int64_t)*x - calibration->x_min) * target_x_max /
-        ((int64_t)calibration->x_max - calibration->x_min);
-    int64_t mapped_y = ((int64_t)*y - calibration->y_min) * target_y_max /
-        ((int64_t)calibration->y_max - calibration->y_min);
+    const int32_t raw_x = *x;
+    const int32_t raw_y = *y;
+    int64_t mapped_x = 0;
+    int64_t mapped_y = 0;
+
+    if (calibration->rotate_xy) {
+        mapped_x = ((int64_t)raw_y - calibration->x_min) * target_x_max /
+            ((int64_t)calibration->x_max - calibration->x_min);
+        mapped_y = ((int64_t)raw_x - calibration->y_min) * target_y_max /
+            ((int64_t)calibration->y_max - calibration->y_min);
+    } else {
+        mapped_x = ((int64_t)raw_x - calibration->x_min) * target_x_max /
+            ((int64_t)calibration->x_max - calibration->x_min);
+        mapped_y = ((int64_t)raw_y - calibration->y_min) * target_y_max /
+            ((int64_t)calibration->y_max - calibration->y_min);
+    }
 
     if (mapped_x < 0) mapped_x = 0;
     if (mapped_x > target_x_max) mapped_x = target_x_max;
     if (mapped_y < 0) mapped_y = 0;
     if (mapped_y > target_y_max) mapped_y = target_y_max;
 
+    if (calibration->invert_x) {
+        mapped_x = target_x_max - mapped_x;
+    }
+    if (calibration->invert_y) {
+        mapped_y = target_y_max - mapped_y;
+    }
+
     *x = (uint16_t)mapped_x;
     *y = (uint16_t)mapped_y;
 }
 
 // Reads all currently-touched points from the device into pool->raw_x/raw_y/raw_count, applying
-// calibration in the graphics driver's own native (LV_DISPLAY_ROTATION_0) coordinate space -
-// native_x_max/native_y_max are just the panel's fixed pixel dimensions, not a rotation. This
-// function has no notion of LVGL rotation at all: calibration corrects the raw sensor's fixed
-// physical mapping, which never changes with on-screen orientation, so it doesn't belong anywhere
-// near rotation math.
-static void lvgl_pointer_pool_refresh(struct LvglPointerPool* pool, int32_t native_x_max, int32_t native_y_max) {
+// calibration directly into LVGL's current logical coordinate space (post-rotation). This matches
+// Touch_Calibrate semantics: calibration maps raw touch to the orientation the user calibrated in.
+static void lvgl_pointer_pool_refresh(struct LvglPointerPool* pool, int32_t logical_x_max, int32_t logical_y_max) {
     pool->raw_count = 0;
 
     if (pointer_read_data(pool->device, LVGL_POINTER_READ_TIMEOUT) != ERROR_NONE) {
@@ -126,14 +142,15 @@ static void lvgl_pointer_pool_refresh(struct LvglPointerPool* pool, int32_t nati
     }
     if (point_count > LVGL_POINTER_MAX_SLOTS) point_count = LVGL_POINTER_MAX_SLOTS;
 
-    if (pool->calibration_enabled && native_x_max > 0 && native_y_max > 0) {
+    if (pool->calibration_enabled && logical_x_max > 0 && logical_y_max > 0) {
         for (uint8_t i = 0; i < point_count; i++) {
-            lvgl_pointer_calibration_apply(&pool->calibration, native_x_max, native_y_max, &pool->raw_x[i], &pool->raw_y[i]);
+            lvgl_pointer_calibration_apply(&pool->calibration, logical_x_max, logical_y_max, &pool->raw_x[i], &pool->raw_y[i]);
         }
     }
 
     pool->raw_count = point_count;
 }
+
 
 // Matches this round's raw points onto pool slots by nearest-neighbor to each slot's last known
 // position, so a slot "follows" the same physical finger across rounds instead of jumping when
@@ -141,11 +158,10 @@ static void lvgl_pointer_pool_refresh(struct LvglPointerPool* pool, int32_t nati
 // anywhere in this stack - see esp_lcd_touch_get_coordinates()/PointerApi.get_touched_points()).
 // Unmatched raw points (new touches) claim the nearest inactive slot. Slots with no matching
 // point this round go inactive (RELEASED).
-static void lvgl_pointer_pool_assign(struct LvglPointerPool* pool, int32_t native_x_max) {
-    // Touch drivers clamp raw coordinates to the panel's configured native resolution regardless
-    // of calibration, so native_x_max is a valid scale reference for the distance cap even when calibration is disabled. 
+static void lvgl_pointer_pool_assign(struct LvglPointerPool* pool, int32_t logical_x_max) {
+    // Use the same coordinate space the slot points are tracked in (logical display coordinates).
     // Falls back to a conservative fixed pixel value if the display/resolution isn't available for some reason.
-    const int32_t max_track_dist = native_x_max > 0 ? (native_x_max / LVGL_POINTER_MAX_TRACK_DIST_FRACTION) : 150;
+    const int32_t max_track_dist = logical_x_max > 0 ? (logical_x_max / LVGL_POINTER_MAX_TRACK_DIST_FRACTION) : 150;
     const int32_t max_track_dist_sq = max_track_dist * max_track_dist;
 
     bool raw_claimed[LVGL_POINTER_MAX_SLOTS] = {};
@@ -214,12 +230,10 @@ static void lvgl_pointer_read_cb(lv_indev_t* indev, lv_indev_data_t* data) {
 
     if (pool->round_pos == 0) {
         lv_display_t* display = lv_indev_get_display(indev);
-        // lv_display_get_original_*_resolution() is the native (LV_DISPLAY_ROTATION_0) size,
-        // unaffected by the display's current rotation - no rotation lookup needed to get it.
-        int32_t native_x_max = display != NULL ? lv_display_get_original_horizontal_resolution(display) - 1 : 0;
-        int32_t native_y_max = display != NULL ? lv_display_get_original_vertical_resolution(display) - 1 : 0;
-        lvgl_pointer_pool_refresh(pool, native_x_max, native_y_max);
-        lvgl_pointer_pool_assign(pool, native_x_max);
+        int32_t logical_x_max = display != NULL ? lv_display_get_horizontal_resolution(display) - 1 : 0;
+        int32_t logical_y_max = display != NULL ? lv_display_get_vertical_resolution(display) - 1 : 0;
+        lvgl_pointer_pool_refresh(pool, logical_x_max, logical_y_max);
+        lvgl_pointer_pool_assign(pool, logical_x_max);
     }
     pool->round_pos = (uint8_t)((pool->round_pos + 1) % pool->slot_count);
 

@@ -47,6 +47,7 @@ void State::setConnectSsid(const std::string& ssid) {
 std::string State::getConnectSsid() const {
     mutex.lock();
     auto result = connectSsid;
+    mutex.unlock();
     return result;
 }
 

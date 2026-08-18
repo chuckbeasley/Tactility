@@ -4,7 +4,6 @@
 #include <Tactility/LogMessages.h>
 #include <Tactility/RecursiveMutex.h>
 #include <Tactility/Tactility.h>
-#include <Tactility/Thread.h>
 #include <Tactility/Timer.h>
 #include <Tactility/service/Service.h>
 #include <Tactility/service/ServiceManifest.h>
@@ -22,6 +21,10 @@
 
 #include <algorithm>
 #include <atomic>
+
+#ifdef ESP_PLATFORM
+#include <esp_heap_caps.h>
+#endif
 
 namespace tt::service::wifi {
 
@@ -63,6 +66,7 @@ namespace {
 /** State lives for the entire process; only ever (re)initialized by onStart(). */
 struct WifiServiceState {
     Device* device = nullptr;
+    std::shared_ptr<PubSub<WifiEvent>> pubsub = std::make_shared<PubSub<WifiEvent>>();
     RecursiveMutex mutex;
     bool secureConnection = false;
     // Internal: set by connect()/disconnect() while a manual attempt is in flight, cleared on
@@ -79,32 +83,24 @@ struct WifiServiceState {
     TickType_t lastScanTime = MAX_TICKS;
     std::unique_ptr<Timer> autoConnectTimer;
     bool bootEventSubscribed = false;
-
-    // Dedicated consumer for WifiEvents, alive for the service's whole lifetime (started in
-    // onStart(), stopped in onStop() - see dispatchSetEnabled()'s comment on why this outlives
-    // radio on/off toggles): runs onWifiDeviceEvent() on its own stack instead of the ESP-IDF
-    // esp_event task's, by blocking in task_event_group_wait_any() rather than being called back
-    // directly from fire_event().
-    TaskEventGroup wifiEventGroup {};
-    WifiEventSubscription wifiEventSub {};
-    Thread* wifiEventThread = nullptr;
-    std::atomic<bool> wifiEventThreadRunning {false};
 };
 
 WifiServiceState state;
 bool started = false;
 
-void onWifiDeviceEvent(Device* device, ::WifiEvent event);
+void onWifiDeviceEvent(Device* device, void* context, ::WifiEvent event);
 
 // ---- Helpers ----
 
-// state.device is started (bookkeeping allocated) for the service's entire lifetime now - see
-// dispatchSetEnabled()'s comment - so device_is_ready() no longer tracks radio-on state; query
-// the driver directly instead.
-bool isRadioOn() {
-    if (state.device == nullptr) return false;
-    WifiRadioState radio = WIFI_RADIO_STATE_OFF;
-    return wifi_get_radio_state(state.device, &radio) == ERROR_NONE && radio == WIFI_RADIO_STATE_ON;
+void publish(WifiEvent event) {
+    state.pubsub->publish(event);
+}
+
+void publishRadioState(WifiRadioState radio_state) {
+    WifiEvent event = {};
+    event.type = WIFI_EVENT_TYPE_RADIO_STATE_CHANGED;
+    event.radio_state = radio_state;
+    publish(event);
 }
 
 RadioState combineRadioState(WifiRadioState radio, WifiStationState station) {
@@ -122,88 +118,60 @@ RadioState combineRadioState(WifiRadioState radio, WifiStationState station) {
     return RadioState::Off;
 }
 
-// ---- WifiEvent consumer thread ----
-// Runs onWifiDeviceEvent() on its own stack (see WifiServiceState::wifiEventGroup's comment).
-
-constexpr configSTACK_DEPTH_TYPE WIFI_EVENT_THREAD_STACK_SIZE = 4096;
-
-int32_t wifiEventThreadMain() {
-    // The 250ms timeout only bounds how promptly a stop request (wifiEventThreadRunning going
-    // false) is noticed; a real event still wakes this immediately regardless, since
-    // task_event_group_wait_any() returns as soon as the bit is signalled, whichever comes first.
-    while (state.wifiEventThreadRunning.load()) {
-        task_event_group_wait_any(&state.wifiEventGroup, nullptr, pdMS_TO_TICKS(250));
-
-        WifiEvent event {};
-        while (wifi_event_poll(&state.wifiEventSub, &event) == ERROR_NONE) {
-            onWifiDeviceEvent(state.device, event);
-        }
-    }
-    return 0;
-}
-
-bool startWifiEventThread() {
-    task_event_group_construct(&state.wifiEventGroup);
-    if (wifi_event_subscribe(state.device, &state.wifiEventSub, &state.wifiEventGroup) != ERROR_NONE) {
-        task_event_group_destruct(&state.wifiEventGroup);
-        return false;
-    }
-
-    state.wifiEventThreadRunning = true;
-    state.wifiEventThread = new Thread("wifi-events", WIFI_EVENT_THREAD_STACK_SIZE, [] { return wifiEventThreadMain(); });
-    state.wifiEventThread->start();
-    return true;
-}
-
-void stopWifiEventThread() {
-    if (state.wifiEventThread == nullptr) return;
-
-    state.wifiEventThreadRunning = false;
-    state.wifiEventThread->join();
-    delete state.wifiEventThread;
-    state.wifiEventThread = nullptr;
-
-    wifi_event_unsubscribe(state.device, &state.wifiEventSub);
-    task_event_group_destruct(&state.wifiEventGroup);
-}
-
 // ---- Dispatched work (runs on the main task) ----
 
-// state.device is started (device_start()) once, in onStart(), and never stopped until onStop() -
-// this only toggles the radio itself, so the wifi-events thread (and any app subscribed directly
-// to the driver) stays subscribed across on/off toggles instead of having to resubscribe.
 void dispatchSetEnabled(bool enabled) {
     LOG_I(TAG, "dispatchSetEnabled(%d)", (int)enabled);
     if (!started || state.device == nullptr) return;
 
-    if (enabled == isRadioOn()) {
+    bool ready = device_is_ready(state.device);
+    if (enabled == ready) {
         LOG_W(TAG, "Can't enable/disable from current state");
         return;
     }
 
     if (enabled) {
+        publishRadioState(WIFI_RADIO_STATE_ON_PENDING);
 
-        if (wifi_set_radio_on(state.device) != ERROR_NONE) {
-            LOG_E(TAG, "Failed to enable WiFi radio");
+#ifdef ESP_PLATFORM
+        LOG_I(TAG, "WiFi init headroom: internal_free=%u internal_largest=%u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+#endif
+        if (device_start(state.device) != ERROR_NONE) {
+            LOG_E(TAG, "Failed to start WiFi device");
+            publishRadioState(WIFI_RADIO_STATE_OFF);
+            return;
+        }
+
+        if (wifi_add_event_callback(state.device, nullptr, onWifiDeviceEvent) != ERROR_NONE) {
+            LOG_E(TAG, "Failed to register WiFi event callback");
+            device_stop(state.device);
+            publishRadioState(WIFI_RADIO_STATE_OFF);
             return;
         }
 
         state.pauseAutoConnect = false;
         state.lastScanTime = 0;
+        publishRadioState(WIFI_RADIO_STATE_ON);
     } else {
+        publishRadioState(WIFI_RADIO_STATE_OFF_PENDING);
 
-        if (wifi_set_radio_off(state.device) != ERROR_NONE) {
-            LOG_E(TAG, "Failed to disable WiFi radio");
+        if (device_stop(state.device) != ERROR_NONE) {
+            LOG_E(TAG, "Failed to stop WiFi device");
+            publishRadioState(WIFI_RADIO_STATE_ON);
             return;
         }
 
+        wifi_remove_event_callback(state.device, onWifiDeviceEvent);
+
         state.secureConnection = false;
+        publishRadioState(WIFI_RADIO_STATE_OFF);
     }
 }
 
 void dispatchScan() {
     LOG_I(TAG, "dispatchScan()");
-    if (!started || state.device == nullptr || !isRadioOn()) return;
+    if (!started || state.device == nullptr || !device_is_ready(state.device)) return;
 
     state.lastScanTime = get_ticks();
 
@@ -229,7 +197,18 @@ void dispatchConnect() {
 
     LOG_I(TAG, "Connecting to %s", target.ssid.c_str());
 
-    wifi_station_connect(state.device, target.ssid.c_str(), target.password.c_str(), target.channel);
+    error_t result = wifi_station_connect(state.device, target.ssid.c_str(), target.password.c_str(), target.channel);
+    if (result != ERROR_NONE) {
+        LOG_E(TAG, "Failed to connect to %s (%s)", target.ssid.c_str(), error_to_string(result));
+        WifiEvent event = {};
+        event.type = WIFI_EVENT_TYPE_STATION_CONNECTION_RESULT;
+        // The driver couldn't even initiate the connection attempt; there's no
+        // more specific WifiStationConnectionError for that.
+        event.connection_error = WIFI_STATION_CONNECTION_ERROR_TIMEOUT;
+        publish(event);
+    }
+    // On success, WIFI_EVENT_TYPE_STATION_STATE_CHANGED / _CONNECTION_RESULT arrive
+    // asynchronously via onWifiDeviceEvent().
 }
 
 void dispatchDisconnect() {
@@ -262,14 +241,12 @@ bool findAutoConnectAp(settings::WifiApSettings& out) {
 
 void dispatchAutoConnect() {
     LOG_I(TAG, "dispatchAutoConnect()");
-    if (state.pauseAutoConnect || state.externalScanPause.load() || !isRadioOn()) {
+    if (state.pauseAutoConnect || state.externalScanPause.load()) {
         // A manual disconnect() or an in-progress manual connect() has paused
         // auto-connect, or a caller (e.g. AutoScanPauseGuard) has externally paused it.
         // This is called on every SCAN_FINISHED, not just the auto-connect timer's own
         // scans (e.g. WifiManage re-scans on show), so it must honor the pause instead of
-        // reconnecting unconditionally. The radio-off check matters because a scan that was
-        // already in flight can finish after the user turns the radio off. Without it,
-        // connect() would call dispatchSetEnabled(true) and turn the radio back on.
+        // reconnecting unconditionally.
         return;
     }
     RadioState radio_state = getRadioState();
@@ -309,7 +286,7 @@ void onAutoConnectTimer() {
 
 // ---- Kernel driver event bridge ----
 
-void onWifiDeviceEvent(Device* device, ::WifiEvent event) {
+void onWifiDeviceEvent(Device* device, void* /*context*/, ::WifiEvent event) {
     switch (event.type) {
         case WIFI_EVENT_TYPE_SCAN_FINISHED:
             getMainDispatcher().dispatch([] { dispatchAutoConnect(); });
@@ -364,6 +341,10 @@ void onWifiDeviceEvent(Device* device, ::WifiEvent event) {
         default:
             break;
     }
+
+    // Forward the event as-is: subscribers inspect event.type and the
+    // relevant union field directly, same as this function does.
+    publish(event);
 }
 
 void autoScanSetPaused(bool paused) {
@@ -375,8 +356,12 @@ void autoScanSetPaused(bool paused) {
 
 // region Public functions
 
+std::shared_ptr<PubSub<WifiEvent>> getPubsub() {
+    return state.pubsub;
+}
+
 RadioState getRadioState() {
-    if (!started || state.device == nullptr) {
+    if (!started || state.device == nullptr || !device_is_ready(state.device)) {
         return RadioState::Off;
     }
 
@@ -426,7 +411,7 @@ void connect(const settings::WifiApSettings& ap, bool remember) {
         state.pauseAutoConnect = true;
         state.connectionTarget = ap;
         state.connectionTargetRemember = remember;
-        radio_off = !isRadioOn();
+        radio_off = !device_is_ready(state.device);
     }
 
     getMainDispatcher().dispatch([radio_off] {
@@ -528,17 +513,9 @@ public:
 
         wifi_auto_scan_set_paused_function(autoScanSetPaused);
 
-        Device* wifi_device = nullptr;
-        if (device_get_first_by_type(&WIFI_TYPE, &wifi_device) != ERROR_NONE) {
+        state.device = wifi_find_first_registered_device();
+        if (state.device == nullptr) {
             LOG_W(TAG, "No WiFi device found");
-        } else if (device_start(wifi_device) != ERROR_NONE) {
-            LOG_E(TAG, "Failed to start WiFi device");
-            device_put(wifi_device);
-        } else {
-            state.device = wifi_device;
-            if (!startWifiEventThread()) {
-                LOG_E(TAG, "Failed to subscribe to WiFi events");
-            }
         }
 
         if (system_event_callback_add(KERNEL_EVENT_BOOT_COMPLETED, onBootCompleted, nullptr) == ERROR_NONE) {
@@ -566,13 +543,9 @@ public:
             state.bootEventSubscribed = false;
         }
 
-        if (state.device != nullptr) {
-            if (isRadioOn()) {
-                wifi_set_radio_off(state.device);
-            }
-            stopWifiEventThread();
+        if (state.device != nullptr && device_is_ready(state.device)) {
+            wifi_remove_event_callback(state.device, onWifiDeviceEvent);
             device_stop(state.device);
-            device_put(state.device);
         }
 
         state.secureConnection = false;
@@ -586,7 +559,7 @@ public:
 } // namespace
 
 extern const ServiceManifest manifest = {
-    .id = "tactility.wifi",
+    .id = "wifi",
     .createService = create<WifiService>
 };
 

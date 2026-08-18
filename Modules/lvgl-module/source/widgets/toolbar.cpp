@@ -32,6 +32,11 @@ static uint32_t getActionIconPadding(UiDensity uiDensity) {
     return (uiDensity != LVGL_UI_DENSITY_COMPACT) ? (uint32_t)(toolbar_height * 0.2f) : 8;
 }
 
+static int32_t getButtonHitSlop(UiDensity uiDensity) {
+    // Keep visual size unchanged, but give small toolbar buttons a larger tappable area.
+    return (uiDensity == LVGL_UI_DENSITY_COMPACT) ? 16 : 10;
+}
+
 /**
  * Helps with button expansion and also with vertical alignment of content,
  * as the parent flex doesn't allow for vertical alignment
@@ -122,6 +127,7 @@ lv_obj_t* lvgl_toolbar_create(lv_obj_t* parent, const char* title) {
     }
 
     lv_obj_set_size(toolbar->close_button, toolbar_height - icon_padding, toolbar_height - icon_padding);
+    lv_obj_set_ext_click_area(toolbar->close_button, getButtonHitSlop(ui_density));
 
     lv_obj_set_style_pad_all(toolbar->close_button, 0, LV_STATE_DEFAULT);
     lv_obj_align(toolbar->close_button, LV_ALIGN_CENTER, 0, 0);
@@ -194,6 +200,7 @@ static lv_obj_t* toolbar_add_button_action(lv_obj_t* obj, const char* imageOrBut
 
     lv_obj_t* action_button = lv_button_create(wrapper);
     lv_obj_set_size(action_button, toolbar_height - padding, toolbar_height - padding);
+    lv_obj_set_ext_click_area(action_button, getButtonHitSlop(ui_density));
     lv_obj_set_style_pad_all(action_button, 0, LV_STATE_DEFAULT);
     lv_obj_align(action_button, LV_ALIGN_CENTER, 0, 0);
     if (ui_density == LVGL_UI_DENSITY_COMPACT) {
