@@ -11,9 +11,11 @@
 
 #include <Tactility/DeprecatedPaths.h>
 #include <Tactility/Tactility.h>
+#include <Tactility/kernel/Kernel.h>
 
 #include <tactility/log.h>
 
+#include <cstring>
 #include <dirent.h>
 #include <format>
 #include <map>
@@ -79,7 +81,9 @@ static void importWifiAp(const std::string& filePath) {
 
     const auto auto_remove_iterator = map.find(AP_PROPERTIES_KEY_AUTO_REMOVE);
     if (auto_remove_iterator != map.end() && auto_remove_iterator->second == "true") {
-        if (!remove(filePath.c_str())) {
+        // std::remove() returns 0 on success - the previous check was inverted, so this logged
+        // failure on success and vice versa.
+        if (std::remove(filePath.c_str()) != 0) {
             LOG_E(TAG, "Failed to auto-remove %s", filePath.c_str());
         } else {
             LOG_I(TAG, "Auto-removed %s", filePath.c_str());
@@ -87,26 +91,55 @@ static void importWifiAp(const std::string& filePath) {
     }
 }
 
+constexpr auto* AP_PROPERTIES_SUFFIX = ".ap.properties";
+
+// Accepts the interrupted-save leftovers too. properties_file.cpp stages a save at "<path>.tmp"
+// and parks the old content at "<path>.bak"; a reset mid-swap can leave one of those as the only
+// copy. The importer renames such an orphan back into place before reading it - otherwise the
+// provisioning file is invisible here and the AP is silently never imported.
+static bool isApPropertiesName(const std::string& name) {
+    return name.ends_with(AP_PROPERTIES_SUFFIX) ||
+        name.ends_with(std::string(AP_PROPERTIES_SUFFIX) + ".tmp") ||
+        name.ends_with(std::string(AP_PROPERTIES_SUFFIX) + ".bak");
+}
+
+static int apPropertiesFilter(const dirent* entry) {
+    switch (entry->d_type) {
+        case file::TT_DT_DIR:
+        case file::TT_DT_CHR:
+        case file::TT_DT_LNK:
+            return -1;
+        case file::TT_DT_REG:
+        default:
+            return isApPropertiesName(entry->d_name) ? 0 : -1;
+    }
+}
+
 static void importWifiApSettingsFromDir(const std::string& path) {
+    // The caller already established that this directory exists, so an empty listing is
+    // anomalous. It has been observed to happen intermittently on the freshly mounted FATFS
+    // volume during boot, and because the old code gave up silently on a zero result, WiFi
+    // provisioning was skipped without a trace and auto-connect never happened. Retry over a
+    // window of about a second before believing it, and never fail quietly.
+    constexpr int MAX_ATTEMPTS = 5;
+    constexpr uint32_t RETRY_DELAY_MS = 250;
     std::vector<dirent> dirent_list;
-    if (file::scandir(path, dirent_list, [](const dirent* entry) {
-        switch (entry->d_type) {
-            case file::TT_DT_DIR:
-            case file::TT_DT_CHR:
-            case file::TT_DT_LNK:
-                return -1;
-            case file::TT_DT_REG:
-            default: {
-                std::string name = entry->d_name;
-                if (name.ends_with(".ap.properties")) {
-                    return 0;
-                } else {
-                    return -1;
-                }
-            }
+    int found = 0;
+
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        dirent_list.clear();
+        found = file::scandir(path, dirent_list, apPropertiesFilter, nullptr);
+        if (found > 0) {
+            break;
         }
-    }, nullptr) == 0) {
-        // keep original behavior: if scandir returns 0, give up silently
+        if (attempt < MAX_ATTEMPTS) {
+            LOG_W(TAG, "Read no AP files at %s (attempt %d/%d), retrying", path.c_str(), attempt, MAX_ATTEMPTS);
+            kernel::delayMillis(RETRY_DELAY_MS);
+        }
+    }
+
+    if (found < 0) {
+        LOG_E(TAG, "Failed to read %s", path.c_str());
         return;
     }
 
@@ -117,6 +150,28 @@ static void importWifiApSettingsFromDir(const std::string& path) {
 
     for (auto& dirent : dirent_list) {
         std::string absolute_path = std::format("{}/{}", path, dirent.d_name);
+
+        // Restore an interrupted save before importing, so the file is both readable now and
+        // present under its real name for subsequent boots.
+        for (const auto* suffix : { ".tmp", ".bak" }) {
+            if (!absolute_path.ends_with(suffix)) {
+                continue;
+            }
+            std::string real_path = absolute_path.substr(0, absolute_path.size() - std::strlen(suffix));
+            if (file::isFile(real_path)) {
+                // The real file survived after all - the leftover is stale, drop it.
+                std::remove(absolute_path.c_str());
+                absolute_path.clear();
+            } else if (std::rename(absolute_path.c_str(), real_path.c_str()) == 0) {
+                LOG_W(TAG, "Recovered %s from an interrupted save", real_path.c_str());
+                absolute_path = real_path;
+            }
+            break;
+        }
+
+        if (absolute_path.empty()) {
+            continue;
+        }
         importWifiAp(absolute_path);
     }
 }

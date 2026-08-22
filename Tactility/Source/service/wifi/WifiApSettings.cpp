@@ -126,6 +126,44 @@ static bool decrypt(const std::string& ssid, const std::string& ciphertextInput,
     return true;
 }
 
+/**
+ * The on-disk filename is not authoritative for the SSID: FAT stores an all-lowercase short name
+ * for names that fit, so "MyAp" comes back as "myap.ap.properties". Reading the ssid key out of
+ * each file preserves the real casing, which load() asserts on.
+ */
+std::vector<std::string> getSavedSsids() {
+    std::vector<std::string> ssids;
+
+    auto service_context = findServiceContext();
+    if (service_context == nullptr) {
+        return ssids;
+    }
+
+    const auto directory = service_context->getPaths()->getUserDataDirectory();
+    std::vector<dirent> entries;
+    if (file::scandir(directory, entries, [](const dirent* entry) {
+        std::string name = entry->d_name;
+        return name.ends_with(".ap.properties") ? 0 : -1;
+    }, nullptr) <= 0) {
+        return ssids;
+    }
+
+    for (const auto& entry : entries) {
+        const auto file_path = file::getChildPath(directory, entry.d_name);
+        std::map<std::string, std::string> map;
+        if (!file::loadPropertiesFile(file_path, map)) {
+            LOG_W(TAG, "Failed to read %s", file_path.c_str());
+            continue;
+        }
+        const auto ssid_iterator = map.find(AP_PROPERTIES_KEY_SSID);
+        if (ssid_iterator != map.end() && !ssid_iterator->second.empty()) {
+            ssids.push_back(ssid_iterator->second);
+        }
+    }
+
+    return ssids;
+}
+
 bool contains(const std::string& ssid) {
     auto service_context = findServiceContext();
     if (service_context == nullptr) {

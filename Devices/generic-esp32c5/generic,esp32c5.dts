@@ -1,6 +1,7 @@
 /dts-v1/;
 
 #include <tactility/bindings/root.h>
+#include <tactility/bindings/esp32_ble.h>
 #include <tactility/bindings/esp32_wifi_pinned.h>
 #include <tactility/bindings/esp32_gpio.h>
 #include <tactility/bindings/esp32_i2c.h>
@@ -14,6 +15,11 @@
 
 	wifi0 {
 		compatible = "espressif,esp32-wifi-pinned";
+		status = "disabled";
+	};
+
+	ble0 {
+		compatible = "espressif,esp32-ble";
 		status = "disabled";
 	};
 
@@ -40,9 +46,25 @@
 		};
 	};
 
+	/*
+	 * T_DIN originally landed on GPIO 15, which is MSPI_IOMUX_PIN_NUM_CS1 - the ESP32-C5 PSRAM
+	 * chip select. This driver bit-bangs T_DIN, and driving GPIO 15 detaches PSRAM, so the board
+	 * died later inside the allocator; that was the cause of the early boot panics here. GPIO 15
+	 * is IOMUX-only and cannot be rerouted through the GPIO matrix, so the wire itself had to be
+	 * moved - it is now on GPIO 24. The driver refuses any MSPI pin outright so a regression
+	 * names itself instead of panicking somewhere unrelated.
+	 *
+	 * miso/sck/cs are the board's original values and were corroborated by a bit-banged sweep,
+	 * but that sweep ran while GPIO 15 was still disturbing the MSPI bus, so treat them as
+	 * probable rather than proven. T_IRQ was independently observed on GPIO 26 (tracked a
+	 * physical press cleanly); this driver polls and does not use it.
+	 *
+	 * Not yet confirmed: that the panel reports coordinates under an actual press. Boot is clean
+	 * and the device binds, but touch response has not been observed on hardware.
+	 */
 	touch {
 		compatible = "xptek,xpt2046-softspi";
-		pin-mosi = <&gpio0 15 GPIO_FLAG_NONE>;
+		pin-mosi = <&gpio0 24 GPIO_FLAG_NONE>; // T_DIN, rewired off GPIO 15 (PSRAM chip select)
 		pin-miso = <&gpio0 9 GPIO_FLAG_NONE>;
 		pin-sck = <&gpio0 23 GPIO_FLAG_NONE>;
 		pin-cs = <&gpio0 28 GPIO_FLAG_NONE>;

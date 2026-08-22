@@ -74,6 +74,11 @@ struct WifiServiceState {
     // clobber each other, otherwise a caller's explicit pause (e.g. AutoScanPauseGuard during a
     // co-processor OTA) can be silently cleared by an unrelated connect/disconnect finishing.
     bool pauseAutoConnect = false;
+    // Set by a deliberate disconnect() and only cleared by an explicit connect() or a radio
+    // off->on cycle. Distinct from pauseAutoConnect: a user who disconnects wants to stay
+    // disconnected until they pick a network, but still wants the network list to keep
+    // refreshing, so this blocks auto-connect without blocking scanning.
+    bool userDisconnected = false;
     // External: only setAutoScanPaused() may set/clear this. Read alongside pauseAutoConnect to
     // gate scan scheduling (both must be false to scan).
     std::atomic<bool> externalScanPause{false};
@@ -89,6 +94,8 @@ WifiServiceState state;
 bool started = false;
 
 void onWifiDeviceEvent(Device* device, void* context, ::WifiEvent event);
+void dispatchScan();
+void dispatchInitialAutoConnect();
 
 // ---- Helpers ----
 
@@ -151,8 +158,15 @@ void dispatchSetEnabled(bool enabled) {
         }
 
         state.pauseAutoConnect = false;
+        state.userDisconnected = false;
         state.lastScanTime = 0;
         publishRadioState(WIFI_RADIO_STATE_ON);
+
+        // Get online immediately instead of waiting for onAutoConnectTimer() to become eligible:
+        // shouldScanForAutoConnect() compares against absolute uptime, so lastScanTime=0 means
+        // "once the system has been up AUTO_SCAN_INTERVAL", not "now". This also skips the full
+        // dual-band scan entirely when a saved network is available.
+        getMainDispatcher().dispatch([] { dispatchInitialAutoConnect(); });
     } else {
         publishRadioState(WIFI_RADIO_STATE_OFF_PENDING);
 
@@ -178,6 +192,39 @@ void dispatchScan() {
     error_t result = wifi_scan(state.device);
     if (result != ERROR_NONE) {
         LOG_I(TAG, "Can't start scan (%s)", error_to_string(result));
+    }
+}
+
+// Finds a saved auto-connect AP without needing scan results. esp_wifi_connect() does its own
+// targeted search for the SSID, so a full discovery sweep is unnecessary just to get online.
+bool findSavedAutoConnectAp(settings::WifiApSettings& out) {
+    for (const auto& ssid : settings::getSavedSsids()) {
+        settings::WifiApSettings loaded;
+        if (settings::load(ssid, loaded) && loaded.autoConnect) {
+            out = loaded;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Runs once when the radio comes up. A full scan on this dual-band part sweeps ~38 channels
+// across 2.4GHz and 5GHz (5GHz DFS channels must be scanned passively) and costs ~10s, which is
+// pure latency when we already know which network we want. If nothing is saved we fall back to
+// scanning so the UI still gets a network list and auto-connect can pick something up later.
+void dispatchInitialAutoConnect() {
+    if (!started || state.device == nullptr || !device_is_ready(state.device)) return;
+
+    settings::WifiApSettings target;
+    if (!state.userDisconnected && findSavedAutoConnectAp(target)) {
+        LOG_I(TAG, "Auto-connecting to %s without scanning first", target.ssid.c_str());
+        connect(target, false);
+        // connect() pauses auto-connect (it assumes a manual/user call); undo that since this
+        // call was automatic. A failed attempt also unpauses via STATION_CONNECTION_RESULT,
+        // after which the periodic scan-based auto-connect takes over.
+        state.pauseAutoConnect = false;
+    } else {
+        dispatchScan();
     }
 }
 
@@ -241,6 +288,10 @@ bool findAutoConnectAp(settings::WifiApSettings& out) {
 
 void dispatchAutoConnect() {
     LOG_I(TAG, "dispatchAutoConnect()");
+    if (state.userDisconnected) {
+        // The user deliberately disconnected; only an explicit connect() may put them back on.
+        return;
+    }
     if (state.pauseAutoConnect || state.externalScanPause.load()) {
         // A manual disconnect() or an in-progress manual connect() has paused
         // auto-connect, or a caller (e.g. AutoScanPauseGuard) has externally paused it.
@@ -266,9 +317,16 @@ void dispatchAutoConnect() {
     }
 }
 
-bool shouldScanForAutoConnect() {
-    bool radio_scannable = getRadioState() == RadioState::On && !isScanning() &&
-        !state.pauseAutoConnect && !state.externalScanPause.load();
+// Gates the periodic scan that keeps the network list fresh. Deliberately *not* tied to
+// auto-connect eligibility: RadioState::On only means "on and not connected", so gating on it
+// alone stopped all scanning the moment we associated - the user then had to toggle the radio
+// off and on to see any available networks. Auto-connect has its own guards in
+// dispatchAutoConnect(), so scanning while connected is safe.
+bool shouldScanPeriodically() {
+    const auto radio_state = getRadioState();
+    // ConnectionPending is excluded on purpose: scanning mid-association can disrupt it.
+    const bool radio_scannable = (radio_state == RadioState::On || radio_state == RadioState::ConnectionActive) &&
+        !isScanning() && !state.pauseAutoConnect && !state.externalScanPause.load();
     if (!radio_scannable) return false;
 
     TickType_t current_time = get_ticks();
@@ -279,7 +337,7 @@ bool shouldScanForAutoConnect() {
 
 void onAutoConnectTimer() {
     if (!started || state.device == nullptr) return;
-    if (shouldScanForAutoConnect()) {
+    if (shouldScanPeriodically()) {
         getMainDispatcher().dispatch([] { dispatchScan(); });
     }
 }
@@ -294,13 +352,18 @@ void onWifiDeviceEvent(Device* device, void* /*context*/, ::WifiEvent event) {
 
         case WIFI_EVENT_TYPE_STATION_STATE_CHANGED:
             if (event.station_state == WIFI_STATION_STATE_DISCONNECTED) {
-                // Don't touch pauseAutoConnect here: a deliberate disconnect() sets it
-                // and relies on it staying set until a new connection is established.
-                // Resetting it on every disconnect (including deliberate ones) would
-                // let auto-connect immediately reconnect the user. Attempts that fail
-                // while pending are unpaused via WIFI_EVENT_TYPE_STATION_CONNECTION_RESULT below.
+                // Don't touch pauseAutoConnect here: it tracks an in-flight connection attempt
+                // and is cleared by WIFI_EVENT_TYPE_STATION_CONNECTION_RESULT below. A
+                // deliberate disconnect is tracked separately via userDisconnected.
                 NetworkDisconnectedEvent disconnected_event = { .device = device };
                 system_event_emit(KERNEL_EVENT_NETWORK_DISCONNECTED, &disconnected_event, sizeof(disconnected_event));
+
+                if (state.userDisconnected) {
+                    // Refresh the network list right away so the user can pick a different AP.
+                    // The periodic scan can't be relied on here: WifiManage externally pauses
+                    // auto-scan for as long as it is open, which is exactly when this happens.
+                    getMainDispatcher().dispatch([] { dispatchScan(); });
+                }
             }
             break;
 
@@ -409,6 +472,9 @@ void connect(const settings::WifiApSettings& ap, bool remember) {
         }
         // Stop auto-connecting until the connection is established.
         state.pauseAutoConnect = true;
+        // Picking a network (or an auto-connect that got past the userDisconnected guard)
+        // ends the "stay disconnected" state.
+        state.userDisconnected = false;
         state.connectionTarget = ap;
         state.connectionTargetRemember = remember;
         radio_off = !device_is_ready(state.device);
@@ -433,8 +499,11 @@ void disconnect() {
             return;
         }
         state.connectionTarget = settings::WifiApSettings("", "");
-        // Manual disconnect (e.g. via app) should stop auto-connecting until a new connection is established.
-        state.pauseAutoConnect = true;
+        // A manual disconnect must survive until the user picks a network again. Note this
+        // deliberately does not set pauseAutoConnect: that also suppresses scanning, which
+        // would leave the network list frozen on the AP the user just left.
+        state.userDisconnected = true;
+        state.pauseAutoConnect = false;
     }
 
     getMainDispatcher().dispatch([] { dispatchDisconnect(); });

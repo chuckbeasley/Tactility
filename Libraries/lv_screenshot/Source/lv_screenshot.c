@@ -1,5 +1,7 @@
 #include "lv_screenshot.h"
 
+#if LV_USE_SNAPSHOT
+
 #include "save_png.h"
 #include "save_bmp.h"
 
@@ -66,4 +68,15 @@ static void data_pre_processing(lv_draw_buf_t* snapshot, uint16_t bpp, lv_100ask
 
 #ifdef __cplusplus
 }
+#endif
+
+#else
+
+bool lv_screenshot_create(lv_obj_t* obj, lv_100ask_screenshot_sv_t screenshot_sv, const char* filename) {
+    LV_UNUSED(obj);
+    LV_UNUSED(screenshot_sv);
+    LV_UNUSED(filename);
+    return false;
+}
+
 #endif
