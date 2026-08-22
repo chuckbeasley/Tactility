@@ -25,3 +25,4 @@ sdkconfig.board.*.dev
 
 .caveman.json
 .ai/mcp
+Data/data/tactility/provisioning/cb2enterprises5G.ap.properties

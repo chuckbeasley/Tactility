@@ -9,7 +9,10 @@
 #include <host/ble_gap.h>
 #include <host/ble_hs_mbuf.h>
 
+#include <esp_heap_caps.h>
+
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 constexpr auto* TAG = "esp32_ble_scan";
@@ -23,11 +26,60 @@ static BleCtx* s_scan_ctx = nullptr;
 
 // ---- Scan data helpers ----
 
+static void* scan_calloc(size_t count, size_t size) {
+#if defined(CONFIG_SPIRAM)
+    // These buffers are tens of kilobytes and are only touched from task context, so keep
+    // them out of the scarce internal heap where possible.
+    void* ptr = heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM);
+    if (ptr != nullptr) return ptr;
+#endif
+    return calloc(count, size);
+}
+
+static bool ensure_scan_capacity(BleCtx* ctx, size_t needed) {
+    if (needed <= ctx->scan_capacity) return true;
+    if (needed > BLE_SCAN_MAX_RESULTS) return false;
+
+    size_t new_capacity = ctx->scan_capacity == 0 ? BLE_SCAN_INITIAL_RESULTS : ctx->scan_capacity;
+    while (new_capacity < needed) {
+        new_capacity *= 2;
+    }
+    if (new_capacity > BLE_SCAN_MAX_RESULTS) {
+        new_capacity = BLE_SCAN_MAX_RESULTS;
+    }
+    if (new_capacity < needed) return false;
+
+    auto* new_results = (BtPeerRecord*)scan_calloc(new_capacity, sizeof(BtPeerRecord));
+    auto* new_addrs   = (ble_addr_t*)scan_calloc(new_capacity, sizeof(ble_addr_t));
+    if (new_results == nullptr || new_addrs == nullptr) {
+        free(new_addrs);
+        free(new_results);
+        return false;
+    }
+
+    if (ctx->scan_count > 0) {
+        memcpy(new_results, ctx->scan_results, ctx->scan_count * sizeof(BtPeerRecord));
+        memcpy(new_addrs, ctx->scan_addrs, ctx->scan_count * sizeof(ble_addr_t));
+    }
+    free(ctx->scan_results);
+    free(ctx->scan_addrs);
+    ctx->scan_results  = new_results;
+    ctx->scan_addrs    = new_addrs;
+    ctx->scan_capacity = new_capacity;
+    return true;
+}
+
 void ble_scan_clear_results(struct Device* device) {
     BleCtx* ctx = ble_get_ctx(device);
     xSemaphoreTake(ctx->scan_mutex, portMAX_DELAY);
     ctx->scan_count = 0;
-    memset(ctx->scan_results, 0, sizeof(ctx->scan_results));
+    ctx->scan_overflowed = false;
+    if (ctx->scan_results != nullptr && ctx->scan_capacity > 0) {
+        memset(ctx->scan_results, 0, ctx->scan_capacity * sizeof(BtPeerRecord));
+    }
+    if (ctx->scan_addrs != nullptr && ctx->scan_capacity > 0) {
+        memset(ctx->scan_addrs, 0, ctx->scan_capacity * sizeof(ble_addr_t));
+    }
     xSemaphoreGive(ctx->scan_mutex);
 }
 
@@ -71,10 +123,15 @@ int ble_gap_disc_event_handler(struct ble_gap_event* event, void* arg) {
                         break;
                     }
                 }
-                if (!found && ctx->scan_count < 64) {
-                    ctx->scan_results[ctx->scan_count] = record;
-                    ctx->scan_addrs[ctx->scan_count]   = disc.addr; // full addr (type+val)
-                    ctx->scan_count++;
+                if (!found) {
+                    if (ensure_scan_capacity(ctx, ctx->scan_count + 1)) {
+                        ctx->scan_results[ctx->scan_count] = record;
+                        ctx->scan_addrs[ctx->scan_count]   = disc.addr; // full addr (type+val)
+                        ctx->scan_count++;
+                    } else if (!ctx->scan_overflowed) {
+                        ctx->scan_overflowed = true;
+                        LOG_W(TAG, "Scan results full (%u peers), dropping further peers", (unsigned)ctx->scan_capacity);
+                    }
                 }
                 xSemaphoreGive(ctx->scan_mutex);
             }
@@ -150,6 +207,12 @@ static int name_res_gap_callback(struct ble_gap_event* event, void* arg) {
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
                 LOG_I(TAG, "Name resolution: connected (idx=%u handle=%u)", (unsigned)idx, event->connect.conn_handle);
+                ctx->name_res_conn_handle.store(event->connect.conn_handle);
+                if (!ble_get_scan_active(ctx->device)) {
+                    // Scan was stopped while this connection was being established.
+                    ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+                    break;
+                }
                 static const ble_uuid16_t device_name_uuid = BLE_UUID16_INIT(0x2A00);
                 int rc = ble_gattc_read_by_uuid(event->connect.conn_handle,
                                                 1, 0xFFFF,
@@ -161,12 +224,14 @@ static int name_res_gap_callback(struct ble_gap_event* event, void* arg) {
                 }
             } else {
                 LOG_I(TAG, "Name resolution: connect failed (idx=%u status=%d)", (unsigned)idx, event->connect.status);
+                ctx->name_res_conn_handle.store(BLE_HS_CONN_HANDLE_NONE);
                 ble_resolve_next_unnamed_peer(ctx->device, idx + 1);
             }
             break;
 
         case BLE_GAP_EVENT_DISCONNECT:
             LOG_I(TAG, "Name resolution: disconnected (idx=%u)", (unsigned)idx);
+            ctx->name_res_conn_handle.store(BLE_HS_CONN_HANDLE_NONE);
             ble_resolve_next_unnamed_peer(ctx->device, idx + 1);
             break;
 
@@ -209,7 +274,8 @@ void ble_resolve_next_unnamed_peer(struct Device* device, size_t start_idx) {
         // can't flip radio_state between the check and the call.
         xSemaphoreTake(ctx->scan_mutex, portMAX_DELAY);
         radio_on = ctx->radio_state.load() == BT_RADIO_STATE_ON;
-        if (radio_on) {
+        bool still_scanning = ctx->scan_active.load();
+        if (radio_on && still_scanning) {
             while (i < ctx->scan_count) {
                 if (ctx->scan_results[i].name[0] == '\0') {
                     addr  = ctx->scan_addrs[i];
@@ -237,6 +303,12 @@ void ble_resolve_next_unnamed_peer(struct Device* device, size_t start_idx) {
             return;
         }
 
+        if (!still_scanning) {
+            // scan_stop() already cleared scan_active and published ScanFinished.
+            LOG_I(TAG, "Name resolution: aborting (scan stopped)");
+            return;
+        }
+
         if (!found) {
             LOG_I(TAG, "Name resolution: complete (%u devices)", (unsigned)i);
             ble_set_scan_active(device, false);
@@ -252,6 +324,19 @@ void ble_resolve_next_unnamed_peer(struct Device* device, size_t start_idx) {
 
         LOG_I(TAG, "Name resolution: ble_gap_connect failed idx=%u rc=%d, skipping", (unsigned)i, rc);
         ++i;
+    }
+}
+
+void ble_scan_abort_name_resolution(struct Device* device) {
+    BleCtx* ctx = ble_get_ctx(device);
+
+    // Cancel a connection attempt that hasn't completed yet. Harmless (returns an error)
+    // when no attempt is outstanding.
+    ble_gap_conn_cancel();
+
+    uint16_t handle = ctx->name_res_conn_handle.exchange(BLE_HS_CONN_HANDLE_NONE);
+    if (handle != BLE_HS_CONN_HANDLE_NONE) {
+        ble_gap_terminate(handle, BLE_ERR_REM_USER_CONN_TERM);
     }
 }
 

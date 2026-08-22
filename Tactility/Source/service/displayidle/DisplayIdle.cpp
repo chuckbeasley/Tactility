@@ -23,6 +23,7 @@
 namespace tt::service::displayidle {
 
 constexpr auto* TAG = "DisplayIdle";
+extern const ServiceManifest manifest;
 
 constexpr uint32_t kWakeActivityThresholdMs = 100;
 
@@ -279,9 +280,13 @@ void DisplayIdleService::reloadSettings() {
 }
 
 std::shared_ptr<DisplayIdleService> findService() {
-    return std::static_pointer_cast<DisplayIdleService>(
-        findServiceById("DisplayIdle")
-    );
+    auto service = std::static_pointer_cast<DisplayIdleService>(findServiceById("DisplayIdle"));
+    if (service != nullptr) {
+        return service;
+    }
+
+    addService(manifest);
+    return std::static_pointer_cast<DisplayIdleService>(findServiceById("DisplayIdle"));
 }
 
 extern const ServiceManifest manifest = {

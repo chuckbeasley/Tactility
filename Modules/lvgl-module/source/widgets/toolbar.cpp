@@ -108,6 +108,9 @@ lv_obj_t* lvgl_toolbar_create(lv_obj_t* parent, const char* title) {
     lv_obj_t* obj = lv_obj_class_create_obj(&toolbar_class, parent);
     lv_obj_class_init_obj(obj);
     lv_obj_set_height(obj, toolbar_height);
+    // App roots use column flex layouts. A scrollable/content-sized sibling can otherwise
+    // shrink the toolbar below the title and action controls' required height.
+    lv_obj_set_style_min_height(obj, toolbar_height, LV_STATE_DEFAULT);
 
     auto* toolbar = reinterpret_cast<Toolbar*>(obj);
     lv_obj_set_width(obj, LV_PCT(100));

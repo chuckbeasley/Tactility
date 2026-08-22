@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <new>
 #include <vector>
 #include <host/ble_gap.h>
 #include <host/ble_gatt.h>
@@ -189,7 +190,9 @@ static error_t midi_stop(struct Device* device) {
         ble_midi_set_conn_handle(device, BLE_HS_CONN_HANDLE_NONE);
     }
     if (!ble_spp_get_active(device) && !ble_hid_get_active(device)) {
-        ble_gap_adv_stop();
+        if (ble_gap_adv_active()) {
+            ble_gap_adv_stop();
+        }
     }
     return ERROR_NONE;
 }
@@ -231,8 +234,17 @@ extern const BtMidiApi nimble_midi_api = {
 // ---- MIDI child driver lifecycle ----
 
 static error_t esp32_ble_midi_start_device(struct Device* device) {
-    BleMidiCtx* mctx = new BleMidiCtx();
+    BleMidiCtx* mctx = new (std::nothrow) BleMidiCtx();
+    if (mctx == nullptr) {
+        LOG_E(TAG, "midi_start_device: context allocation failed");
+        return ERROR_OUT_OF_MEMORY;
+    }
     mctx->rx_mutex = xSemaphoreCreateMutex();
+    if (mctx->rx_mutex == nullptr) {
+        LOG_E(TAG, "midi_start_device: rx mutex create failed");
+        delete mctx;
+        return ERROR_OUT_OF_MEMORY;
+    }
     device_set_driver_data(device, mctx);
     return ERROR_NONE;
 }

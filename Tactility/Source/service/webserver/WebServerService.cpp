@@ -15,6 +15,7 @@
 #include <Tactility/network/HttpdReq.h>
 #include <Tactility/network/Url.h>
 #include <Tactility/service/wifi/Wifi.h>
+#include <Tactility/service/ServiceRegistration.h>
 
 #include <tactility/check.h>
 #include <tactility/filesystem/file_system.h>
@@ -55,6 +56,7 @@
 namespace tt::service::webserver {
 
 constexpr auto* TAG = "WebServerService";
+extern const ServiceManifest manifest;
 
 // Helper to convert chip model enum to human-readable string
 static const char* getChipModelName(esp_chip_model_t model) {
@@ -87,10 +89,23 @@ static void publish_event(WebServerService* webserver, WebServerEvent event) {
     webserver->getPubsub()->publish(event);
 }
 
-std::shared_ptr<PubSub<WebServerEvent>> getPubsub() {
+static WebServerService* ensureService() {
     WebServerService* webserver = g_webServerInstance.load();
+    if (webserver != nullptr) {
+        return webserver;
+    }
+    addService(manifest);
+    webserver = g_webServerInstance.load();
     if (webserver == nullptr) {
-        check(false, "Service not running");
+        LOG_E(TAG, "Failed to lazy-start service");
+    }
+    return webserver;
+}
+
+std::shared_ptr<PubSub<WebServerEvent>> getPubsub() {
+    WebServerService* webserver = ensureService();
+    if (webserver == nullptr) {
+        check(false, "Service not available");
     }
 
     return webserver->getPubsub();
@@ -207,12 +222,13 @@ bool WebServerService::onStart(ServiceContext& service) {
     statusbarIconId = lvgl::statusbar_icon_add();
     lvgl::statusbar_icon_set_visibility(statusbarIconId, false);
 
-    // Load and cache settings once at boot
+    // Avoid filesystem reads during early startup; initialize from in-memory
+    // defaults and let explicit settings changes refresh from storage later.
     bool serverEnabled;
     {
         auto lock = g_settingsMutex.asScopedLock();
         lock.lock();
-        g_cachedSettings = settings::webserver::loadOrGetDefault();
+        g_cachedSettings = settings::webserver::getDefault();
         g_settingsCached = true;
         serverEnabled = g_cachedSettings.webServerEnabled;
     }
@@ -231,7 +247,7 @@ bool WebServerService::onStart(ServiceContext& service) {
         LOG_I(TAG, "WebServer enabled in settings, starting HTTP server...");
         setEnabled(true);
     } else {
-        LOG_I(TAG, "WebServer disabled in settings, NOT starting HTTP server (saves ~10KB RAM)");
+        LOG_I(TAG, "WebServer disabled by default at startup, NOT starting HTTP server (saves ~10KB RAM)");
         setEnabled(false);
     }
 
@@ -1802,7 +1818,7 @@ extern const ServiceManifest manifest = {
 };
 
 void setWebServerEnabled(bool enabled) {
-    WebServerService* instance = g_webServerInstance.load();
+    WebServerService* instance = ensureService();
     if (instance != nullptr) {
         instance->setEnabled(enabled);
         // Don't log here - startServer()/stopServer() already log the actual result

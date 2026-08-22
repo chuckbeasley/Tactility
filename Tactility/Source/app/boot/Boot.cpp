@@ -55,6 +55,11 @@ std::atomic<bool> sdCardMissing = false;
 uint32_t bootAppInstanceId = 0;
 WindowId bootWindowId = 0;
 
+// Set from LV_EVENT_DRAW_POST_END on the splash image, i.e. once it has genuinely been
+// rendered. See waitForSplashToRender().
+std::atomic<bool> splashDrawn = false;
+std::atomic<TickType_t> splashDrawnTime = 0;
+
 #ifdef ESP_PLATFORM
 constexpr auto PARTITION_PREFIX = std::string("/");
 #else
@@ -185,6 +190,13 @@ void createSplashWidgets(lv_obj_t* root, void*) {
     const auto logo_path = lvgl::PATH_PREFIX + getBootAssetsPath(logo);
     LOG_I(TAG, "%s", logo_path.c_str());
     lv_image_set_src(image, logo_path.c_str());
+    // Lets runBootSequence() hold off its filesystem work until the splash is actually on
+    // screen - see waitForSplashToRender().
+    lv_obj_add_event_cb(image, [](lv_event_t*) {
+        if (!splashDrawn.exchange(true)) {
+            splashDrawnTime = get_ticks();
+        }
+    }, LV_EVENT_DRAW_POST_END, nullptr);
 
 #ifdef ESP_PLATFORM
     if (isUsbBootSplash) {
@@ -250,19 +262,35 @@ void startNextApp() {
     app_manager_start(launcher_app_id.c_str(), &launcher_instance_id);
 }
 
+// Blocks until the splash has actually been drawn (or we give up waiting).
+//
+// Everything after this point in the boot sequence hits the filesystem hard - registerApps()
+// alone takes about a second on an ESP32-C5 - and that contends with the LVGL task, which needs
+// the same file mutex to decode the splash PNG. A fixed 10ms delay used to stand in for this; it
+// was enough on a T-Lora Pager but not here, so the splash was still undecoded when the launcher
+// replaced it and the user only ever saw black. Waiting on the real draw makes it independent of
+// how fast the board happens to be.
+void waitForSplashToRender() {
+    constexpr uint32_t TIMEOUT_MS = 2000;
+    constexpr uint32_t POLL_MS = 5;
+    for (uint32_t waited = 0; waited < TIMEOUT_MS; waited += POLL_MS) {
+        if (splashDrawn) {
+            return;
+        }
+        delay_millis(POLL_MS);
+    }
+    LOG_W(TAG, "Splash was not drawn within %ums, continuing", (unsigned)TIMEOUT_MS);
+}
+
 void runBootSequence(TickType_t startTime) {
     LOG_I(TAG, "Starting boot sequence");
 
-    // Give the UI some time to redraw
-    // If we don't do this, various init calls will read files and block SPI IO for the display
-    // This would result in a blank/black screen being shown during this phase of the boot process
-    // This works with 5 ms on a T-Lora Pager, so we give it 10 ms to be safe
-    delay_millis(10);
+    // Let the splash reach the panel before any of the work below starts competing for the
+    // filesystem and the SPI bus.
+    waitForSplashToRender();
 
     LOG_I(TAG, "Setup display");
     setupDisplay();
-    LOG_I(TAG, "Prepare file systems");
-    prepareFileSystems();
 
 #ifdef CONFIG_TT_USER_DATA_LOCATION_SD
     std::string sd_path;
@@ -275,7 +303,10 @@ void runBootSequence(TickType_t startTime) {
     if (!setupUsbBootMode()) {
         LOG_I(TAG, "initFromBootApp");
         registerApps();
-        waitForMinimalSplashDuration(startTime);
+        // Measured from when the splash actually appeared, not from app start: the render wait
+        // above can consume a good part of the minimum on its own, which would cut the visible
+        // time short.
+        waitForMinimalSplashDuration(splashDrawn ? splashDrawnTime.load() : startTime);
         startNextApp();
     }
 
@@ -292,6 +323,8 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     // Snapshot before runBootSequence() potentially clears the flag via setupUsbBootMode()
     isUsbBootSplash = hal::usb::isUsbBootMode();
     sdCardMissing = false;
+    splashDrawn = false;
+    splashDrawnTime = 0;
 
     AppEventSubscription sub {};
     sub.app_instance_id = appInstanceId;

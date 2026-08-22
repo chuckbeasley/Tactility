@@ -23,7 +23,9 @@
 #include <store/config/ble_store_config.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 
 constexpr auto* TAG = "esp32_ble";
 #include <tactility/log.h>
@@ -51,6 +53,7 @@ extern const BtMidiApi   nimble_midi_api;
 // is fixed by the NimBLE API (on_sync, on_reset) and cannot carry a Device*.
 // All other callbacks receive Device* via their void* arg parameter.
 static BleCtx* s_ctx = nullptr;
+static uint8_t s_own_addr_type = BLE_OWN_ADDR_PUBLIC;
 
 // ---- Context accessor ----
 // Returns the BleCtx for any BLE device (root or child).
@@ -429,6 +432,7 @@ static void on_sync() {
     if (rc != 0) LOG_E(TAG, "ensure_addr failed (rc=%d)", rc);
     rc = ble_hs_id_infer_auto(0, &own_addr_type);
     if (rc != 0) LOG_E(TAG, "infer addr type failed (rc=%d)", rc);
+    if (rc == 0) s_own_addr_type = own_addr_type;
 
     // Sync GATT handle values — pass the child device so the GATT callbacks
     // can retrieve child driver data (BleSppCtx / BleMidiCtx) without globals.
@@ -441,17 +445,11 @@ static void on_sync() {
     e.radio_state = BT_RADIO_STATE_ON;
     ble_publish_event(ctx->device, e);
 
-    // The Tactility bridge handles auto-start (SPP/MIDI/HID) in response to
-    // BT_EVENT_RADIO_STATE_CHANGED(ON), dispatched to the main task above.
-    // On a multi-core ESP32 the main task can preempt the NimBLE host task
-    // between ble_publish_event() and here, call hid/spp/midi_device_start(),
-    // set hid/spp/midi_active, and already start profile-specific advertising.
-    // Only start name-only advertising if no profile has been activated yet;
-    // otherwise we would overwrite the correct profile advertising with name-only,
-    // causing Windows to connect without seeing the HID/SPP/MIDI service UUID.
-    if (!ctx->hid_active.load() && !ctx->spp_active.load() && !ctx->midi_active.load()) {
-        ble_start_advertising(ctx->device, nullptr);
-    }
+    // Keep the radio ON but idle after sync. Starting connectable name-only
+    // advertising here can fail on constrained memory budgets and is not needed
+    // for central operations (scan/connect). Profile-specific advertising is
+    // still started on demand by spp/midi/hid start paths.
+    LOG_I(TAG, "BLE synced; idle until a profile requests advertising");
 }
 
 static void dispatch_disable_timer_cb(void* arg) {
@@ -515,7 +513,9 @@ static void host_task(void* param) {
 // ---- Advertising helpers ----
 
 void ble_start_advertising(struct Device* device, const ble_uuid128_t* svc_uuid) {
-    ble_gap_adv_stop();
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
 
     // Always sync the GAP name from ctx right before building the advertising packet,
     // so bluetooth_set_device_name() is honoured regardless of call timing.
@@ -585,7 +585,7 @@ void ble_start_advertising(struct Device* device, const ble_uuid128_t* svc_uuid)
     adv_params.itvl_min  = 160; // 100 ms
     adv_params.itvl_max  = 240; // 150 ms
 
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, nullptr, BLE_HS_FOREVER,
+    rc = ble_gap_adv_start(s_own_addr_type, nullptr, BLE_HS_FOREVER,
                            &adv_params, gap_event_handler, device);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         LOG_E(TAG, "startAdvertising: adv_start failed rc=%d", rc);
@@ -595,7 +595,9 @@ void ble_start_advertising(struct Device* device, const ble_uuid128_t* svc_uuid)
 }
 
 void ble_start_advertising_hid(struct Device* device, uint16_t appearance) {
-    ble_gap_adv_stop();
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
 
     // Always sync the GAP name from ctx right before building the advertising packet.
     BleCtx* _name_ctx = ble_get_ctx(device);
@@ -648,7 +650,7 @@ void ble_start_advertising_hid(struct Device* device, uint16_t appearance) {
     adv_params.itvl_min  = 160;
     adv_params.itvl_max  = 240;
 
-    rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, nullptr, BLE_HS_FOREVER,
+    rc = ble_gap_adv_start(s_own_addr_type, nullptr, BLE_HS_FOREVER,
                            &adv_params, gap_event_handler, device);
     if (rc != 0 && rc != BLE_HS_EALREADY) {
         LOG_E(TAG, "startAdvertisingHid: adv_start failed rc=%d", rc);
@@ -890,8 +892,12 @@ static error_t api_set_radio_enabled(struct Device* device, bool enabled) {
     } else {
         dispatch_disable(ctx);
     }
+    const BtRadioState state_after = ctx->radio_state.load();
     xSemaphoreGive(ctx->radio_mutex);
-    return ERROR_NONE;
+    if (enabled) {
+        return state_after == BT_RADIO_STATE_ON ? ERROR_NONE : ERROR_RESOURCE;
+    }
+    return state_after == BT_RADIO_STATE_OFF ? ERROR_NONE : ERROR_RESOURCE;
 }
 
 static error_t api_scan_start(struct Device* device) {
@@ -934,8 +940,11 @@ static error_t api_scan_start(struct Device* device) {
 static error_t api_scan_stop(struct Device* device) {
     BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
     if (!ctx) return ERROR_INVALID_STATE;
-    ble_gap_disc_cancel();
+    // Clear the flag first: the name-resolution chain re-checks it on every hop, so this
+    // stops it from starting another connection while we tear the current one down.
     ctx->scan_active.store(false);
+    ble_gap_disc_cancel();
+    ble_scan_abort_name_resolution(device);
     struct BtEvent e = {};
     e.type = BT_EVENT_SCAN_FINISHED;
     ble_publish_event(device, e);
@@ -1094,14 +1103,45 @@ const BluetoothApi nimble_bluetooth_api = {
 
 // ---- Driver lifecycle ----
 
-static void create_child_device(struct Device* parent, const char* name,
-                                Driver* drv, struct Device*& out) {
-    out = new Device { .address = 0, .name = name, .config = nullptr, .parent = nullptr, .internal = nullptr };
-    device_construct(out);
+static error_t create_child_device(struct Device* parent, const char* name,
+                                   Driver* drv, struct Device*& out) {
+    out = new (std::nothrow) Device { .address = 0, .name = name, .config = nullptr, .parent = nullptr, .internal = nullptr };
+    if (out == nullptr) {
+        LOG_E(TAG, "create_child_device(%s): allocation failed", name);
+        return ERROR_OUT_OF_MEMORY;
+    }
+
+    error_t error = device_construct(out);
+    if (error != ERROR_NONE) {
+        LOG_E(TAG, "create_child_device(%s): construct failed (%d)", name, error);
+        delete out;
+        out = nullptr;
+        return error;
+    }
+
     device_set_parent(out, parent);
     device_set_driver(out, drv);
-    device_add(out);
-    device_start(out);
+
+    error = device_add(out);
+    if (error != ERROR_NONE) {
+        LOG_E(TAG, "create_child_device(%s): add failed (%d)", name, error);
+        device_destruct(out);
+        delete out;
+        out = nullptr;
+        return error;
+    }
+
+    error = device_start(out);
+    if (error != ERROR_NONE) {
+        LOG_E(TAG, "create_child_device(%s): start failed (%d)", name, error);
+        device_remove(out);
+        device_destruct(out);
+        delete out;
+        out = nullptr;
+        return error;
+    }
+
+    return ERROR_NONE;
 }
 
 static void destroy_child_device(struct Device*& child) {
@@ -1114,9 +1154,64 @@ static void destroy_child_device(struct Device*& child) {
 }
 
 static error_t esp32_ble_start_device(struct Device* device) {
-    BleCtx* ctx = new BleCtx();
+    BleCtx* ctx = new (std::nothrow) BleCtx();
+    if (ctx == nullptr) {
+        LOG_E(TAG, "start_device: context allocation failed");
+        return ERROR_OUT_OF_MEMORY;
+    }
+    ctx->radio_mutex       = nullptr;
+    ctx->cb_mutex          = nullptr;
+    ctx->scan_mutex        = nullptr;
+    ctx->host_task_done_sem = nullptr;
+    ctx->midi_keepalive_timer = nullptr;
+    ctx->adv_restart_timer    = nullptr;
+    ctx->disable_timer        = nullptr;
+    ctx->serial_child         = nullptr;
+    ctx->midi_child           = nullptr;
+    ctx->hid_device_child     = nullptr;
+    ctx->scan_results         = nullptr;
+    ctx->scan_addrs           = nullptr;
+    ctx->scan_capacity        = 0;
+
+    auto cleanup_ctx = [ctx]() {
+        if (ctx->disable_timer != nullptr) {
+            esp_timer_stop(ctx->disable_timer);
+            esp_timer_delete(ctx->disable_timer);
+            ctx->disable_timer = nullptr;
+        }
+        if (ctx->host_task_done_sem != nullptr) {
+            vSemaphoreDelete(ctx->host_task_done_sem);
+            ctx->host_task_done_sem = nullptr;
+        }
+        if (ctx->scan_mutex != nullptr) {
+            vSemaphoreDelete(ctx->scan_mutex);
+            ctx->scan_mutex = nullptr;
+        }
+        free(ctx->scan_addrs);
+        ctx->scan_addrs = nullptr;
+        free(ctx->scan_results);
+        ctx->scan_results = nullptr;
+        ctx->scan_capacity = 0;
+        ctx->scan_count = 0;
+        if (ctx->cb_mutex != nullptr) {
+            vSemaphoreDelete(ctx->cb_mutex);
+            ctx->cb_mutex = nullptr;
+        }
+        if (ctx->radio_mutex != nullptr) {
+            vSemaphoreDelete(ctx->radio_mutex);
+            ctx->radio_mutex = nullptr;
+        }
+        delete ctx;
+    };
+
     ctx->radio_mutex = xSemaphoreCreateMutex();
     ctx->cb_mutex    = xSemaphoreCreateMutex();
+    if (ctx->radio_mutex == nullptr || ctx->cb_mutex == nullptr) {
+        LOG_E(TAG, "start_device: mutex create failed");
+        cleanup_ctx();
+        return ERROR_OUT_OF_MEMORY;
+    }
+
     ctx->radio_state.store(BT_RADIO_STATE_OFF);
     ctx->scan_active.store(false);
     ctx->hid_host_active.store(false);
@@ -1141,12 +1236,24 @@ static error_t esp32_ble_start_device(struct Device* device) {
     ctx->serial_child         = nullptr;
     ctx->midi_child           = nullptr;
     ctx->hid_device_child     = nullptr;
+    ctx->scan_results         = nullptr;
+    ctx->scan_addrs           = nullptr;
+    ctx->scan_capacity        = 0;
     ctx->scan_mutex           = xSemaphoreCreateMutex();
+    if (ctx->scan_mutex == nullptr) {
+        LOG_E(TAG, "start_device: scan mutex create failed");
+        cleanup_ctx();
+        return ERROR_OUT_OF_MEMORY;
+    }
+
     ctx->scan_count           = 0;
-    memset(ctx->scan_results, 0, sizeof(ctx->scan_results));
+    ctx->scan_overflowed      = false;
+    ctx->name_res_conn_handle.store(BLE_HS_CONN_HANDLE_NONE);
     ctx->host_task_done_sem   = xSemaphoreCreateBinary();
     if (ctx->host_task_done_sem == nullptr) {
         LOG_E(TAG, "start_device: host_task_done_sem create failed");
+        cleanup_ctx();
+        return ERROR_OUT_OF_MEMORY;
     }
 
     // Create the disable timer used to dispatch dispatchDisable off the NimBLE host task.
@@ -1158,6 +1265,8 @@ static error_t esp32_ble_start_device(struct Device* device) {
     int rc = esp_timer_create(&disable_args, &ctx->disable_timer);
     if (rc != ESP_OK) {
         LOG_E(TAG, "start_device: disable timer create failed (rc=%d)", rc);
+        cleanup_ctx();
+        return ERROR_RESOURCE;
     }
 
     device_set_driver_data(device, ctx);
@@ -1166,9 +1275,32 @@ static error_t esp32_ble_start_device(struct Device* device) {
     // Create child devices for the serial, MIDI and HID device profiles.
     // device_start() on each child will invoke start_device (for serial/midi)
     // which initialises their driver data (BleSppCtx / BleMidiCtx).
-    create_child_device(device, "ble_serial",     &esp32_ble_serial_driver,     ctx->serial_child);
-    create_child_device(device, "ble_midi",       &esp32_ble_midi_driver,       ctx->midi_child);
-    create_child_device(device, "ble_hid_device", &esp32_ble_hid_device_driver, ctx->hid_device_child);
+    error_t error = create_child_device(device, "ble_serial", &esp32_ble_serial_driver, ctx->serial_child);
+    if (error != ERROR_NONE) {
+        s_ctx = nullptr;
+        device_set_driver_data(device, nullptr);
+        cleanup_ctx();
+        return error;
+    }
+
+    error = create_child_device(device, "ble_midi", &esp32_ble_midi_driver, ctx->midi_child);
+    if (error != ERROR_NONE) {
+        destroy_child_device(ctx->serial_child);
+        s_ctx = nullptr;
+        device_set_driver_data(device, nullptr);
+        cleanup_ctx();
+        return error;
+    }
+
+    error = create_child_device(device, "ble_hid_device", &esp32_ble_hid_device_driver, ctx->hid_device_child);
+    if (error != ERROR_NONE) {
+        destroy_child_device(ctx->midi_child);
+        destroy_child_device(ctx->serial_child);
+        s_ctx = nullptr;
+        device_set_driver_data(device, nullptr);
+        cleanup_ctx();
+        return error;
+    }
 
     return ERROR_NONE;
 }
@@ -1194,6 +1326,12 @@ static error_t esp32_ble_stop_device(struct Device* device) {
         vSemaphoreDelete(ctx->scan_mutex);
         ctx->scan_mutex = nullptr;
     }
+    free(ctx->scan_addrs);
+    ctx->scan_addrs = nullptr;
+    free(ctx->scan_results);
+    ctx->scan_results = nullptr;
+    ctx->scan_capacity = 0;
+    ctx->scan_count = 0;
 
     if (ctx->host_task_done_sem != nullptr) {
         vSemaphoreDelete(ctx->host_task_done_sem);

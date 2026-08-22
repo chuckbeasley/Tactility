@@ -23,6 +23,7 @@
 #include <freertos/semphr.h>
 
 #include <atomic>
+#include <cstddef>
 
 // ---- Per-module headers (structs, accessors, sub-API externs) ----
 
@@ -31,6 +32,11 @@
 #include <bluetooth/esp32_ble_hid.h>
 
 #define BLE_MAX_CALLBACKS 8
+// Scan storage is allocated lazily and grown on demand. Records are large (BtPeerRecord
+// carries a 249-byte name field), so the buffer is preferably placed in PSRAM; on boards
+// without it, growth simply stops early when the allocation fails.
+#define BLE_SCAN_INITIAL_RESULTS 16
+#define BLE_SCAN_MAX_RESULTS 256
 
 struct BleCallbackEntry {
     BtEventCallback fn;
@@ -94,9 +100,15 @@ struct BleCtx {
 
     // Scan data (guarded by scan_mutex)
     SemaphoreHandle_t scan_mutex;
-    BtPeerRecord      scan_results[64];
-    ble_addr_t        scan_addrs[64];
+    BtPeerRecord*     scan_results;
+    ble_addr_t*       scan_addrs;
+    size_t            scan_capacity;
     size_t            scan_count;
+    // True once a peer has been dropped for lack of capacity; keeps the warning to once per scan.
+    bool              scan_overflowed;
+    // Connection handle of the name-resolution link currently being read, or
+    // BLE_HS_CONN_HANDLE_NONE. Lets scan_stop tear down an in-flight resolution.
+    std::atomic<uint16_t> name_res_conn_handle;
 
     // Device reference (passed to BtEventCallback)
     struct Device* device;
@@ -121,6 +133,8 @@ void ble_set_scan_active(struct Device* device, bool v);
 
 // ---- Scan data management (defined in esp32_ble_scan.cpp) ----
 void ble_scan_clear_results(struct Device* device);
+// Tears down any in-flight name-resolution connection so a stopped scan stops immediately.
+void ble_scan_abort_name_resolution(struct Device* device);
 
 // ---- Event publishing ----
 void ble_publish_event(struct Device* device, struct BtEvent event);

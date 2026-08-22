@@ -18,6 +18,10 @@
 
 namespace tt::app::btmanage {
 
+// Upper bound on peer-list rebuild frequency. A busy RF environment can produce dozens of
+// BT_EVENT_PEER_FOUND per second and each rebuild is a full lv_obj_clean() + repopulate.
+static constexpr uint32_t LIST_REBUILD_INTERVAL_MS = 750;
+
 static void onBackPressed(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
     // Async, non-blocking - must NOT call app_manager_stop() directly here: that bound-waits
@@ -38,6 +42,9 @@ static void onEnableSwitchChanged(lv_event_t* event) {
 static void onEnableOnBootSwitchChanged(lv_event_t* event) {
     auto* enable_switch = static_cast<lv_obj_t*>(lv_event_get_target(event));
     bool is_on = lv_obj_has_state(enable_switch, LV_STATE_CHECKED);
+    // setEnableOnBoot() updates the in-memory cache before it touches the filesystem, so
+    // dispatching keeps the (slow) save off the LVGL task while shouldEnableOnBoot() still
+    // reflects the new value almost immediately.
     getMainDispatcher().dispatch([is_on] {
         bluetooth::settings::setEnableOnBoot(is_on);
     });
@@ -167,31 +174,40 @@ void View::updateScanning() {
     }
 }
 
-void View::updatePeerList() {
-    lv_obj_clean(peers_list);
+void View::createEnableOnBootRow(lv_obj_t* parent) {
+    // Deliberately a sibling of peers_list rather than a child: updatePeerList() calls
+    // lv_obj_clean(), so a row living inside the list would be destroyed and recreated on
+    // every rebuild. That is what made this switch flip back to its old value - the tap
+    // persisted asynchronously, but the rebuild that followed recreated the switch from the
+    // not-yet-updated setting. Built once here, it simply keeps whatever the user set.
+    auto* wrapper = lv_obj_create(parent);
+    lv_obj_set_size(wrapper, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_hor(wrapper, 8, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(wrapper, 0, LV_STATE_DEFAULT);
+    lv_obj_remove_flag(wrapper, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Enable on boot row
-    auto* enable_on_boot_wrapper = lv_obj_create(peers_list);
-    lv_obj_set_size(enable_on_boot_wrapper, LV_PCT(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_pad_all(enable_on_boot_wrapper, 0, LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(enable_on_boot_wrapper, 0, LV_STATE_DEFAULT);
-
-    auto* enable_label = lv_label_create(enable_on_boot_wrapper);
+    auto* enable_label = lv_label_create(wrapper);
     lv_label_set_text(enable_label, "Enable on boot");
     lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
 
-    enable_on_boot_switch = lv_switch_create(enable_on_boot_wrapper);
+    enable_on_boot_switch = lv_switch_create(wrapper);
     lv_obj_align(enable_on_boot_switch, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_add_event_cb(enable_on_boot_switch, onEnableOnBootSwitchChanged, LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(enable_on_boot_wrapper, onEnableOnBootParentClicked, LV_EVENT_SHORT_CLICKED, enable_on_boot_switch);
+    lv_obj_add_event_cb(wrapper, onEnableOnBootParentClicked, LV_EVENT_SHORT_CLICKED, enable_on_boot_switch);
 
     if (lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT) {
-        lv_obj_set_style_pad_ver(enable_on_boot_wrapper, 2, LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_ver(wrapper, 2, LV_STATE_DEFAULT);
     } else {
-        lv_obj_set_style_pad_ver(enable_on_boot_wrapper, 8, LV_STATE_DEFAULT);
+        lv_obj_set_style_pad_ver(wrapper, 8, LV_STATE_DEFAULT);
     }
 
     updateEnableOnBootToggle();
+}
+
+void View::updatePeerList() {
+    const int32_t scroll_y = lv_obj_get_scroll_y(peers_list);
+
+    lv_obj_clean(peers_list);
 
     using enum bluetooth::RadioState;
     if (state->getRadioState() == On) {
@@ -215,8 +231,6 @@ void View::updatePeerList() {
             auto* no_devices_label = lv_label_create(peers_list);
             lv_label_set_text(no_devices_label, "No devices found.");
         }
-        // Never hide peers_list: it always contains the "Enable on boot" row.
-        // While scanning with no results the spinner in the toolbar provides feedback.
 
         // Scan button
         auto* scan_button = lv_button_create(peers_list);
@@ -226,6 +240,35 @@ void View::updatePeerList() {
         lv_label_set_text(scan_label, state->isScanning() ? "Stop scan" : "Scan");
         lv_obj_add_event_cb(scan_button, onScanButtonClicked, LV_EVENT_SHORT_CLICKED, context);
     }
+
+    // Restore where the user was: a rebuild triggered by a newly discovered peer must not
+    // yank the list back to the top while they are reading further down.
+    if (scroll_y > 0) {
+        lv_obj_update_layout(peers_list);
+        lv_obj_scroll_to_y(peers_list, scroll_y, LV_ANIM_OFF);
+    }
+}
+
+bool View::isUserInteractingWithList() const {
+    if (peers_list == nullptr) {
+        return false;
+    }
+    for (lv_indev_t* indev = lv_indev_get_next(nullptr); indev != nullptr; indev = lv_indev_get_next(indev)) {
+        if (lv_indev_get_scroll_obj(indev) == peers_list) {
+            return true;
+        }
+        if (lv_indev_get_state(indev) != LV_INDEV_STATE_PRESSED) {
+            continue;
+        }
+        // A press anywhere inside the list means a tap or drag is in flight; rebuilding now
+        // would delete the pressed widget out from under the input device.
+        for (lv_obj_t* obj = lv_indev_get_active_obj(); obj != nullptr; obj = lv_obj_get_parent(obj)) {
+            if (obj == peers_list) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // endregion Secondary updates
@@ -247,16 +290,76 @@ void View::init(void* newContext, lv_obj_t* parent) {
     enable_switch = lvgl_toolbar_add_switch_action(toolbar);
     lv_obj_add_event_cb(enable_switch, onEnableSwitchChanged, LV_EVENT_VALUE_CHANGED, context);
 
+    // Persistent settings row, above (and outside of) the rebuilt peer list.
+    createEnableOnBootRow(parent);
+
     // Peer list
     peers_list = lv_list_create(parent);
     lv_obj_set_flex_grow(peers_list, 1);
     lv_obj_set_width(peers_list, LV_PCT(100));
+
+    // A rebuild deferred by the throttle (or by an in-progress touch) needs something to
+    // flush it: the BT event that requested it may well have been the last one.
+    rebuild_timer = lv_timer_create([](lv_timer_t* timer) {
+        static_cast<View*>(lv_timer_get_user_data(timer))->update();
+    }, LIST_REBUILD_INTERVAL_MS, this);
+    lv_obj_add_event_cb(parent, [](lv_event_t* e) {
+        auto* view = static_cast<View*>(lv_event_get_user_data(e));
+        if (view->rebuild_timer != nullptr) {
+            lv_timer_delete(view->rebuild_timer);
+            view->rebuild_timer = nullptr;
+        }
+        view->root = nullptr;
+        view->peers_list = nullptr;
+        view->enable_on_boot_switch = nullptr;
+    }, LV_EVENT_DELETE, this);
 }
 
 void View::update() {
+    if (root == nullptr) {
+        return;
+    }
+
     updateBtToggle();
     updateScanning();
+
+    const auto current_radio = state->getRadioState();
+    const auto current_scanning = state->isScanning();
+    const auto current_scan_count = state->getScanResultCount();
+    const auto current_paired_count = state->getPairedPeerCount();
+
+    const bool content_changed = !hasRenderedList ||
+        current_radio != lastListRadioState ||
+        current_scanning != lastListScanning ||
+        current_scan_count != lastScanResultCount ||
+        current_paired_count != lastPairedCount;
+
+    if (!content_changed && !listRebuildPending) {
+        return;
+    }
+
+    // BT_EVENT_PEER_FOUND arrives in bursts while scanning. Rebuilding on each one destroys
+    // the widget the user is touching, so scrolling never gets a chance to start. Defer
+    // while they are interacting, and otherwise coalesce to at most one rebuild per period.
+    if (isUserInteractingWithList()) {
+        listRebuildPending = true;
+        return;
+    }
+
+    const uint32_t now = lv_tick_get();
+    if (hasRenderedList && (uint32_t)(now - lastListRenderTick) < LIST_REBUILD_INTERVAL_MS) {
+        listRebuildPending = true;
+        return;
+    }
+
     updatePeerList();
+    listRebuildPending = false;
+    hasRenderedList = true;
+    lastListRenderTick = now;
+    lastListRadioState = current_radio;
+    lastListScanning = current_scanning;
+    lastScanResultCount = current_scan_count;
+    lastPairedCount = current_paired_count;
 }
 
 } // namespace tt::app::btmanage

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <new>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 
 constexpr auto* TAG = "properties_file";
@@ -45,6 +46,28 @@ struct PropertiesFile {
 
 namespace {
 
+// Repairs the aftermath of a save that was cut short (reset or power loss). save_to_file()
+// stages the new content at "<path>.tmp" and parks the previous content at "<path>.bak" while
+// it swaps them, so if the real path is missing, one of those two holds the file's content:
+// the ".tmp" is the newer of the pair and is preferred. Without this, an interrupted save is
+// silently indistinguishable from "file was never created", and the settings it held are gone.
+void recover_orphans(const std::string& path) {
+    struct stat info {};
+    if (::stat(path.c_str(), &info) == 0) {
+        return;
+    }
+    for (const auto* suffix : { ".tmp", ".bak" }) {
+        std::string candidate = path + suffix;
+        if (::stat(candidate.c_str(), &info) != 0) {
+            continue;
+        }
+        if (std::rename(candidate.c_str(), path.c_str()) == 0) {
+            LOG_W(TAG, "Recovered %s from an interrupted save (%s)", path.c_str(), suffix);
+            return;
+        }
+    }
+}
+
 // Missing file is not an error - a fresh instance just starts out empty and gets created on
 // close(). Mirrors Tactility's loadPropertiesFile(): "#"-prefixed and blank lines are skipped;
 // a "[section]" line becomes a literal prefix (verbatim, brackets included) prepended to every
@@ -56,6 +79,8 @@ bool load_from_file(PropertiesFile* file) {
     FileMutex mutex {};
     file_mutex_get(&mutex, file->path.c_str());
     file_mutex_lock(&mutex);
+
+    recover_orphans(file->path);
 
     FILE* handle = std::fopen(file->path.c_str(), "r");
     if (handle == nullptr) {
@@ -151,15 +176,26 @@ bool save_to_file(const PropertiesFile* file) {
     }
 
     // rename() may not overwrite an existing destination on some filesystems (e.g. FAT on
-    // ESP32), so remove it first; this is best-effort and ignored if the path doesn't exist yet.
-    std::remove(file->path.c_str());
+    // ESP32), so the destination has to be moved out of the way first. It is renamed to a
+    // backup rather than deleted: deleting it leaves a window in which neither the real path
+    // nor a recoverable copy exists, so a reset or power loss there destroys the file outright
+    // and leaves only an orphaned ".tmp" behind (observed in practice). recover_orphans()
+    // below puts either survivor back in place on the next open.
+    std::string backup_path = file->path + ".bak";
+    std::remove(backup_path.c_str());
+    const bool had_previous = std::rename(file->path.c_str(), backup_path.c_str()) == 0;
 
     if (std::rename(temp_path.c_str(), file->path.c_str()) != 0) {
         LOG_E(TAG, "Failed to replace %s", file->path.c_str());
         std::remove(temp_path.c_str());
+        if (had_previous) {
+            std::rename(backup_path.c_str(), file->path.c_str());
+        }
         file_mutex_unlock(&mutex);
         return false;
     }
+
+    std::remove(backup_path.c_str());
 
     file_mutex_unlock(&mutex);
     return true;

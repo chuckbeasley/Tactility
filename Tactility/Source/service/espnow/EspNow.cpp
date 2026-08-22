@@ -6,15 +6,32 @@
 
 #include <Tactility/service/espnow/EspNow.h>
 #include <Tactility/service/espnow/EspNowService.h>
+#include <Tactility/service/ServiceManifest.h>
+#include <Tactility/service/ServiceRegistration.h>
 
 #include <tactility/log.h>
 
 namespace tt::service::espnow {
 
 constexpr auto* TAG = "EspNow";
+extern const ServiceManifest manifest;
+
+static std::shared_ptr<EspNowService> ensureService() {
+    auto service = findService();
+    if (service != nullptr) {
+        return service;
+    }
+
+    addService(manifest);
+    service = findService();
+    if (service == nullptr) {
+        LOG_E(TAG, "Failed to lazy-start service");
+    }
+    return service;
+}
 
 void enable(const EspNowConfig& config) {
-    auto service = findService();
+    auto service = ensureService();
     if (service != nullptr) {
         service->enable(config);
     } else {
@@ -42,7 +59,7 @@ bool isEnabled() {
 }
 
 bool addPeer(const esp_now_peer_info_t& peer) {
-    auto service = findService();
+    auto service = ensureService();
     if (service != nullptr) {
         return service->addPeer(peer);
     } else {
@@ -62,7 +79,7 @@ bool send(const uint8_t* address, const uint8_t* buffer, size_t bufferLength) {
 }
 
 ReceiverSubscription subscribeReceiver(std::function<void(const esp_now_recv_info_t* receiveInfo, const uint8_t* data, int length)> onReceive) {
-    auto service = findService();
+    auto service = ensureService();
     if (service != nullptr) {
         return service->subscribeReceiver(onReceive);
     } else {

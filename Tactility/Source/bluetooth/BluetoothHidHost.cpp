@@ -35,6 +35,10 @@ namespace tt::bluetooth {
 
 constexpr auto* TAG = "BtHidHost";
 
+// Defined further down with the other public-facing helpers; used by the GATT discovery
+// callbacks above it.
+static void fireHidHostFailure(const std::array<uint8_t, 6>& addr);
+
 // ---- Report type ----
 
 enum class HidReportType : uint8_t { Unknown = 0, Keyboard, Mouse, Consumer };
@@ -631,6 +635,7 @@ static int hidHostSvcDiscCb(uint16_t conn_handle, const struct ble_gatt_error* e
     } else if (error->status == BLE_HS_EDONE) {
         if (ctx.hidSvcStart == 0) {
             LOG_W(TAG, "No HID service found — disconnecting");
+            fireHidHostFailure(ctx.peerAddr);
             ble_gap_terminate(ctx.connHandle, BLE_ERR_REM_USER_CONN_TERM);
             return 0;
         }
@@ -769,6 +774,24 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
 
 // ---- Public functions ----
 
+// Reports an unsuccessful HID host attach back to the UI. Without this a tap on a scan result
+// that turns out not to be a HID peripheral (a speaker, a phone, ...) fails entirely silently:
+// the connect is refused or the peer is dropped again after service discovery, and nothing ever
+// reaches the app, so the button appears dead.
+static void fireHidHostFailure(const std::array<uint8_t, 6>& addr) {
+    Device* dev;
+    if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) != ERROR_NONE) {
+        return;
+    }
+    BtEvent e = {};
+    e.type = BT_EVENT_PAIR_RESULT;
+    std::memcpy(e.pair_result.addr, addr.data(), 6);
+    e.pair_result.result = BT_PAIR_RESULT_FAILED;
+    e.pair_result.profile = BT_PROFILE_HID_HOST;
+    bluetooth_fire_event(dev, e);
+    device_put(dev);
+}
+
 void hidHostConnect(const std::array<uint8_t, 6>& addr) {
     if (getRadioState() != RadioState::On) {
         LOG_W(TAG, "hidHostConnect: radio not on");
@@ -825,6 +848,7 @@ void hidHostConnect(const std::array<uint8_t, 6>& addr) {
     int rc = ble_gap_connect(own_addr_type, &ble_addr, 5000, nullptr, hidHostGapCb, nullptr);
     if (rc != 0) {
         LOG_W(TAG, "ble_gap_connect failed rc=%d", rc);
+        fireHidHostFailure(addr);
         hid_host_ctx.reset();
         Device* dev;
         if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {

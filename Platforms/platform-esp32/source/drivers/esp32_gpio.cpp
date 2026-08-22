@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <driver/gpio.h>
 
+#if __has_include(<soc/spi_pins.h>)
+#include <soc/spi_pins.h>
+#endif
+
 #include <tactility/driver.h>
 #include <tactility/drivers/esp32_gpio.h>
 
@@ -20,6 +24,49 @@ struct Esp32GpioInternal {
 #define GET_INTERNAL_FROM_DESCRIPTOR(gpio_descriptor) ((struct Esp32GpioInternal*)gpio_descriptor->controller_context)
 
 extern "C" {
+
+bool esp32_gpio_is_mspi_pin(int pin) {
+    if (pin < 0) {
+        return false;
+    }
+
+    // The MSPI IO MUX pins are fixed per target. They are listed individually because not every
+    // target defines every signal. D4-D7/DQS are deliberately excluded: those are only wired up on
+    // octal flash/PSRAM modules and are ordinary GPIOs elsewhere.
+    static const int mspi_pins[] = {
+#ifdef MSPI_IOMUX_PIN_NUM_CS0
+        MSPI_IOMUX_PIN_NUM_CS0,
+#endif
+#if defined(MSPI_IOMUX_PIN_NUM_CS1) && defined(CONFIG_SPIRAM)
+        // CS1 is the PSRAM chip select, so it is only off-limits when PSRAM is in use.
+        MSPI_IOMUX_PIN_NUM_CS1,
+#endif
+#ifdef MSPI_IOMUX_PIN_NUM_CLK
+        MSPI_IOMUX_PIN_NUM_CLK,
+#endif
+#ifdef MSPI_IOMUX_PIN_NUM_MOSI
+        MSPI_IOMUX_PIN_NUM_MOSI,
+#endif
+#ifdef MSPI_IOMUX_PIN_NUM_MISO
+        MSPI_IOMUX_PIN_NUM_MISO,
+#endif
+#ifdef MSPI_IOMUX_PIN_NUM_WP
+        MSPI_IOMUX_PIN_NUM_WP,
+#endif
+#ifdef MSPI_IOMUX_PIN_NUM_HD
+        MSPI_IOMUX_PIN_NUM_HD,
+#endif
+        -1 // Sentinel, keeps the array non-empty on targets without any of the above
+    };
+
+    for (int mspi_pin : mspi_pins) {
+        if (mspi_pin >= 0 && mspi_pin == pin) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 static error_t set_level(GpioDescriptor* descriptor, bool high) {
     // ESP32 GPIO has no hardware output-invert for plain digital I/O: active-low is a
@@ -41,6 +88,11 @@ static error_t set_flags(GpioDescriptor* descriptor, gpio_flags_t flags) {
     const Esp32GpioConfig* config = GET_CONFIG(descriptor->controller);
 
     if (descriptor->pin >= config->gpioCount) {
+        return ERROR_INVALID_ARGUMENT;
+    }
+
+    if (esp32_gpio_is_mspi_pin(descriptor->pin)) {
+        LOG_E(TAG, "GPIO %d drives the flash/PSRAM MSPI bus and cannot be used as a general purpose pin", descriptor->pin);
         return ERROR_INVALID_ARGUMENT;
     }
 

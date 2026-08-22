@@ -11,7 +11,13 @@ namespace tt::service::memorychecker {
 constexpr auto* TAG = "MemoryChecker";
 
 // Total memory (in bytes) that should be free before warnings occur
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+// C5's stable baseline can sit around ~9-10KB internal free after startup;
+// warn below this tighter floor to reduce persistent false-positive warnings.
+constexpr auto TOTAL_FREE_THRESHOLD = 8'000;
+#else
 constexpr auto TOTAL_FREE_THRESHOLD = 10'000;
+#endif
 // Smallest memory block size (in bytes) that should be available before warnings occur
 constexpr auto LARGEST_FREE_BLOCK_THRESHOLD = 2'000;
 

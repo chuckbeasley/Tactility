@@ -13,6 +13,7 @@
 #include <tactility/log.h>
 
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <new>
 
@@ -26,6 +27,10 @@ constexpr size_t APP_INSTANCE_ID_THREAD_SLOT_INDEX = 1;
 
 // Matches TactilityKernel's Thread wrapper's THREAD_PRIORITY_NORMAL.
 constexpr UBaseType_t APP_TASK_PRIORITY = 4;
+constexpr uint32_t APP_TASK_STACK_SIZE_BYTES_DEFAULT = 8192;
+#ifdef ESP_PLATFORM
+constexpr uint32_t APP_TASK_STACK_SIZE_BYTES_HEAVY = 12288;
+#endif
 
 namespace {
 
@@ -66,6 +71,25 @@ void set_completion(AppInstanceId app_instance_id, AppCompletionSignal* completi
         iterator->second.completion = completion;
     }
     mutex_unlock(&ledger.mutex);
+}
+
+uint32_t resolve_task_stack_size_bytes(AppInstanceId app_instance_id) {
+#ifdef ESP_PLATFORM
+    const char* manifest_id = nullptr;
+    auto& ledger = app_ledger();
+    mutex_lock(&ledger.mutex);
+    auto iterator = ledger.instances.find(app_instance_id);
+    if (iterator != ledger.instances.end() && iterator->second.manifest != nullptr) {
+        manifest_id = iterator->second.manifest->id;
+    }
+    mutex_unlock(&ledger.mutex);
+
+    // Touch calibration is the known deep-stack app on C5; keep a larger stack only there.
+    if (manifest_id != nullptr && strcmp(manifest_id, "TouchCalibration") == 0) {
+        return APP_TASK_STACK_SIZE_BYTES_HEAVY;
+    }
+#endif
+    return APP_TASK_STACK_SIZE_BYTES_DEFAULT;
 }
 
 // Takes a reference on app_instance_id's completion signal (see AppCompletionSignal), for the
@@ -167,7 +191,8 @@ void app_task_main(void* context) {
     AppCompletionSignal* completion = ctx->completion;
     delete ctx;
 
-    LOG_I(TAG, "Thread for %d finished", app_instance_id);
+    const uint32_t stack_low_water_bytes = static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr)) * sizeof(StackType_t);
+    LOG_I(TAG, "Thread for %d finished (stack low-water free=%u bytes)", app_instance_id, (unsigned)stack_low_water_bytes);
 
     // Erase the ledger entry before self-deleting - see "Reap self-terminated app tasks":
     // nothing else is guaranteed to ever call app_scheduler_stop() for this instance (the
@@ -240,11 +265,23 @@ error_t app_scheduler_start(AppInstanceId app_instance_id, AppLocation location,
     snprintf(task_name, sizeof(task_name), "app_%lu", static_cast<unsigned long>(app_instance_id));
 
     TaskHandle_t task_handle = nullptr;
-    // 8192 bytes -> stack depth in words, matching what TactilityKernel's Thread wrapper does with the stack size it's given.
+    // stack size bytes -> stack depth in words, matching what TactilityKernel's Thread wrapper does with the stack size it's given.
     // Created at idle priority so it can't preempt us before vTaskSuspend() below runs, then suspended immediately -
     // the ledger must record the handle (set_task()) before the task can possibly observe or erase its own entry.
     // (see app_scheduler_stop()'s liveness check and app_task_main()'s exit path)
-    BaseType_t create_result = xTaskCreate(app_task_main, task_name, 8192 / sizeof(StackType_t), context, tskIDLE_PRIORITY, &task_handle);
+    const uint32_t task_stack_size_bytes = resolve_task_stack_size_bytes(app_instance_id);
+    LOG_I(TAG, "Starting app %u with stack=%u bytes", (unsigned)app_instance_id, (unsigned)task_stack_size_bytes);
+    // Always allocate the stack in internal RAM: a PSRAM-backed stack is unreachable while the
+    // flash cache is disabled (any NVS/settings write), and xTaskCreateWithCaps() would also
+    // require vTaskDeleteWithCaps() in app_task_main()'s self-delete path.
+    BaseType_t create_result = xTaskCreate(
+        app_task_main,
+        task_name,
+        task_stack_size_bytes / sizeof(StackType_t),
+        context,
+        tskIDLE_PRIORITY,
+        &task_handle
+    );
     if (create_result != pdPASS) {
         delete context;
         vSemaphoreDelete(completion->semaphore);

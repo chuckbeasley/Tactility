@@ -20,6 +20,7 @@
 #include <lvgl/widgets/toolbar.h>
 
 #include <algorithm>
+#include <atomic>
 #include <format>
 
 namespace tt::app::apphub {
@@ -38,6 +39,7 @@ struct Context {
     std::string cachedAppsJsonFile = std::format("{}/app_hub.json", getTempPath());
     std::vector<AppHubEntry> entries;
     Mutex mutex;
+    std::atomic<uint32_t> uiGeneration = 1;
 };
 
 
@@ -59,11 +61,17 @@ void onAppPressed(lv_event_t* e) {
     auto* widget = lv_event_get_target_obj(e);
     const auto* user_data = lv_obj_get_user_data(widget);
     const intptr_t index = reinterpret_cast<intptr_t>(user_data);
+    AppHubEntry selected {};
+    bool found = false;
     ctx->mutex.lock();
     if (index < ctx->entries.size()) {
-        apphubdetails::start(ctx->entries[index]);
+        selected = ctx->entries[index];
+        found = true;
     }
     ctx->mutex.unlock();
+    if (found) {
+        apphubdetails::start(selected);
+    }
 }
 
 void onRefreshPressed(lv_event_t* e) {
@@ -72,6 +80,9 @@ void onRefreshPressed(lv_event_t* e) {
 }
 
 void showRefreshFailedError(Context* ctx, const char* message) {
+    if (ctx->contentWrapper == nullptr || ctx->refreshButton == nullptr) {
+        return;
+    }
     lv_obj_clean(ctx->contentWrapper);
 
     auto* label = lv_label_create(ctx->contentWrapper);
@@ -86,6 +97,9 @@ void showNoInternet(Context* ctx) {
 }
 
 void showApps(Context* ctx) {
+    if (ctx->contentWrapper == nullptr) {
+        return;
+    }
     lv_obj_clean(ctx->contentWrapper);
     ctx->mutex.lock();
     if (parseJson(ctx->cachedAppsJsonFile, ctx->entries)) {
@@ -113,6 +127,10 @@ void showApps(Context* ctx) {
 }
 
 void refresh(Context* ctx) {
+    if (ctx->contentWrapper == nullptr || ctx->refreshButton == nullptr) {
+        return;
+    }
+
     lv_obj_clean(ctx->contentWrapper);
     auto* spinner = lvgl_spinner_create(ctx->contentWrapper);
     lv_obj_align(spinner, LV_ALIGN_CENTER, 0, 0);
@@ -131,23 +149,35 @@ void refresh(Context* ctx) {
     // These callbacks run on a background network thread and reach back into this app's
     // widgets via the captured ctx pointer - same convention as AppHubDetailsApp.cpp's
     // download callback for the sibling "install/update" flow.
+    const uint32_t refreshGeneration = ctx->uiGeneration.load();
     network::http::download(
         getAppsJsonUrl(),
         CERTIFICATE_PATH,
         ctx->cachedAppsJsonFile,
-        [ctx] {
+        [ctx, refreshGeneration] {
             LOG_I(TAG, "Request success");
             lvgl_lock();
-            showApps(ctx);
+            if (ctx->uiGeneration.load() == refreshGeneration && ctx->contentWrapper != nullptr) {
+                showApps(ctx);
+            }
             lvgl_unlock();
         },
-        [ctx](const char* error) {
+        [ctx, refreshGeneration](const char* error) {
             LOG_E(TAG, "Request failed: %s", error);
             lvgl_lock();
-            showRefreshFailedError(ctx, "Cannot reach server");
+            if (ctx->uiGeneration.load() == refreshGeneration && ctx->contentWrapper != nullptr && ctx->refreshButton != nullptr) {
+                showRefreshFailedError(ctx, "Cannot reach server");
+            }
             lvgl_unlock();
         }
     );
+}
+
+void destroyWidgets(void* userData) {
+    auto* ctx = static_cast<Context*>(userData);
+    ctx->contentWrapper = nullptr;
+    ctx->refreshButton = nullptr;
+    ctx->uiGeneration.fetch_add(1);
 }
 
 void createWidgets(lv_obj_t* parent, void* userData) {
@@ -168,6 +198,8 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_set_style_pad_all(ctx->contentWrapper, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_pad_ver(ctx->contentWrapper, 0, LV_STATE_DEFAULT);
 
+    // Invalidate any in-flight async callback captured before this UI tree existed.
+    ctx->uiGeneration.fetch_add(1);
     refresh(ctx);
 }
 
@@ -179,7 +211,7 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     sub.app_instance_id = appInstanceId;
     app_event_subscribe(&sub);
 
-    WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
+    WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
 
     bool shouldClose = false;
     while (!shouldClose) {
@@ -197,6 +229,7 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
         }
     }
 
+    ctx.uiGeneration.fetch_add(1);
     window_manager_remove(window);
     app_event_unsubscribe(&sub);
 

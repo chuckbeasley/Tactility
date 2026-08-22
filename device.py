@@ -205,9 +205,14 @@ def write_spiram_variables(output_file, device_properties: dict):
     # Speed
     output_file.write(f"CONFIG_SPIRAM_SPEED_{speed}=y\n")
     output_file.write(f"CONFIG_SPIRAM_SPEED={speed}\n")
-    # Reduce IRAM usage
-    output_file.write("CONFIG_SPIRAM_USE_MALLOC=y\n")
-    output_file.write("CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y\n")
+    # Reduce IRAM usage.
+    # Respect explicit board sdkconfig overrides for SPIRAM allocation mode and
+    # Wi-Fi/LWIP SPIRAM preference. Emitting conflicting choice values here can
+    # make effective config drift from the board file on some IDF paths.
+    if "sdkconfig.CONFIG_SPIRAM_USE_MALLOC" not in device_properties and "sdkconfig.CONFIG_SPIRAM_USE_CAPS_ALLOC" not in device_properties:
+        output_file.write("CONFIG_SPIRAM_USE_MALLOC=y\n")
+    if "sdkconfig.CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP" not in device_properties:
+        output_file.write("CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y\n")
     # Performance improvements
     if idf_target == "esp32s3":
         apply_fix = get_property_or_default(device_properties, "hardware.spiRamXipDisabled", "false").lower()
@@ -435,6 +440,10 @@ def write_custom_sdkconfig(output_file, device_properties: dict):
     if sdkconfig_items:
         output_file.write("# Custom\n")
         for key, value in sdkconfig_items:
+            normalized = value.strip().lower()
+            if normalized == "n":
+                output_file.write(f"# {key} is not set\n")
+                continue
             escaped_value = value.replace("\"", "\\\"")
             output_file.write(f"{key}={escaped_value}\n")
 
@@ -450,9 +459,10 @@ def write_properties(output_file, device_properties: dict, device_id: str, is_de
     write_usb_variables(output_file, device_properties)
     write_bluetooth_variables(output_file, device_properties)
     write_usbhost_variables(output_file, device_properties)
-    write_custom_sdkconfig(output_file, device_properties)
     write_lvgl_variables(output_file, device_properties)
     write_touch_calibration_variables(output_file, device_properties)
+    # Keep explicit board overrides last so they win over generated defaults.
+    write_custom_sdkconfig(output_file, device_properties)
 
 def get_current_sdkconfig_target(sdkconfig_path: str):
     if not os.path.isfile(sdkconfig_path):

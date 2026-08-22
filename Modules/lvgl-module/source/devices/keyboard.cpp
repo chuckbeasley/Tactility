@@ -13,6 +13,38 @@ static LvglSoftwareKeyboard last_software_keyboard = {
 
 static lv_group_t* keyboard_group;
 
+// Screen region that holds the app UI. The keyboard deliberately overlays the screen instead of
+// participating in the layout, which means widgets hidden behind it are still "in view" as far as
+// LVGL is concerned - so lv_obj_scroll_to_view() has nothing to do and a focused textarea can sit
+// permanently under the keyboard. Shrinking this region while the keyboard is up gives LVGL a
+// viewport that matches what the user can actually see.
+static lv_obj_t* keyboard_content_area = nullptr;
+
+static void update_content_area_for_keyboard(bool keyboard_visible) {
+    if (keyboard_content_area == nullptr) {
+        return;
+    }
+
+    if (!keyboard_visible) {
+        lv_obj_set_height(keyboard_content_area, LV_PCT(100));
+        lv_obj_update_layout(keyboard_content_area);
+        return;
+    }
+
+    lv_obj_t* keyboard_object = last_software_keyboard.object;
+    lv_obj_t* parent = lv_obj_get_parent(keyboard_content_area);
+    if (keyboard_object == nullptr || parent == nullptr) {
+        return;
+    }
+
+    lv_obj_update_layout(keyboard_object);
+    const int32_t available = lv_obj_get_height(parent) - lv_obj_get_height(keyboard_object);
+    if (available > 0) {
+        lv_obj_set_height(keyboard_content_area, available);
+        lv_obj_update_layout(keyboard_content_area);
+    }
+}
+
 extern "C" {
 
 void lvgl_keyboard_on_start_lvgl() {
@@ -30,6 +62,7 @@ void lvgl_keyboard_on_stop_lvgl() {
     last_software_keyboard = {
         .object = nullptr
     };
+    keyboard_content_area = nullptr;
 
     lvgl_lock();
     lv_group_delete(keyboard_group);
@@ -141,7 +174,9 @@ static void textarea_show_keyboard(lv_event_t* event) {
     lv_obj_t* target = lv_event_get_current_target_obj(event);
     if (last_software_keyboard.object != nullptr) {
         lvgl_software_keyboard_show(&last_software_keyboard, target);
-        lv_obj_scroll_to_view(target, LV_ANIM_ON);
+        // Recursive: the textarea is typically nested inside layout wrappers, so the scrollable
+        // ancestor is not its direct parent.
+        lv_obj_scroll_to_view_recursive(target, LV_ANIM_ON);
     }
 }
 
@@ -176,11 +211,26 @@ void lvgl_software_keyboard_show(LvglSoftwareKeyboard* keyboard, lv_obj_t* texta
     assert(keyboard->object != nullptr);
     lv_obj_clear_flag(keyboard->object, LV_OBJ_FLAG_HIDDEN);
     lv_keyboard_set_textarea(keyboard->object, textarea);
+    update_content_area_for_keyboard(true);
+}
+
+void lvgl_software_keyboard_set_content_area(lv_obj_t* content_area) {
+    keyboard_content_area = content_area;
 }
 
 void lvgl_software_keyboard_hide(LvglSoftwareKeyboard* keyboard) {
     assert(keyboard->object != nullptr);
     lv_obj_add_flag(keyboard->object, LV_OBJ_FLAG_HIDDEN);
+    // The software keyboard is created once on the root widget (see Tactility.cpp) and therefore
+    // outlives every app's widget tree. lv_keyboard keeps a raw pointer to its bound textarea and
+    // dereferences it from lv_keyboard_def_event_cb() on LV_EVENT_VALUE_CHANGED, so leaving the
+    // binding in place after the textarea is gone is a use-after-free: a press that lands on the
+    // keyboard before an app closes is still delivered as a release/click afterwards, and the
+    // default handler then posts LV_EVENT_READY/LV_EVENT_CANCEL to freed memory.
+    // Hiding always means "no textarea is being edited", and lvgl_software_keyboard_show() rebinds
+    // unconditionally, so dropping the reference here is both safe and sufficient.
+    lv_keyboard_set_textarea(keyboard->object, nullptr);
+    update_content_area_for_keyboard(false);
 }
 
 bool lvgl_software_keyboard_is_enabled() {

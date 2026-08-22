@@ -246,9 +246,13 @@ esp_err_t DevelopmentService::handleAppUninstall(httpd_req_t* request) {
 // endregion
 
 std::shared_ptr<DevelopmentService> findService() {
-    return std::static_pointer_cast<DevelopmentService>(
-        findServiceById(manifest.id)
-    );
+    auto service = std::static_pointer_cast<DevelopmentService>(findServiceById(manifest.id));
+    if (service != nullptr) {
+        return service;
+    }
+
+    addService(manifest);
+    return std::static_pointer_cast<DevelopmentService>(findServiceById(manifest.id));
 }
 
 extern const ServiceManifest manifest = {

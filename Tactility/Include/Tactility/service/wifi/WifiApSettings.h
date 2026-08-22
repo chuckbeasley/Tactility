@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace tt::service::wifi::settings {
 
@@ -32,6 +33,13 @@ struct WifiApSettings {
  * @return true if the settings exist
  */
 bool contains(const std::string& ssid);
+
+/**
+ * List the SSIDs of all stored access points.
+ * Useful to find a saved network without performing a scan first.
+ * @return the stored SSIDs, in no particular order
+ */
+std::vector<std::string> getSavedSsids();
 
 /**
  * Load the settings for the provided SSID

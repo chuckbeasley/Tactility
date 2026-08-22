@@ -170,6 +170,11 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
         (int)service::wifi::isScanning(),
         connection_target.empty() ? "(none)" : connection_target.c_str(),
         (int)can_scan);
+    if (can_scan && !service::wifi::isScanning()) {
+        // The service no longer scans on its own when it can connect straight to a saved AP,
+        // and it stops scanning entirely once connected, so refresh the list on show.
+        service::wifi::scan();
+    }
     bool shouldClose = false;
     while (!shouldClose) {
         AppEvent event {};

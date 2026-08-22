@@ -107,10 +107,27 @@ void lvgl_software_keyboard_destruct(struct LvglSoftwareKeyboard* keyboard);
 void lvgl_software_keyboard_show(struct LvglSoftwareKeyboard* keyboard, lv_obj_t* textarea);
 
 /**
- * @brief Hides the on-screen keyboard.
+ * @brief Hides the on-screen keyboard and unbinds it from its textarea.
+ *
+ * The binding is cleared because the keyboard outlives the textareas it is bound to, and
+ * lv_keyboard dereferences its textarea pointer from its own event handler. Callers that want
+ * input to resume must call lvgl_software_keyboard_show() again, which rebinds.
+ *
  * @warning Caller must hold the LVGL lock.
  */
 void lvgl_software_keyboard_hide(struct LvglSoftwareKeyboard* keyboard);
+
+/**
+ * @brief Registers the screen region that holds the app UI.
+ *
+ * The keyboard overlays the screen rather than taking part in the layout, so without this LVGL
+ * still considers widgets hidden behind the keyboard to be visible and will not scroll them into
+ * view. While the keyboard is shown this region is shrunk to the space above it, and it is
+ * restored to full height when the keyboard is hidden. Passing NULL disables the behaviour.
+ *
+ * @warning Caller must hold the LVGL lock.
+ */
+void lvgl_software_keyboard_set_content_area(lv_obj_t* content_area);
 
 /**
  * The on-screen keyboard is only shown when there is no hardware keyboard driver active.

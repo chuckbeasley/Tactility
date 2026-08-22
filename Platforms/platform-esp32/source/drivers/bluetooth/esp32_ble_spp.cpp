@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <new>
 #include <vector>
 #include <host/ble_gap.h>
 #include <host/ble_gatt.h>
@@ -145,7 +146,9 @@ static error_t spp_stop(struct Device* device) {
     // Do NOT restart advertising after user-initiated stop — restarting name-only
     // advertising causes bonded Windows hosts to auto-reconnect in a tight loop.
     if (!ble_midi_get_active(device) && !ble_hid_get_active(device)) {
-        ble_gap_adv_stop();
+        if (ble_gap_adv_active()) {
+            ble_gap_adv_stop();
+        }
     }
     return ERROR_NONE;
 }
@@ -207,8 +210,17 @@ extern const BtSerialApi nimble_serial_api = {
 // ---- Serial child driver lifecycle ----
 
 static error_t esp32_ble_serial_start_device(struct Device* device) {
-    BleSppCtx* sctx = new BleSppCtx();
+    BleSppCtx* sctx = new (std::nothrow) BleSppCtx();
+    if (sctx == nullptr) {
+        LOG_E(TAG, "serial_start_device: context allocation failed");
+        return ERROR_OUT_OF_MEMORY;
+    }
     sctx->rx_mutex = xSemaphoreCreateMutex();
+    if (sctx->rx_mutex == nullptr) {
+        LOG_E(TAG, "serial_start_device: rx mutex create failed");
+        delete sctx;
+        return ERROR_OUT_OF_MEMORY;
+    }
     device_set_driver_data(device, sctx);
     return ERROR_NONE;
 }

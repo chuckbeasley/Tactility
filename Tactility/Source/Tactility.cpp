@@ -1,10 +1,14 @@
 #ifdef ESP_PLATFORM
 #include <sdkconfig.h>
+#include <esp_log.h>
+#include <esp_rom_sys.h>
+#include <esp_heap_caps.h>
 #include <Tactility/InitEsp.h>
 #include <app_esp32/module.h>
 #endif
 
 #include <format>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -33,6 +37,7 @@
 #include <Tactility/service/ServiceRegistration.h>
 #include <Tactility/service/audio/Audio.h>
 #include <Tactility/settings/TimePrivate.h>
+#include <Tactility/Timer.h>
 #include <Tactility/settings/TouchCalibrationSettings.h>
 
 #include <crypt/module.h>
@@ -65,6 +70,7 @@
 #include <tactility/kernel_init.h>
 #include <tactility/log.h>
 #include <tactility/memory.h>
+#include <tactility/system_event.h>
 
 namespace tt {
 
@@ -73,8 +79,88 @@ constexpr auto* TAG = "Tactility";
 static DispatcherHandle_t mainDispatcherHandle = dispatcher_alloc();
 
 void initFileMutexForLvgl();
+static void registerAndStartServices();
+
+// Needed by registerAndStartServices() before the manifest's own header is pulled in.
+namespace service {
+    namespace wifi { extern const ServiceManifest manifest; }
+}
 
 namespace {
+
+#ifdef ESP_PLATFORM
+int romVprintf(const char* format, va_list arguments) {
+    return esp_rom_vprintf(format, arguments);
+}
+#endif
+
+// Bluetooth and NTP still start after the UI is up, so their init does not overlap the FATFS/lwIP
+// boot window this board has historically been fragile in. The delay no longer has to wait out a
+// memory crisis though: internal heap with Wi-Fi and Bluetooth running is now ~86KB, up from
+// ~20KB before the IRAM/PSRAM tuning in Devices/generic-esp32c5/device.properties.
+//
+// WiFi is deliberately NOT part of this: its service must be running before the boot app emits
+// KERNEL_EVENT_BOOT_COMPLETED, because that event is what drives bootSplashInit() (provisioning
+// import + enable-on-boot). Starting it late meant the event had already fired.
+constexpr TickType_t DEFERRED_CONNECTIVITY_START_DELAY = pdMS_TO_TICKS(3000);
+std::unique_ptr<Timer> deferredConnectivityStartTimer;
+std::atomic<bool> deferredConnectivityStarted = false;
+std::atomic<bool> primaryServicesStarted = false;
+
+void startDeferredConnectivityServices();
+void startPrimaryServicesIfNeeded() {
+    if (primaryServicesStarted.exchange(true)) {
+        return;
+    }
+    registerAndStartServices();
+}
+
+void onBootCompletedStartConnectivity(SystemEvent*, void*) {
+    getMainDispatcher().dispatch([] {
+        startPrimaryServicesIfNeeded();
+        if (deferredConnectivityStarted.load()) {
+            return;
+        }
+
+        if (deferredConnectivityStartTimer == nullptr) {
+            deferredConnectivityStartTimer = std::make_unique<Timer>(Timer::Type::Once, DEFERRED_CONNECTIVITY_START_DELAY, [] {
+                startDeferredConnectivityServices();
+            });
+            deferredConnectivityStartTimer->start();
+        } else {
+            deferredConnectivityStartTimer->reset(DEFERRED_CONNECTIVITY_START_DELAY);
+        }
+
+        system_event_callback_remove(KERNEL_EVENT_BOOT_COMPLETED, onBootCompletedStartConnectivity);
+    });
+}
+
+void startDeferredConnectivityServices() {
+    if (deferredConnectivityStarted.exchange(true)) {
+        return;
+    }
+
+    LOG_I(TAG, "Starting deferred connectivity services");
+#ifdef ESP_PLATFORM
+    LOG_I(TAG, "Connectivity pre-start headroom: internal_free=%u internal_largest=%u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+#endif
+    bluetooth::systemStart();
+    // Defer lwIP/NTP startup with connectivity to avoid early network timer activity
+    // during boot-time memory-sensitive phases on C5.
+    network::ntp::init();
+    deferredConnectivityStartTimer.reset();
+}
+
+void subscribeDeferredConnectivityStart() {
+    if (system_event_callback_add(KERNEL_EVENT_BOOT_COMPLETED, onBootCompletedStartConnectivity, nullptr) != ERROR_NONE) {
+        LOG_W(TAG, "Failed to subscribe boot-complete deferred connectivity start; starting now");
+        getMainDispatcher().dispatch([] {
+            startPrimaryServicesIfNeeded();
+            startDeferredConnectivityServices();
+        });
+    }
+}
 
 void mainDispatcherTrampoline(void* context) {
     auto* function = static_cast<MainDispatcher::Function*>(context);
@@ -269,7 +355,7 @@ static void registerInternalApps() {
         app_manager_add(&app::power::manifest);
     }
 
-#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+#if defined(CONFIG_BT_NIMBLE_ENABLED) && CONFIG_BT_NIMBLE_ENABLED
     app_manager_add(&app::btmanage::manifest);
     app_manager_add(&app::btpeersettings::manifest);
 #endif
@@ -298,17 +384,10 @@ static void registerAndStartServices() {
     if (device_exists_of_type(&AUDIO_STREAM_TYPE)) {
         addService(service::audio::manifest);
     }
+    // Must be started before the boot app runs: WifiService::onStart() subscribes to
+    // KERNEL_EVENT_BOOT_COMPLETED, and that subscription is what triggers bootSplashInit().
+    // Starting the service does not power the radio - only setEnabled() does.
     addService(service::wifi::manifest);
-#ifdef ESP_PLATFORM
-    addService(service::development::manifest);
-#endif
-
-#if defined(CONFIG_SOC_WIFI_SUPPORTED) || defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
-    addService(service::espnow::manifest);
-#endif
-#ifdef ESP_PLATFORM
-    addService(service::webserver::manifest);
-#endif
 #if defined(ESP_PLATFORM)
     if (device_exists_of_type(&RTC_TYPE)) {
         addService(service::rtctime::manifest);
@@ -390,6 +469,9 @@ static lv_obj_t* windowManagerScreenInit(lv_obj_t* root) {
     // everything, including the statusbar, regardless of which app is showing. Hidden until a
     // focused textarea shows it (see lvgl_keyboard_add_textarea()/textarea_show_keyboard()).
     lvgl_software_keyboard_construct(&softwareKeyboard, root);
+    // Lets the keyboard shrink the app area while it is up, so a focused textarea is scrolled
+    // above the keyboard instead of staying hidden behind it.
+    lvgl_software_keyboard_set_content_area(vertical_container);
 
     return app_container;
 }
@@ -437,9 +519,6 @@ static void onLvglStarted() {
 
     addService(service::statusbar::manifest);
     addService(service::memorychecker::manifest);
-#if defined(ESP_PLATFORM)
-    addService(service::displayidle::manifest);
-#endif
 #if defined(CONFIG_TT_TDECK_WORKAROUND)
     addService(service::keyboardidle::manifest);
 #endif
@@ -473,7 +552,8 @@ static void onLvglStopped() {
     check(service::removeService(service::keyboardidle::manifest.id));
 #endif
 #if defined(ESP_PLATFORM)
-    check(service::removeService(service::displayidle::manifest.id));
+    // DisplayIdle is lazily registered and may never have been started.
+    service::removeService(service::displayidle::manifest.id);
 #endif
     check(service::removeService(service::memorychecker::manifest.id));
     check(service::removeService(service::statusbar::manifest.id));
@@ -482,6 +562,11 @@ static void onLvglStopped() {
 }
 
 void run(Module* const dtsModules[], const DtsDevice dtsDevices[]) {
+#ifdef ESP_PLATFORM
+    // ESP-IDF v6.0.2 recursively routes the C5 UART console VFS back to itself.
+    esp_log_set_vprintf(romVprintf);
+#endif
+
     LOG_I(TAG, "Tactility v%s on %s (%s)", TT_VERSION, CONFIG_TT_DEVICE_NAME, CONFIG_TT_DEVICE_ID);
 
     LOG_I(TAG, "Initializing kernel");
@@ -504,25 +589,37 @@ void run(Module* const dtsModules[], const DtsDevice dtsDevices[]) {
     initEsp();
 #endif
 
+    // Prepare writable filesystem paths before starting the boot app UI. This avoids
+    // concurrent filesystem mutation while LVGL decodes the splash image.
+    prepareFileSystems();
+
     settings::initTimeZone();
 
     // Attempt to start all disabled SD cards (some require delayed init)
     hal::sdcard::startAll();
 
-    network::ntp::init();
-    bluetooth::systemStart();
-
-    registerAndStartServices();
+    // Primary services (including WiFi) must be up before the boot app emits
+    // KERNEL_EVENT_BOOT_COMPLETED, otherwise the WiFi boot-splash init stage never runs.
+    startPrimaryServicesIfNeeded();
 
     // Must start right before LVGL
     initFileMutexForLvgl();
+
+    const uint32_t lvglTaskStackSize =
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+        // C5 boot path decodes PNG splash via lodepng on the LVGL task; keep extra
+        // headroom to avoid deep-call-chain stack pressure corrupting heap metadata.
+        12288;
+#else
+        9120;
+#endif
 
     lvgl_module_configure((LvglModuleConfig) {
         .on_start = onLvglStarted,
         .on_stop = onLvglStopped,
         .task_priority = THREAD_PRIORITY_HIGHER,
         // TODO: Remove Wi-Fi driver callback mechanism and use subscribe/await from wifi app to be able to reduce callstack
-        .task_stack_size = 9120,
+        .task_stack_size = lvglTaskStackSize,
 #ifdef ESP_PLATFORM
         .task_affinity = getCpuAffinityConfiguration().graphics
 #endif
@@ -535,6 +632,7 @@ void run(Module* const dtsModules[], const DtsDevice dtsDevices[]) {
     // The boot app takes care of registering system apps, user services and user apps.
     // It's a new-model (app-module + window-manager) app now, replacing the old app::start().
     app_manager_add(&app::boot::manifest);
+    subscribeDeferredConnectivityStart();
     uint32_t boot_instance_id = 0;
     app_manager_start(app::boot::manifest.id, &boot_instance_id);
 

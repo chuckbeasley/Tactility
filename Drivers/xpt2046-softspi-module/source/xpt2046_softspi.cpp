@@ -8,6 +8,7 @@
 #include <tactility/driver.h>
 #include <tactility/drivers/gpio.h>
 #include <tactility/drivers/gpio_controller.h>
+#include <tactility/drivers/esp32_gpio.h>
 #include <tactility/drivers/pointer.h>
 #include <tactility/drivers/power_supply.h>
 #include <tactility/delay.h>
@@ -82,6 +83,14 @@ static error_t start(Device* device) {
     *internal = {};
 
     internal->mosi_pin = static_cast<gpio_num_t>(config->pin_mosi.pin);
+    // Configuring an MSPI pin as a plain GPIO detaches it from the IO MUX and silently kills
+    // flash/PSRAM access, which surfaces much later as an unrelated allocator panic rather than
+    // as a wiring error. Refuse up front so the real cause is named.
+    if (esp32_gpio_is_mspi_pin(internal->mosi_pin)) {
+        LOG_E(TAG, "MOSI pin %d drives the flash/PSRAM MSPI bus and cannot be bit-banged", (int)internal->mosi_pin);
+        free(internal);
+        return ERROR_INVALID_ARGUMENT;
+    }
     gpio_set_direction(internal->mosi_pin, GPIO_MODE_OUTPUT);
     internal->miso = gpio_descriptor_acquire(config->pin_miso.gpio_controller, config->pin_miso.pin, GPIO_FLAG_DIRECTION_INPUT, GPIO_OWNER_GPIO);
     internal->sck = gpio_descriptor_acquire(config->pin_sck.gpio_controller, config->pin_sck.pin, GPIO_FLAG_DIRECTION_OUTPUT, GPIO_OWNER_GPIO);

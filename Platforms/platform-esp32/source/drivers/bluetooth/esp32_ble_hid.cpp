@@ -14,6 +14,7 @@
 #include <tactility/drivers/hid_report_descriptors.h>
 
 #include <cstring>
+#include <new>
 
 constexpr auto* TAG = "esp32_ble_hid";
 #include <tactility/device.h>
@@ -273,7 +274,9 @@ bool ble_hid_switch_profile(struct Device* device, BleHidProfile profile) {
     if (profile == current_hid_profile) return true;
     LOG_I(TAG, "switchGattProfile: %d -> %d", (int)current_hid_profile, (int)profile);
 
-    ble_gap_adv_stop();
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
 
     BleHidDeviceCtx* hid_ctx = (BleHidDeviceCtx*)device_get_driver_data(device);
     if (hid_ctx && hid_ctx->hid_conn_handle.load() != BLE_HS_CONN_HANDLE_NONE) {
@@ -362,7 +365,11 @@ static error_t hid_device_start(struct Device* device, enum BtHidDeviceMode mode
     BleHidDeviceCtx* old_ctx = (BleHidDeviceCtx*)device_get_driver_data(device);
     delete old_ctx; // no-op if nullptr
     // Create driver data for this HID session.
-    BleHidDeviceCtx* hid_ctx = new BleHidDeviceCtx();
+    BleHidDeviceCtx* hid_ctx = new (std::nothrow) BleHidDeviceCtx();
+    if (hid_ctx == nullptr) {
+        LOG_E(TAG, "hid_device_start: context allocation failed");
+        return ERROR_OUT_OF_MEMORY;
+    }
     hid_ctx->hid_conn_handle.store(BLE_HS_CONN_HANDLE_NONE);
     device_set_driver_data(device, hid_ctx);
 
@@ -400,7 +407,9 @@ static error_t hid_device_start(struct Device* device, enum BtHidDeviceMode mode
 
 static error_t hid_device_stop(struct Device* device) {
     ble_hid_set_active(device, false);
-    ble_gap_adv_stop();
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
     BleHidDeviceCtx* hid_ctx = (BleHidDeviceCtx*)device_get_driver_data(device);
     uint16_t conn = hid_ctx ? hid_ctx->hid_conn_handle.load() : (uint16_t)BLE_HS_CONN_HANDLE_NONE;
     if (conn != BLE_HS_CONN_HANDLE_NONE) {

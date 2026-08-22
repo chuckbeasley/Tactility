@@ -36,6 +36,20 @@ public:
         lock.lock();
         return pairedPeers;
     }
+
+    // Cheap accessors for change detection: the vector getters above deep-copy every record
+    // (each holds a std::string name), which is far too costly to run on every BT event.
+    size_t getScanResultCount() const {
+        auto lock = mutex.asScopedLock();
+        lock.lock();
+        return scanResults.size();
+    }
+
+    size_t getPairedPeerCount() const {
+        auto lock = mutex.asScopedLock();
+        lock.lock();
+        return pairedPeers.size();
+    }
 };
 
 } // namespace tt::app::btmanage

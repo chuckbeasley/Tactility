@@ -3,6 +3,8 @@
 #include <Tactility/app/btmanage/BtManagePrivate.h>
 #include <Tactility/app/btmanage/View.h>
 
+#include <Tactility/app/alertdialog/AlertDialog.h>
+
 #include <Tactility/Tactility.h>
 
 #include <app/event.h>
@@ -42,6 +44,14 @@ static void onBtToggled(void* context, bool requestOn) {
             }
         }
         device_put(dev);
+
+        // Sync the cached radio state right away. bluetooth::start()/stop() are asynchronous:
+        // BT_EVENT_RADIO_STATE_CHANGED can be hundreds of milliseconds away, and until it
+        // arrives ctx->state still says Off. View::update() repaints the switch from that
+        // cached value on every tick (including the periodic list-rebuild timer), so a stale
+        // Off would immediately snap the switch the user just enabled back off.
+        ctx->state.setRadioState(bluetooth::getRadioState());
+        requestViewUpdate(ctx);
     } else {
         LOG_W(TAG, "Toggle: No bluetooth device found");
     }
@@ -117,6 +127,17 @@ void onBtEvent(Context* ctx, const BtEvent& event) {
             break;
         case BT_EVENT_PAIR_RESULT:
             ctx->state.updatePairedPeers();
+            if (event.pair_result.result != BT_PAIR_RESULT_SUCCESS &&
+                event.pair_result.profile == BT_PROFILE_HID_HOST) {
+                // Tapping a scan result only ever attempts a HID host attach, so anything that
+                // is not a keyboard/mouse/gamepad can never succeed. Say so instead of leaving
+                // the tap looking like it did nothing at all.
+                alertdialog::start(
+                    ctx->appInstanceId,
+                    "Cannot connect",
+                    "This device does not offer a supported input (HID) service."
+                );
+            }
             break;
         case BT_EVENT_PROFILE_STATE_CHANGED:
             ctx->state.updateScanResults();

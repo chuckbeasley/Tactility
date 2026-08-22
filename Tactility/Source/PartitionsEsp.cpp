@@ -1,5 +1,6 @@
 #ifdef ESP_PLATFORM
 
+#include <sdkconfig.h>
 #include <Tactility/PartitionsEsp.h>
 
 #include <esp_vfs_fat.h>
@@ -9,6 +10,18 @@
 #include <tactility/log.h>
 
 namespace tt {
+
+#if defined(CONFIG_IDF_TARGET_ESP32C5) && defined(CONFIG_FATFS_ALLOC_PREFER_EXTRAM)
+#error "CONFIG_FATFS_ALLOC_PREFER_EXTRAM must be disabled on ESP32-C5 (causes PSRAM heap fault during FATFS mount)."
+#endif
+
+#if defined(CONFIG_IDF_TARGET_ESP32C5) && defined(CONFIG_HEAP_TLSF_USE_ROM_IMPL)
+#error "CONFIG_HEAP_TLSF_USE_ROM_IMPL must be disabled on ESP32-C5 (ROM TLSF faults in FATFS/LWIP init paths)."
+#endif
+
+#if defined(CONFIG_IDF_TARGET_ESP32C5) && defined(CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP)
+#error "CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP must be disabled on ESP32-C5 (triggers unstable LWIP heap path)."
+#endif
 
 constexpr auto* TAG = "Partitions";
 
