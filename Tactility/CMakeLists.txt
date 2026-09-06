@@ -17,6 +17,7 @@ list(APPEND REQUIRES_LIST
     service-module
     lv_screenshot
     minitar
+    espressif__esp_new_jpeg
 )
 
 if (DEFINED ENV{ESP_IDF_VERSION})
