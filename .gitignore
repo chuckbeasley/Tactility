@@ -10,6 +10,9 @@ CMakeFiles
 
 release/
 
+# App payloads (manifest, assets, ELF) are built/copied from the TactilityApps repo.
+Data/data/tactility/app/
+
 sdkconfig
 sdkconfig.old
 
