@@ -337,6 +337,16 @@ bool isRadioOnOrPending(Device* dev) {
 // directly to the driver (e.g. BtManage) stay subscribed across on/off toggles instead of
 // having to resubscribe.
 bool start(Device* dev) {
+    // The devicetree marks ble0 "disabled" (constructed but not started), so start it here
+    // before touching the radio - otherwise device_get_driver_data() has no BleCtx yet.
+    if (!device_is_ready(dev)) {
+        LOG_I(TAG, "Starting BLE device");
+        if (device_start(dev) != ERROR_NONE) {
+            LOG_E(TAG, "Failed to start BLE device");
+            return false;
+        }
+    }
+
     // TODO: Fix bug where repeatedly calling start would try to subscribe the bridge thread twice
     if (!startBtEventThread(dev)) {
         LOG_E(TAG, "Failed to subscribe to BLE events");
