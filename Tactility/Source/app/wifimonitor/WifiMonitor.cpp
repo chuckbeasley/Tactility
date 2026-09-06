@@ -12,6 +12,7 @@
 
 #include <app/event.h>
 #include <app/manager.h>
+#include <app/start.h>
 #include <app/manifest.h>
 
 #include <lvgl_window_manager/window_manager.h>
@@ -634,7 +635,6 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
                 stopCapture(&ctx);
 #endif
-                app_manager_finish(appInstanceId);
                 shouldClose = true;
                 break;
             default:
@@ -665,7 +665,7 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
 
 uint32_t start() {
     uint32_t instanceId = 0;
-    app_manager_start(manifest.id, &instanceId);
+    app_start(manifest.id, 0, nullptr, &instanceId);
     return instanceId;
 }
 

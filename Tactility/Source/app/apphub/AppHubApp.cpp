@@ -125,7 +125,7 @@ void showApps(Context* ctx) {
         std::erase_if(ctx->entries, [](const AppHubEntry& entry) {
 #ifdef ESP_PLATFORM
             return !entry.targetPlatforms.empty() &&
-                std::ranges::find(entry.targetPlatforms, CONFIG_IDF_TARGET) == entry.targetPlatforms.end();
+                std::ranges::find(entry.targetPlatforms, std::string(CONFIG_IDF_TARGET)) == entry.targetPlatforms.end();
 #else
             (void)entry;
             return false;

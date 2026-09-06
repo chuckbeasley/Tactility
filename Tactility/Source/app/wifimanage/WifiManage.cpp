@@ -7,6 +7,7 @@
 
 #include <app/event.h>
 #include <app/manager.h>
+#include <app/start.h>
 #include <app/manifest.h>
 
 #include <lvgl_window_manager/window_manager.h>
@@ -186,7 +187,6 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
         while (app_event_poll(&sub, &event) == ERROR_NONE) {
         switch (event.type) {
             case APP_EVENT_CLOSE:
-                app_manager_finish(appInstanceId);
                 shouldClose = true;
                 break;
             case APP_EVENT_RESULT:
@@ -218,7 +218,7 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
 
 uint32_t start(uint32_t callerAppInstanceId) {
     uint32_t instanceId = 0;
-    app_manager_start_for_result(manifest.id, callerAppInstanceId, 0, nullptr, &instanceId);
+    app_start_for_result(manifest.id, 0, nullptr, callerAppInstanceId, &instanceId);
     return instanceId;
 }
 
