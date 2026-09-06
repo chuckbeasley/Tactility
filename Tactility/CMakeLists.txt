@@ -42,6 +42,7 @@ list(APPEND REQUIRES_LIST
     gps-meshtastic-module
     service-module
     # Libraries/*
+    elf_loader
     lv_screenshot
     minitar
     espressif__esp_new_jpeg
@@ -68,7 +69,7 @@ if (DEFINED ENV{ESP_IDF_VERSION})
         esp_http_client
         esp-tls
         esp_wifi
-        json # Effectively cJSON
+        espressif__cjson # Effectively cJSON
         nvs_flash
         spiffs
         vfs
