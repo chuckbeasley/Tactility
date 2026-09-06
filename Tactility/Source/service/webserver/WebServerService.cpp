@@ -226,13 +226,12 @@ bool WebServerService::onStart(ServiceContext& service) {
     statusbarIconId = lvgl::statusbar_icon_add();
     lvgl::statusbar_icon_set_visibility(statusbarIconId, false);
 
-    // Avoid filesystem reads during early startup; initialize from in-memory
-    // defaults and let explicit settings changes refresh from storage later.
+    // Load the saved enable state so the Web Server stays enabled across reboots.
     bool serverEnabled;
     {
         auto lock = g_settingsMutex.asScopedLock();
         lock.lock();
-        g_cachedSettings = settings::webserver::getDefault();
+        g_cachedSettings = settings::webserver::loadOrGetDefault();
         g_settingsCached = true;
         serverEnabled = g_cachedSettings.webServerEnabled;
     }
