@@ -561,11 +561,20 @@ void run(Module* const dtsModules[], const DtsDevice dtsDevices[]) {
 
     registerAndStartServices();
 
+    const uint32_t lvglTaskStackSize =
+#if defined(CONFIG_IDF_TARGET_ESP32C5)
+        // C5 boot path decodes PNG splash via lodepng on the LVGL task; keep extra
+        // headroom to avoid deep-call-chain stack pressure corrupting heap metadata.
+        12288;
+#else
+        9120;
+#endif
+
     lvgl_module_configure((LvglModuleConfig) {
         .on_start = onLvglStarted,
         .on_stop = onLvglStopped,
         .task_priority = THREAD_PRIORITY_HIGHER,
-        .task_stack_size = 9120,
+        .task_stack_size = lvglTaskStackSize,
 #ifdef ESP_PLATFORM
         .task_affinity = getCpuAffinityConfiguration().graphics
 #endif
