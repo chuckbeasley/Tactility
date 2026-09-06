@@ -23,6 +23,10 @@ struct Device* bluetooth_hid_device_get() {
     return found;
 }
 
+struct Device* bluetooth_hid_device_get() {
+    return bluetooth_hid_device_get_device();
+}
+
 error_t bluetooth_hid_device_start(struct Device* device, enum BtHidDeviceMode mode) {
     return BT_HID_DEVICE_API(device)->start(device, mode);
 }

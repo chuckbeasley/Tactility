@@ -116,6 +116,9 @@ extern const struct DeviceType BLUETOOTH_HID_DEVICE_TYPE;
  */
 struct Device* bluetooth_hid_device_get(void);
 
+/** Upstream-compatible alias of bluetooth_hid_device_get_device(). */
+struct Device* bluetooth_hid_device_get(void);
+
 error_t bluetooth_hid_device_start(struct Device* device, enum BtHidDeviceMode mode);
 error_t bluetooth_hid_device_stop(struct Device* device);
 error_t bluetooth_hid_device_send_key(struct Device* device, uint8_t keycode, bool pressed);
