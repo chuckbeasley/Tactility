@@ -182,9 +182,9 @@ void createWidgets(lv_obj_t* parent, void*) {
         ? computeButtonMargin(lv_display_get_horizontal_resolution(display), total_button_size)
         : computeButtonMargin(lv_display_get_vertical_resolution(display), total_button_size);
 
-    auto* app_list_button = createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_APPS, "AppList", margin, is_landscape_display);
-    createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_FOLDER, "Files", margin, is_landscape_display);
-    createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_SETTINGS, "Settings", margin, is_landscape_display);
+    auto* app_list_button = createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_APPS, "tactility.applist", margin, is_landscape_display);
+    createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_FOLDER, "tactility.files", margin, is_landscape_display);
+    createAppButton(buttons_wrapper, ui_density, LVGL_ICON_LAUNCHER_SETTINGS, "tactility.settings", margin, is_landscape_display);
 
     // The launcher's container is several levels below the screen, and LVGL only sends
     // LV_EVENT_SIZE_CHANGED to the screen object itself on a resolution change - so the
@@ -199,7 +199,7 @@ void createWidgets(lv_obj_t* parent, void*) {
         lv_obj_set_ext_click_area(power_button, ICON_BUTTON_HIT_SLOP);
         lv_obj_set_style_pad_all(power_button, 8, 0);
         lv_obj_align(power_button, LV_ALIGN_BOTTOM_MID, 0, -10);
-        lv_obj_add_event_cb(power_button, onAppPressed, LV_EVENT_SHORT_CLICKED, (void*)"PowerOff");
+        lv_obj_add_event_cb(power_button, onAppPressed, LV_EVENT_SHORT_CLICKED, (void*)"tactility.poweroff");
         lv_obj_set_style_shadow_width(power_button, 0, LV_STATE_DEFAULT);
         lv_obj_set_style_bg_opa(power_button, 0, LV_PART_MAIN);
 
