@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <new>
 #include <string>
+#include <sys/stat.h>
 
 constexpr auto* TAG = "app_esp32_loader";
 
@@ -31,22 +32,26 @@ struct Esp32AppRuntime {
 };
 
 error_t read_file(const char* path, uint8_t** out_data, size_t* out_size) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        LOG_E(TAG, "Failed to stat %s", path);
+        return ERROR_NOT_FOUND;
+    }
+    long size = static_cast<long>(st.st_size);
+    if (size <= 0) {
+        LOG_E(TAG, "read_file %s: bad size %ld", path, size);
+        return ERROR_RESOURCE;
+    }
+
     FILE* file = fopen(path, "rb");
     if (file == nullptr) {
         LOG_E(TAG, "Failed to open %s", path);
         return ERROR_NOT_FOUND;
     }
 
-    fseek(file, 0, SEEK_END);
-    long size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    if (size <= 0) {
-        fclose(file);
-        return ERROR_RESOURCE;
-    }
-
     auto* data = static_cast<uint8_t*>(malloc(static_cast<size_t>(size)));
     if (data == nullptr) {
+        LOG_E(TAG, "read_file %s: malloc(%ld) failed", path, size);
         fclose(file);
         return ERROR_OUT_OF_MEMORY;
     }
@@ -55,6 +60,7 @@ error_t read_file(const char* path, uint8_t** out_data, size_t* out_size) {
     fclose(file);
 
     if (read != static_cast<size_t>(size)) {
+        LOG_E(TAG, "read_file %s: short read %u/%ld", path, (unsigned)read, size);
         free(data);
         return ERROR_RESOURCE;
     }
