@@ -158,8 +158,6 @@ static const ModuleSymbol platform_esp32_symbols[] = {
     DEFINE_MODULE_SYMBOL(esp_event_post_to),
     DEFINE_MODULE_SYMBOL(esp_event_isr_post),
     DEFINE_MODULE_SYMBOL(esp_event_isr_post_to),
-    // sys/errno.h
-    DEFINE_MODULE_SYMBOL(__errno),
     // esp_vfs.h
     DEFINE_MODULE_SYMBOL(esp_vfs_register),
     DEFINE_MODULE_SYMBOL(esp_vfs_unregister),

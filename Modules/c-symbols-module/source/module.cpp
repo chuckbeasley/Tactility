@@ -150,8 +150,10 @@ static const ModuleSymbol SYMBOLS[] = {
     // ctype.h
 #ifdef ESP_PLATFORM
     // _ctype_ is newlib's internal lookup table backing isalnum() etc.;
-    // glibc/macOS libc don't export a symbol by this name.
-    DEFINE_MODULE_SYMBOL(_ctype_),
+    // glibc/macOS libc don't export a symbol by this name. Under picolibc
+    // _ctype_ expands to a macro (__locale_ctype_ptr()), so taking its address
+    // is invalid - emit the pointer directly.
+    { "_ctype_", (void*)_ctype_ },
 #endif
     DEFINE_MODULE_SYMBOL(isalnum),
     DEFINE_MODULE_SYMBOL(isalpha),

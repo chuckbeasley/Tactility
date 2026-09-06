@@ -148,7 +148,6 @@ static const ModuleSymbol SYMBOLS[] = {
     DEFINE_MODULE_SYMBOL(xPortGetCoreID),
     DEFINE_MODULE_SYMBOL(xPortGetTickRateHz),
     DEFINE_MODULE_SYMBOL(xPortInterruptedFromISRContext),
-    DEFINE_MODULE_SYMBOL(__getreent),
 #endif
     MODULE_SYMBOL_TERMINATOR,
 };
