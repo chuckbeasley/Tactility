@@ -276,7 +276,7 @@ int32_t captureWriterMain(void* context) {
     auto* ctx = static_cast<Context*>(context);
 
     // Timestamped filename so consecutive captures don't overwrite each other.
-    std::string path = std::format("{}/wifi-monitor-{}.pcap", getUserDataPath(), (long long)esp_timer_get_time());
+    std::string path = std::format("{}/wifi-monitor-{}.pcap", getUserHomePath(), (long long)esp_timer_get_time());
     if (!ctx->writer.open(path.c_str())) {
         LOG_E(TAG, "Failed to open capture file %s", path.c_str());
         return 1;
