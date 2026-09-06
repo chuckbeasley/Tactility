@@ -185,6 +185,7 @@ namespace app {
     namespace usbsettings { extern const ::AppManifest manifest; }
     namespace btmanage { extern const ::AppManifest manifest; }
     namespace btpeersettings { extern const ::AppManifest manifest; }
+    namespace blespam { extern const ::AppManifest manifest; }
     namespace wifiapsettings { extern const ::AppManifest manifest; }
     namespace wificonnect { extern const ::AppManifest manifest; }
     namespace wifimanage { extern const ::AppManifest manifest; }
@@ -206,6 +207,7 @@ namespace app {
 
 #if defined(CONFIG_SOC_WIFI_SUPPORTED) || defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
     namespace chat { extern const ::AppManifest manifest; }
+    namespace wifimonitor { extern const ::AppManifest manifest; }
 #endif
 }
 
@@ -275,6 +277,7 @@ static void registerInternalApps() {
 
 #if defined(CONFIG_SOC_WIFI_SUPPORTED) || defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
     app_manager_add(&app::chat::manifest);
+    app_manager_add(&app::wifimonitor::manifest);
 #endif
 
     if (device_exists_of_type(&GROVE_TYPE)) {
@@ -293,6 +296,7 @@ static void registerInternalApps() {
 #if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
     app_manager_add(&app::btmanage::manifest);
     app_manager_add(&app::btpeersettings::manifest);
+    app_manager_add(&app::blespam::manifest);
 #endif
 }
 
