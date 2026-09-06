@@ -10,6 +10,7 @@
 #include <tactility/device.h>
 #include <tactility/drivers/power_supply.h>
 #include <tactility/time.h>
+#include <tactility/concurrent/task_event_group.h>
 
 #include <lvgl/lvgl.h>
 #include <lvgl/widgets/toolbar.h>
@@ -106,8 +107,7 @@ void onBackPressed(lv_event_t* event) {
     // (thread_join) for this app's own thread to finish, which needs the LVGL lock
     // (window_manager_remove()) - but this callback runs ON the LVGL task, which would
     // deadlock against itself.
-    AppEvent closeEvent { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
-    app_event_emit(ctx->appInstanceId, &closeEvent);
+    app_event_emit_close(ctx->appInstanceId);
 }
 
 void onPowerEnabledChanged(lv_event_t* event) {
@@ -240,32 +240,34 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
         updateUi(&ctx);
     });
 
+    TaskEventGroup event_group;
+    task_event_group_construct(&event_group);
     AppEventSubscription sub {};
-    sub.app_instance_id = appInstanceId;
-    app_event_subscribe(&sub);
+    app_event_subscribe(&sub, &event_group);
 
     WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
     ctx.timer->start();
 
     bool shouldClose = false;
     while (!shouldClose) {
+        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
         AppEvent event {};
-        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
-            break;
-        }
-        switch (event.type) {
-            case APP_EVENT_CLOSE:
-                app_manager_finish(appInstanceId);
-                shouldClose = true;
-                break;
-            default:
-                break;
+        while (app_event_poll(&sub, &event) == ERROR_NONE) {
+            switch (event.type) {
+                case APP_EVENT_CLOSE:
+                    app_manager_finish(appInstanceId);
+                    shouldClose = true;
+                    break;
+                default:
+                    break;
+            }
         }
     }
 
     ctx.timer->stop();
     window_manager_remove(window);
     app_event_unsubscribe(&sub);
+    task_event_group_destruct(&event_group);
 
     return 0;
 }

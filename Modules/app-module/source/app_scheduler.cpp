@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include <app/private/app_event.h>
 #include <app/private/app_ledger.h>
 #include <app/private/app_scheduler.h>
 #include <app/event.h>
@@ -303,8 +304,7 @@ error_t app_scheduler_start(AppInstanceId app_instance_id, AppLocation location,
 error_t app_scheduler_stop(AppInstanceId app_instance_id, TickType_t join_timeout) {
     AppCompletionSignal* completion = acquire_completion_signal(app_instance_id);
     if (completion != nullptr) {
-        AppEvent event { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
-        app_event_emit(app_instance_id, &event);
+        app_event_emit_close(app_instance_id);
 
         // Blocks until app_task_main() gives this dedicated semaphore as the literal last thing it does before vTaskDelete().
         // Uses aa dedicated semaphore rather than this task's default FreeRTOS notification because app_event.cpp's AppEventSubscription also uses that shared slot.

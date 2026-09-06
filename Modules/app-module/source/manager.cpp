@@ -13,10 +13,34 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <strings.h> // strcasecmp/strncasecmp
 #include <unordered_map>
 #include <vector>
 
 #define TAG "app_manager"
+
+// Resolve an app id tolerantly. Apps in the apps repo reference internal apps as
+// "tactility.selectiondialog"/"tactility.alertdialog", while the OS registers them as
+// "SelectionDialog"/"AlertDialog". Try an exact match first, then a "tactility."-stripped
+// case-insensitive match. Caller must hold ledger.mutex.
+static const AppManifest* find_manifest_locked(const AppLedger& ledger, const char* id) {
+    auto exact = ledger.manifests.find(id);
+    if (exact != ledger.manifests.end()) {
+        return exact->second;
+    }
+
+    constexpr size_t PREFIX_LEN = 10; // strlen("tactility.")
+    if (strncasecmp(id, "tactility.", PREFIX_LEN) != 0) {
+        return nullptr;
+    }
+    const char* stripped = id + PREFIX_LEN;
+    for (const auto& [key, manifest] : ledger.manifests) {
+        if (strcasecmp(key.c_str(), stripped) == 0) {
+            return manifest;
+        }
+    }
+    return nullptr;
+}
 
 extern "C" {
 
@@ -51,12 +75,12 @@ error_t app_manager_remove(const char* id) {
 error_t app_manager_find_manifest(const char* id, AppManifest* out_manifest) {
     auto& ledger = app_ledger();
     mutex_lock(&ledger.mutex);
-    auto iterator = ledger.manifests.find(id);
-    if (iterator == ledger.manifests.end()) {
+    const AppManifest* manifest = find_manifest_locked(ledger, id);
+    if (manifest == nullptr) {
         mutex_unlock(&ledger.mutex);
         return ERROR_NOT_FOUND;
     }
-    *out_manifest = *iterator->second;
+    *out_manifest = *manifest;
     mutex_unlock(&ledger.mutex);
     return ERROR_NONE;
 }
@@ -95,13 +119,12 @@ error_t start_internal(const char* id, AppInstanceId parent_instance_id, int arg
     auto& ledger = app_ledger();
 
     mutex_lock(&ledger.mutex);
-    auto manifest_iterator = ledger.manifests.find(id);
-    if (manifest_iterator == ledger.manifests.end()) {
+    const AppManifest* manifest = find_manifest_locked(ledger, id);
+    if (manifest == nullptr) {
         mutex_unlock(&ledger.mutex);
         app_ledger_free_arguments(argc, argv);
         return ERROR_NOT_FOUND;
     }
-    const AppManifest* manifest = manifest_iterator->second;
 
     AppInstanceId target_id = ledger.next_instance_id++;
     AppInstanceRecord record { target_id, manifest, APP_INSTANCE_STATE_STARTING, nullptr };

@@ -28,8 +28,7 @@ static void onBackPressed(lv_event_t* event) {
     // (thread_join) for this app's own thread to finish, which needs the LVGL lock
     // (window_manager_remove()) - but this callback runs ON the LVGL task, which would
     // deadlock against itself.
-    AppEvent closeEvent { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
-    app_event_emit(*appInstanceId, &closeEvent);
+    app_event_emit_close(*appInstanceId);
 }
 
 static uint8_t mapRssiToPercentage(int rssi) {

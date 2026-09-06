@@ -361,7 +361,14 @@ error_t api_scan(Device* device) {
     }
     mutex_unlock(&ctx->mutex);
 
-    esp_err_t err = esp_wifi_scan_start(nullptr, false);
+    // Use an explicit active scan: the default (nullptr) config can be too brief
+    // to sweep any channels while the STA is connected, returning zero APs.
+    wifi_scan_config_t config = {};
+    config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    config.show_hidden = false;
+    config.scan_time.active.min = 100;
+    config.scan_time.active.max = 300;
+    esp_err_t err = esp_wifi_scan_start(&config, false);
     if (err != ESP_OK) {
         return esp_err_to_error(err);
     }
@@ -537,12 +544,11 @@ error_t api_remove_event_callback(Device* device, WifiEventCallback callback) {
 
 // ---- Promiscuous mode ----
 
-static void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
-    // Retrieve the context via the IDF's own rx_cb arg — IDF doesn't pass a user arg directly,
-    // so we store the device pointer in a file-scope variable set at enable time.
-    // This is safe because only one WiFi device exists on ESP32.
-    static Esp32WifiCtx* s_promisc_ctx = nullptr;
+// File-scope pointer used by the IDF rx callback (IDF doesn't support a user-arg
+// for the promiscuous cb), set at enable time and read back in promiscuous_rx_cb.
+static Esp32WifiCtx* s_promisc_ctx = nullptr;
 
+static void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
     if (buf == nullptr || s_promisc_ctx == nullptr) return;
 
     auto* pkt = static_cast<wifi_promiscuous_pkt_t*>(buf);
@@ -564,9 +570,6 @@ static void promiscuous_rx_cb(void* buf, wifi_promiscuous_pkt_type_t type) {
 
     cb(user_ctx, pkt->payload, rx.sig_len, info);
 }
-
-// File-scope pointer used by the IDF rx callback (IDF doesn't support a user-arg for promiscuous cb).
-static Esp32WifiCtx* s_promisc_ctx = nullptr;
 
 error_t api_set_promiscuous(Device* device, bool enable) {
     auto* ctx = GET_CTX(device);
@@ -601,6 +604,17 @@ error_t api_set_promiscuous_callback(Device* device, WifiPromiscuousCallback cal
     // Re-register with IDF so it picks up a null callback (effectively a no-op filter) too.
     esp_wifi_set_promiscuous_rx_cb(callback != nullptr ? promiscuous_rx_cb : nullptr);
     return ERROR_NONE;
+}
+
+error_t api_set_channel(Device* /*device*/, uint8_t channel) {
+    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
+}
+
+error_t api_send_raw_frame(Device* /*device*/, const uint8_t* frame, size_t length) {
+    if (frame == nullptr || length < 24 || length > 1500) return ERROR_INVALID_ARGUMENT;
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame, (int)length, true);
+    return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
 }
 
 error_t api_get_firmware_ops(Device* /*device*/, const FirmwareOps** ops, void** ctx) {
@@ -639,6 +653,8 @@ const WifiApi esp32_wifi_api = {
     .set_promiscuous = api_set_promiscuous,
     .get_promiscuous = api_get_promiscuous,
     .set_promiscuous_callback = api_set_promiscuous_callback,
+    .set_channel = api_set_channel,
+    .send_raw_frame = api_send_raw_frame,
 };
 
 // ---- Driver lifecycle ----

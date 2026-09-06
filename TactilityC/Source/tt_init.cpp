@@ -61,6 +61,14 @@ extern "C" {
 extern double __floatsidf(int x);
 extern void _esp_error_check_failed(esp_err_t rc, const char *file, int line, const char *function, const char *expression);
 
+// Auto-generated export table (Libraries/elf_loader/src/esp_all_symbol.c) built from the OS ELF.
+// Used as the final fallback in tt_symbol_resolver() so apps can resolve any OS symbol they
+// reference (LVGL, app-module, C++ runtime such as std::string::_M_dispose, etc.) even when it
+// is not in the curated symbol tables nor exported by a registered module.
+#ifdef CONFIG_ELF_LOADER_CUSTOMER_SYMBOLS
+extern const struct esp_elfsym g_customer_elfsyms[];
+#endif
+
 const esp_elfsym main_symbols[] {
     // stdlib.h
     ESP_ELFSYM_EXPORT(malloc),
@@ -442,6 +450,17 @@ uintptr_t tt_symbol_resolver(const char* symbolName) {
     if (module_resolve_symbol_global(symbolName, &symbol_address)) {
         return symbol_address;
     }
+
+#ifdef CONFIG_ELF_LOADER_CUSTOMER_SYMBOLS
+    // Comprehensive fallback: the auto-generated table of every global/weak function and object
+    // exported by the OS ELF. Without this, apps that reference symbols absent from the curated
+    // tables and not exposed by a started module (e.g. LVGL, app-module, preferences, and C++
+    // std::string internals like _Znwj/_ZdlPvj/_M_dispose) fail to load with "Can't find symbol".
+    const uintptr_t customer_address = resolve_symbol(g_customer_elfsyms, symbolName);
+    if (customer_address != 0) {
+        return customer_address;
+    }
+#endif
 
     return 0;
 }

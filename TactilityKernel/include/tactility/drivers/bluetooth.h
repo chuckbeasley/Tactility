@@ -255,6 +255,26 @@ struct BluetoothApi {
     error_t (*get_device_name)(struct Device* device, char* buf, size_t buf_len);
 
     /**
+     * Start advertising with raw advertising data (the full AD structure bytes,
+     * including length/type/company fields). Replaces any active advertising.
+     * @param[in] device the bluetooth device
+     * @param[in] adv_data raw advertising data (up to 31 bytes)
+     * @param[in] adv_len length of adv_data
+     * @param[in] connectable true for connectable advertising, false for non-connectable
+     * @param[in] randomize_address true to generate a fresh random BLE address before
+     * advertising, so each burst appears to come from a different device
+     * @return ERROR_NONE on success
+     */
+    error_t (*start_advertising)(struct Device* device, const uint8_t* adv_data, size_t adv_len, bool connectable, bool randomize_address);
+
+    /**
+     * Stop any active advertising.
+     * @param[in] device the bluetooth device
+     * @return ERROR_NONE on success
+     */
+    error_t (*stop_advertising)(struct Device* device);
+
+    /**
      * Notify the driver that a HID host connection is in progress or complete.
      * Called by the Tactility HID host module to prevent name resolution from
      * initiating a simultaneous central connection (BLE_HS_EALREADY).
@@ -299,6 +319,8 @@ error_t bluetooth_add_event_callback(struct Device* device, void* context, BtEve
 error_t bluetooth_remove_event_callback(struct Device* device, BtEventCallback callback);
 error_t bluetooth_set_device_name(struct Device* device, const char* name);
 error_t bluetooth_get_device_name(struct Device* device, char* buf, size_t buf_len);
+error_t bluetooth_start_advertising(struct Device* device, const uint8_t* adv_data, size_t adv_len, bool connectable, bool randomize_address);
+error_t bluetooth_stop_advertising(struct Device* device);
 void    bluetooth_set_hid_host_active(struct Device* device, bool active);
 void    bluetooth_fire_event(struct Device* device, struct BtEvent event);
 

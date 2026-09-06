@@ -226,6 +226,60 @@ error_t api_station_disconnect(Device* device) {
     return err != ERROR_NONE ? err : result;
 }
 
+error_t api_get_promiscuous(Device* device, bool* enabled) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr || ctx->child == nullptr) return ERROR_INVALID_STATE;
+    return wifi_get_promiscuous(ctx->child, enabled);
+}
+
+error_t api_set_promiscuous(Device* device, bool enable) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr || ctx->child == nullptr) return ERROR_INVALID_STATE;
+
+    error_t result = ERROR_NONE;
+    Device* child = ctx->child;
+    error_t err = run_on_pinned_thread(ctx, [child, enable, &result]() {
+        result = wifi_set_promiscuous(child, enable);
+    });
+    return err != ERROR_NONE ? err : result;
+}
+
+error_t api_set_promiscuous_callback(Device* device, WifiPromiscuousCallback callback, void* context) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr || ctx->child == nullptr) return ERROR_INVALID_STATE;
+
+    error_t result = ERROR_NONE;
+    Device* child = ctx->child;
+    error_t err = run_on_pinned_thread(ctx, [child, callback, context, &result]() {
+        result = wifi_set_promiscuous_callback(child, callback, context);
+    });
+    return err != ERROR_NONE ? err : result;
+}
+
+error_t api_set_channel(Device* device, uint8_t channel) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr || ctx->child == nullptr) return ERROR_INVALID_STATE;
+
+    error_t result = ERROR_NONE;
+    Device* child = ctx->child;
+    error_t err = run_on_pinned_thread(ctx, [child, channel, &result]() {
+        result = wifi_set_channel(child, channel);
+    });
+    return err != ERROR_NONE ? err : result;
+}
+
+error_t api_send_raw_frame(Device* device, const uint8_t* frame, size_t length) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr || ctx->child == nullptr) return ERROR_INVALID_STATE;
+
+    error_t result = ERROR_NONE;
+    Device* child = ctx->child;
+    error_t err = run_on_pinned_thread(ctx, [child, frame, length, &result]() {
+        result = wifi_send_raw_frame(child, frame, length);
+    });
+    return err != ERROR_NONE ? err : result;
+}
+
 const WifiApi esp32_wifi_pinned_api = {
     .get_radio_state = api_get_radio_state,
     .get_station_state = api_get_station_state,
@@ -239,7 +293,12 @@ const WifiApi esp32_wifi_pinned_api = {
     .station_disconnect = api_station_disconnect,
     .station_get_rssi = api_station_get_rssi,
     .add_event_callback = api_add_event_callback,
-    .remove_event_callback = api_remove_event_callback
+    .remove_event_callback = api_remove_event_callback,
+    .set_promiscuous = api_set_promiscuous,
+    .get_promiscuous = api_get_promiscuous,
+    .set_promiscuous_callback = api_set_promiscuous_callback,
+    .set_channel = api_set_channel,
+    .send_raw_frame = api_send_raw_frame
 };
 
 // ---- Driver lifecycle ----

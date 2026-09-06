@@ -13,6 +13,7 @@
 
 #include <lvgl_window_manager/window_manager.h>
 
+#include <tactility/concurrent/task_event_group.h>
 #include <tactility/log.h>
 
 #include <lvgl/lvgl.h>
@@ -43,8 +44,9 @@ struct Context {
 };
 
 
-void showApps(Context* ctx);
-void refresh(Context* ctx);
+bool showApps(Context* ctx);
+void refresh(Context* ctx, bool force);
+void tryRefreshVersion(Context* ctx, uint32_t refreshGeneration, const std::vector<std::string>& urls, size_t index);
 
 void onBackPressed(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
@@ -52,8 +54,7 @@ void onBackPressed(lv_event_t* event) {
     // (thread_join) for this app's own thread to finish, which needs the LVGL lock
     // (window_manager_remove()) - but this callback runs ON the LVGL task, which would
     // deadlock against itself.
-    AppEvent closeEvent { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
-    app_event_emit(ctx->appInstanceId, &closeEvent);
+    app_event_emit_close(ctx->appInstanceId);
 }
 
 void onAppPressed(lv_event_t* e) {
@@ -76,7 +77,7 @@ void onAppPressed(lv_event_t* e) {
 
 void onRefreshPressed(lv_event_t* e) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
-    refresh(ctx);
+    refresh(ctx, true);
 }
 
 void showRefreshFailedError(Context* ctx, const char* message) {
@@ -96,9 +97,35 @@ void showNoInternet(Context* ctx) {
     showRefreshFailedError(ctx, "No Internet Connection");
 }
 
-void showApps(Context* ctx) {
+// The download layer emits short, technical error strings. Map them to something the user
+// can reason about: the important distinction is "couldn't connect at all" (network/TLS/DNS)
+// versus "the server answered but had no apps content for this version" (a 404/error).
+static const char* mapDownloadError(const char* error) {
+    std::string reason(error == nullptr ? "" : error);
+    if (reason.empty()) {
+        // No detail available; conservatively report a connectivity problem.
+        return "Cannot reach server";
+    }
+    if (reason == "Failed to read certificate") {
+        return "Certificate error";
+    }
+    if (reason == "Failed to open connection") {
+        // DNS resolution, TCP connect or the TLS handshake failed.
+        return "Cannot reach server";
+    }
+    if (reason == "Failed to get request headers") {
+        return "Server did not respond";
+    }
+    if (reason == "Server response is not OK") {
+        // Reachable, but the object isn't there (e.g. no apps published for this version).
+        return "No apps available for this version";
+    }
+    return error;
+}
+
+bool showApps(Context* ctx) {
     if (ctx->contentWrapper == nullptr) {
-        return;
+        return false;
     }
     lv_obj_clean(ctx->contentWrapper);
     ctx->mutex.lock();
@@ -120,13 +147,15 @@ void showApps(Context* ctx) {
             lv_obj_set_user_data(entry_button, int_as_voidptr);
             lv_obj_add_event_cb(entry_button, onAppPressed, LV_EVENT_SHORT_CLICKED, ctx);
         }
-    } else {
-        showRefreshFailedError(ctx, "Failed to load content");
+        ctx->mutex.unlock();
+        return true;
     }
+    showRefreshFailedError(ctx, "Failed to load content");
     ctx->mutex.unlock();
+    return false;
 }
 
-void refresh(Context* ctx) {
+void refresh(Context* ctx, bool force) {
     if (ctx->contentWrapper == nullptr || ctx->refreshButton == nullptr) {
         return;
     }
@@ -142,16 +171,41 @@ void refresh(Context* ctx) {
         return;
     }
 
-    if (file::isFile(ctx->cachedAppsJsonFile)) {
-        showApps(ctx);
+    // Show a valid cached manifest immediately and only re-download on the first load (no
+    // cache) or an explicit refresh. Re-downloading on every re-open exhausts the C5's limited
+    // internal RAM - each download allocates TLS/mbedTLS buffers from it - so a later download
+    // fails its TLS handshake and reports "Cannot reach server".
+    const bool cachedShown = file::isFile(ctx->cachedAppsJsonFile) && showApps(ctx);
+    if (!force && cachedShown) {
+        lv_obj_remove_flag(ctx->refreshButton, LV_OBJ_FLAG_HIDDEN);
+        return;
     }
 
-    // These callbacks run on a background network thread and reach back into this app's
-    // widgets via the captured ctx pointer - same convention as AppHubDetailsApp.cpp's
-    // download callback for the sibling "install/update" flow.
+    // These callbacks run on the main dispatcher and reach back into this app's widgets via the
+    // captured ctx pointer - same convention as AppHubDetailsApp.cpp's download callback for the
+    // sibling "install/update" flow.
     const uint32_t refreshGeneration = ctx->uiGeneration.load();
+    tryRefreshVersion(ctx, refreshGeneration, apphub::getAppsJsonUrlCandidates(), 0);
+}
+
+// Tries the manifest URLs newest-first. When a URL is reachable but the manifest isn't there
+// (e.g. this OS version isn't published yet, so the CDN answers 404), it moves on to the next
+// older version. Other failures (DNS/TCP/TLS) are shown as-is because they may be a genuine
+// connectivity problem rather than a missing manifest.
+void tryRefreshVersion(Context* ctx, uint32_t refreshGeneration, const std::vector<std::string>& urls, size_t index) {
+    if (index >= urls.size()) {
+        // Every candidate was reachable but had no content: this version isn't published yet.
+        lvgl_lock();
+        if (ctx->uiGeneration.load() == refreshGeneration && ctx->contentWrapper != nullptr && ctx->refreshButton != nullptr) {
+            showRefreshFailedError(ctx, "No apps available for this version");
+        }
+        lvgl_unlock();
+        return;
+    }
+
+    const std::string url = urls[index];
     network::http::download(
-        getAppsJsonUrl(),
+        url,
         CERTIFICATE_PATH,
         ctx->cachedAppsJsonFile,
         [ctx, refreshGeneration] {
@@ -162,11 +216,24 @@ void refresh(Context* ctx) {
             }
             lvgl_unlock();
         },
-        [ctx, refreshGeneration](const char* error) {
-            LOG_E(TAG, "Request failed: %s", error);
+        [ctx, refreshGeneration, urls, index](const char* error) {
+            if (error != nullptr) {
+                LOG_E(TAG, "Request failed (%zu): %s", index, error);
+            } else {
+                LOG_E(TAG, "Request failed (%zu): (null error)", index);
+            }
+            // The only failure worth stepping back a version is "the server was reached but
+            // has no content for this version" (e.g. a 404). A connect/TLS/DNS failure is a
+            // real problem, not a version problem, so it must not be masked by a fallback.
+            if (error != nullptr && std::string(error) == "Server response is not OK") {
+                if (ctx->uiGeneration.load() == refreshGeneration) {
+                    return tryRefreshVersion(ctx, refreshGeneration, urls, index + 1);
+                }
+                return;
+            }
             lvgl_lock();
             if (ctx->uiGeneration.load() == refreshGeneration && ctx->contentWrapper != nullptr && ctx->refreshButton != nullptr) {
-                showRefreshFailedError(ctx, "Cannot reach server");
+                showRefreshFailedError(ctx, mapDownloadError(error));
             }
             lvgl_unlock();
         }
@@ -200,25 +267,25 @@ void createWidgets(lv_obj_t* parent, void* userData) {
 
     // Invalidate any in-flight async callback captured before this UI tree existed.
     ctx->uiGeneration.fetch_add(1);
-    refresh(ctx);
+    refresh(ctx, false);
 }
 
 int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     Context ctx;
     ctx.appInstanceId = appInstanceId;
 
+    TaskEventGroup event_group;
+    task_event_group_construct(&event_group);
     AppEventSubscription sub {};
-    sub.app_instance_id = appInstanceId;
-    app_event_subscribe(&sub);
+    app_event_subscribe(&sub, &event_group);
 
     WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
 
     bool shouldClose = false;
     while (!shouldClose) {
+        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
         AppEvent event {};
-        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
-            break;
-        }
+        while (app_event_poll(&sub, &event) == ERROR_NONE) {
         switch (event.type) {
             case APP_EVENT_CLOSE:
                 app_manager_finish(appInstanceId);
@@ -227,11 +294,13 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
             default:
                 break;
         }
+        }
     }
 
     ctx.uiGeneration.fetch_add(1);
     window_manager_remove(window);
     app_event_unsubscribe(&sub);
+    task_event_group_destruct(&event_group);
 
     return 0;
 }

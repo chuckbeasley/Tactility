@@ -343,6 +343,17 @@ void elf_set_symbol_resolver(symbol_resolver resolver) {
  */
 uintptr_t esp_elf_map_sym(esp_elf_t *elf, uintptr_t sym)
 {
+    /* Segment-based loader (esp_elf_load_segment): the whole ELF image is copied into elf->psegment,
+     * whose base VMA is elf->svaddr. Any in-ELF symbol VMA maps to psegment + (sym - svaddr). The
+     * section-based loader does NOT populate psegment/svaddr, so this branch only fires when the
+     * segment loader is in use (the RISC-V path). Without it, in-ELF symbols such as C++ std::string
+     * functions (e.g. _M_dispose) that are DEFINED inside the app could never be resolved because
+     * elf->sec[] is never filled by the segment loader (it stays all zero). */
+    if (elf->psegment != NULL && sym >= elf->svaddr) {
+        return (uintptr_t)elf->psegment + (sym - elf->svaddr);
+    }
+
+    /* Section-based loader (esp_elf_load_section): map through the per-section ranges. */
     for (int i = 0; i < ELF_SECS; i++) {
         if ((sym >= elf->sec[i].v_addr) &&
                 (sym < (elf->sec[i].v_addr + elf->sec[i].size))) {
@@ -429,7 +440,6 @@ int esp_elf_relocate(esp_elf_t *elf, const uint8_t *pbuf)
             ESP_LOGD(TAG, "Section %s has %d symbol tables", shstrab + shdr[i].name, (int)nr_reloc);
 
             for (int i = 0; i < nr_reloc; i++) {
-                int type;
                 uintptr_t addr = 0;
                 elf32_rela_t rela_buf;
 
@@ -437,37 +447,34 @@ int esp_elf_relocate(esp_elf_t *elf, const uint8_t *pbuf)
 
                 const elf32_sym_t *sym = &symtab[ELF_R_SYM(rela_buf.info)];
 
-                type = ELF_R_TYPE(rela_buf.info);
-                if (type == STT_COMMON || type == STT_OBJECT || type == STT_SECTION) {
-                    const char *comm_name = strtab + sym->name;
-
-                    if (comm_name[0]) {
-                        addr = elf_find_sym(comm_name);
-
-                        if (!addr) {
-                            ESP_LOGE(TAG, "Can't find common %s", strtab + sym->name);
-#if CONFIG_ELF_LOADER_BUS_ADDRESS_MIRROR
-                            esp_elf_free(elf->pdata);
-                            esp_elf_free(elf->ptext);
-#else
-                            esp_elf_free(elf->psegment);
-#endif
-                            return -ENOSYS;
-                        }
-
-                        ESP_LOGD(TAG, "Find common %s addr=%x", comm_name, addr);
-                    }
-                } else if (type == STT_FILE) {
-                    const char *func_name = strtab + sym->name;
-
-                    if (sym->value) {
+                // Symbol-address resolution, keyed off the symbol's *definition* rather than the
+                // relocation type. The old code compared "relocation type" (ELF_R_TYPE) against
+                // symbol-type enum values. On RISC-V, R_RISCV_32 == STT_OBJECT == 1, so an ordinary
+                // 32-bit fixup against a symbol that is actually DEFINED inside this app ELF was
+                // wrongly sent to the external lookup (elf_find_sym). That broke C++ apps whose
+                // std::string internals (e.g. _ZNSt7__cxx1112basic_string..._M_disposeEv) are
+                // self-contained but were treated as external and could never be resolved.
+                //
+                // Resolution rule: a symbol with a defined section index (shndx != SHN_UNDEF, i.e.
+                // != 0) lives in this ELF and must be mapped within the app's loaded memory via
+                // sym->value. A genuinely undefined symbol (shndx == SHN_UNDEF) is resolved from the
+                // OS export table via elf_find_sym. This preserves the proven STT_FILE behavior
+                // (sym->value ? map : external) while fixing the object/common/section case.
+                const char *sym_name = strtab + sym->name;
+                if (sym_name[0]) {
+                    /* Symbol *section index* (sym->shndx) decides where the address lives. */
+                    if (sym->shndx == 0xFFF2) {                 /* SHN_COMMON */
+                        addr = elf_find_sym(sym_name);          /* common block -> external */
+                    } else if (sym->shndx == 0xFFF1) {          /* SHN_ABS */
+                        addr = sym->value;                      /* value IS the address */
+                    } else if (sym->shndx != 0) {               /* != SHN_UNDEF: in this ELF */
                         addr = esp_elf_map_sym(elf, sym->value);
-                    } else {
-                        addr = elf_find_sym(func_name);
+                    } else {                                    /* SHN_UNDEF: external */
+                        addr = elf_find_sym(sym_name);
                     }
 
                     if (!addr) {
-                        ESP_LOGE(TAG, "Can't find symbol %s", func_name);
+                        ESP_LOGE(TAG, "Can't find symbol %s", sym_name);
 #if CONFIG_ELF_LOADER_BUS_ADDRESS_MIRROR
                         esp_elf_free(elf->pdata);
                         esp_elf_free(elf->ptext);
@@ -476,8 +483,6 @@ int esp_elf_relocate(esp_elf_t *elf, const uint8_t *pbuf)
 #endif
                         return -ENOSYS;
                     }
-
-                    ESP_LOGD(TAG, "Find function %s addr=%x", func_name, addr);
                 }
 
                 esp_elf_arch_relocate(elf, &rela_buf, sym, addr);

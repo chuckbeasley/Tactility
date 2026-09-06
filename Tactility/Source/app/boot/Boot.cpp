@@ -1,5 +1,6 @@
 #include "tactility/system_event.h"
 
+#include <tactility/concurrent/task_event_group.h>
 #include <tactility/delay.h>
 #include <tactility/drivers/backlight.h>
 #include <tactility/drivers/display.h>
@@ -326,9 +327,10 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     splashDrawn = false;
     splashDrawnTime = 0;
 
+    TaskEventGroup event_group;
+    task_event_group_construct(&event_group);
     AppEventSubscription sub {};
-    sub.app_instance_id = appInstanceId;
-    app_event_subscribe(&sub);
+    app_event_subscribe(&sub, &event_group);
 
     bootWindowId = window_manager_create(appInstanceId, createSplashWidgets, nullptr);
 
@@ -337,14 +339,16 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     // Waits until app_manager_start(launcher) (or a permanent stop) tells us to give up -
     // startNextApp() above is what triggers that, via app-module's "save the previously active
     // app" policy, unless sdCardMissing halted before it.
-    while (true) {
+    bool should_close = false;
+    while (!should_close) {
+        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
         AppEvent event {};
-        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
-            break;
-        }
-        if (event.type == APP_EVENT_CLOSE) {
-            app_manager_finish(appInstanceId);
-            break;
+        while (app_event_poll(&sub, &event) == ERROR_NONE) {
+            if (event.type == APP_EVENT_CLOSE) {
+                app_manager_finish(appInstanceId);
+                should_close = true;
+                break;
+            }
         }
     }
 
@@ -352,6 +356,7 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
         window_manager_remove(bootWindowId);
     }
     app_event_unsubscribe(&sub);
+    task_event_group_destruct(&event_group);
 
     return 0;
 }

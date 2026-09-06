@@ -266,6 +266,23 @@ struct WifiApi {
      * @return ERROR_NONE on success
      */
     error_t (*set_promiscuous_callback)(struct Device* device, WifiPromiscuousCallback callback, void* context);
+
+    /**
+     * Set the primary channel. Used by monitor mode / channel hopping.
+     * @param[in] device  the wifi device
+     * @param[in] channel channel number (1-14 = 2.4 GHz, 36+ = 5 GHz)
+     * @return ERROR_NONE on success
+     */
+    error_t (*set_channel)(struct Device* device, uint8_t channel);
+
+    /**
+     * Transmit a raw 802.11 frame (used by monitor mode, e.g. deauth injection).
+     * @param[in] device the wifi device
+     * @param[in] frame  raw 802.11 frame bytes (>= 24 and <= 1500)
+     * @param[in] length frame length in bytes
+     * @return ERROR_NONE on success
+     */
+    error_t (*send_raw_frame)(struct Device* device, const uint8_t* frame, size_t length);
 };
 
 extern const struct DeviceType WIFI_TYPE;
@@ -283,6 +300,8 @@ error_t wifi_station_get_ipv4_address(struct Device* device, char* ipv4);
 error_t wifi_station_get_target_ssid(struct Device* device, char* ssid);
 error_t wifi_station_connect(struct Device* device, const char* ssid, const char* password, int32_t channel);
 error_t wifi_station_disconnect(struct Device* device);
+error_t wifi_set_channel(struct Device* device, uint8_t channel);
+error_t wifi_send_raw_frame(struct Device* device, const uint8_t* frame, size_t length);
 error_t wifi_station_get_rssi(struct Device* device, int32_t* rssi);
 error_t wifi_add_event_callback(struct Device* device, void* callback_context, WifiEventCallback callback);
 error_t wifi_remove_event_callback(struct Device* device, WifiEventCallback callback);

@@ -7,6 +7,7 @@
 #include <lvgl_window_manager/window_manager.h>
 
 #include <tactility/log.h>
+#include <tactility/concurrent/task_event_group.h>
 
 #include <lvgl.h>
 #include <lvgl/widgets/toolbar.h>
@@ -50,8 +51,7 @@ void onItemSelected(lv_event_t* e) {
     // finish, which needs the LVGL lock (window_manager_remove()) - but this callback is
     // running ON the LVGL task, which would deadlock against itself. The caller reaps this
     // instance via app_manager_stop() after it receives the APP_EVENT_RESULT instead.
-    AppEvent event { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
-    app_event_emit(itemCtx->ctx->appInstanceId, &event);
+    app_event_emit_close(itemCtx->ctx->appInstanceId);
 }
 
 void createChoiceItem(Context* ctx, lv_obj_t* list, const std::string& title, int32_t index) {
@@ -65,8 +65,7 @@ void createChoiceItem(Context* ctx, lv_obj_t* list, const std::string& title, in
 // mirrors the original's 0-items (error) and 1-item (auto-select) shortcuts.
 void closeWithResult(Context* ctx, int32_t result) {
     ctx->result = result;
-    AppEvent event { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
-    app_event_emit(ctx->appInstanceId, &event);
+    app_event_emit_close(ctx->appInstanceId);
 }
 
 void createWidgets(lv_obj_t* parent, void* userData) {
@@ -104,25 +103,29 @@ int32_t appMain(AppInstanceId appInstanceId, int argc, char* argv[]) {
     ctx.argc = argc;
     ctx.argv = argv;
 
+    TaskEventGroup event_group;
+    task_event_group_construct(&event_group);
     AppEventSubscription sub {};
-    sub.app_instance_id = appInstanceId;
-    app_event_subscribe(&sub);
+    app_event_subscribe(&sub, &event_group);
 
     WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
 
-    while (true) {
+    bool should_close = false;
+    while (!should_close) {
+        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
         AppEvent event {};
-        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
-            break;
-        }
-        if (event.type == APP_EVENT_CLOSE) {
-            app_manager_finish(appInstanceId); // no-op: modal children never supersede anything
-            break;
+        while (app_event_poll(&sub, &event) == ERROR_NONE) {
+            if (event.type == APP_EVENT_CLOSE) {
+                app_manager_finish(appInstanceId); // no-op: modal children never supersede anything
+                should_close = true;
+                break;
+            }
         }
     }
 
     window_manager_remove(window);
     app_event_unsubscribe(&sub);
+    task_event_group_destruct(&event_group);
 
     return ctx.result;
 }

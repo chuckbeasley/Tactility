@@ -95,4 +95,4 @@ dependencies:
     version: "7.3.0"
     rules:
       - if: "target in [esp32, esp32s3, esp32p4, esp32c5]"
-  idf: '6.0.2'
+  idf: '6.1'

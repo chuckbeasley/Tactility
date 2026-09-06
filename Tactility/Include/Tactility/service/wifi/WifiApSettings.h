@@ -42,6 +42,17 @@ bool contains(const std::string& ssid);
 std::vector<std::string> getSavedSsids();
 
 /**
+ * Find the first saved network that has auto-connect enabled.
+ * Reads each settings file at most once - unlike getSavedSsids() (which reads
+ * every file to extract the SSIDs) followed by load() (which re-reads the
+ * matching file). Used on the boot auto-connect path, where the per-file read
+ * is comparatively expensive.
+ * @param[out] settings the output settings of the first auto-connect network
+ * @return true if an auto-connect network was found
+ */
+bool findFirstAutoConnectAp(WifiApSettings& settings);
+
+/**
  * Load the settings for the provided SSID
  * @param[in] ssid the access point to look for
  * @param[out] settings the output settings
@@ -62,5 +73,11 @@ bool save(const WifiApSettings& settings);
  * @return true when settings were found and removed
  */
 bool remove(const std::string& ssid);
+
+/**
+ * One-time migration into the dedicated settings/wifi subdirectory.
+ * Call once at service start.
+ */
+void migrateLegacyApSettings();
 
 } // namespace

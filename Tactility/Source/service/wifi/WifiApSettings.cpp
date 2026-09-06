@@ -53,9 +53,16 @@ bool readHex(const std::string& input, uint8_t* buffer, int length) {
     return true;
 }
 
+// Saved networks live in a dedicated subdirectory so the saved-SSID scan (which
+// enumerates the directory) isn't slowed by unrelated files (e.g. .pcap captures)
+// that also live in the user data directory.
+static std::string getApSettingsDirectory(std::shared_ptr<ServicePaths> paths) {
+    return paths->getUserDataPath("settings/wifi");
+}
+
 // TODO: The SSID could contain invalid filename characters (e.g. "/", "\" and more) so we have to refactor this.
 static std::string getApPropertiesFilePath(std::shared_ptr<ServicePaths> paths, const std::string& ssid) {
-    return std::format(AP_SETTINGS_FORMAT, paths->getUserDataDirectory(), ssid);
+    return std::format(AP_SETTINGS_FORMAT, getApSettingsDirectory(paths), ssid);
 }
 
 // The IV is derived from the SSID rather than the password/ciphertext, because the SSID is the one
@@ -139,12 +146,13 @@ std::vector<std::string> getSavedSsids() {
         return ssids;
     }
 
-    const auto directory = service_context->getPaths()->getUserDataDirectory();
+    const auto directory = getApSettingsDirectory(service_context->getPaths());
     std::vector<dirent> entries;
-    if (file::scandir(directory, entries, [](const dirent* entry) {
+    int scan_result = file::scandir(directory, entries, [](const dirent* entry) {
         std::string name = entry->d_name;
         return name.ends_with(".ap.properties") ? 0 : -1;
-    }, nullptr) <= 0) {
+    }, nullptr);
+    if (scan_result <= 0) {
         return ssids;
     }
 
@@ -164,6 +172,42 @@ std::vector<std::string> getSavedSsids() {
     return ssids;
 }
 
+// One-time migration: move legacy <ssid>.ap.properties entries (which used to live
+// directly in the user data directory) into settings/wifi/ so the saved-SSID scan
+// is no longer slowed by unrelated files such as .pcap captures.
+void migrateLegacyApSettings() {
+    auto service_context = findServiceContext();
+    if (service_context == nullptr) {
+        return;
+    }
+
+    const auto old_directory = service_context->getPaths()->getUserDataDirectory();
+    const auto new_directory = getApSettingsDirectory(service_context->getPaths());
+
+    std::vector<dirent> entries;
+    if (file::scandir(old_directory, entries, [](const dirent* entry) {
+        std::string name = entry->d_name;
+        return name.ends_with(".ap.properties") ? 0 : -1;
+    }, nullptr) <= 0) {
+        return;
+    }
+
+    if (!file::findOrCreateDirectory(new_directory, 0755)) {
+        LOG_E(TAG, "Failed to create %s", new_directory.c_str());
+        return;
+    }
+
+    for (const auto& entry : entries) {
+        const std::string old_path = file::getChildPath(old_directory, entry.d_name);
+        const std::string new_path = file::getChildPath(new_directory, entry.d_name);
+        if (::rename(old_path.c_str(), new_path.c_str()) != 0) {
+            LOG_W(TAG, "Failed to migrate %s", old_path.c_str());
+        } else {
+            LOG_I(TAG, "Migrated %s -> %s", old_path.c_str(), new_path.c_str());
+        }
+    }
+}
+
 bool contains(const std::string& ssid) {
     auto service_context = findServiceContext();
     if (service_context == nullptr) {
@@ -173,13 +217,10 @@ bool contains(const std::string& ssid) {
     return file::isFile(file_path);
 }
 
-bool load(const std::string& ssid, WifiApSettings& apSettings) {
-    auto service_context = findServiceContext();
-    if (service_context == nullptr) {
-        LOG_E(TAG, "No service context");
-        return false;
-    }
-    const auto file_path = getApPropertiesFilePath(service_context->getPaths(), ssid);
+// Reads and parses a single saved-network properties file. This is the one place
+// that touches the file, so callers that need the SSID casing, password and
+// auto-connect flag together get them in a single read.
+static bool loadFromPath(const std::string& file_path, WifiApSettings& apSettings) {
     if (!file::isFile(file_path)) {
         LOG_E(TAG, "Not a file: %s", file_path.c_str());
         return false;
@@ -191,21 +232,20 @@ bool load(const std::string& ssid, WifiApSettings& apSettings) {
         return false;
     }
 
-    // SSID is required
+    // SSID is required and is also the IV seed for the password cipher.
     if (!map.contains(AP_PROPERTIES_KEY_SSID)) {
         LOG_E(TAG, "File does not contain SSID: %s", file_path.c_str());
         return false;
     }
 
     apSettings.ssid = map[AP_PROPERTIES_KEY_SSID];
-    assert(ssid == apSettings.ssid);
 
     if (map.contains(AP_PROPERTIES_KEY_PASSWORD)) {
         std::string password_decrypted;
         const auto& encrypted_password = map[AP_PROPERTIES_KEY_PASSWORD];
         if (encrypted_password.empty()) {
             apSettings.password = "";
-        } else if (decrypt(ssid, encrypted_password, password_decrypted)) {
+        } else if (decrypt(apSettings.ssid, encrypted_password, password_decrypted)) {
             apSettings.password = password_decrypted;
         } else {
             LOG_E(TAG, "Failed to decrypt password from %s", file_path.c_str());
@@ -228,7 +268,47 @@ bool load(const std::string& ssid, WifiApSettings& apSettings) {
     }
 
     return true;
+}
 
+bool load(const std::string& ssid, WifiApSettings& apSettings) {
+    auto service_context = findServiceContext();
+    if (service_context == nullptr) {
+        LOG_E(TAG, "No service context");
+        return false;
+    }
+    const auto file_path = getApPropertiesFilePath(service_context->getPaths(), ssid);
+    bool loaded = loadFromPath(file_path, apSettings);
+    assert(!loaded || ssid == apSettings.ssid);
+    return loaded;
+}
+
+bool findFirstAutoConnectAp(WifiApSettings& apSettings) {
+    auto service_context = findServiceContext();
+    if (service_context == nullptr) {
+        return false;
+    }
+
+    const auto directory = getApSettingsDirectory(service_context->getPaths());
+    std::vector<dirent> entries;
+    if (file::scandir(directory, entries, [](const dirent* entry) {
+        std::string name = entry->d_name;
+        return name.ends_with(".ap.properties") ? 0 : -1;
+    }, nullptr) <= 0) {
+        return false;
+    }
+
+    for (const auto& entry : entries) {
+        std::string file_path = file::getChildPath(directory, entry.d_name);
+        WifiApSettings loaded;
+        // Read each file at most once. loadFromPath() captures the SSID casing,
+        // password and auto-connect flag in a single pass, so a separate
+        // getSavedSsids() + load() (which re-reads the matched file) is not needed.
+        if (loadFromPath(file_path, loaded) && loaded.autoConnect) {
+            apSettings = loaded;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool save(const WifiApSettings& apSettings) {

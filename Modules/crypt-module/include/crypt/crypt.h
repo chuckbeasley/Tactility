@@ -80,6 +80,13 @@ int crypt_encrypt(const uint8_t iv[16], const uint8_t* inData, uint8_t* outData,
  */
 int crypt_decrypt(const uint8_t iv[16], const uint8_t* inData, uint8_t* outData, size_t dataLength);
 
+/**
+ * @brief Warm up the secure-storage key derivation (NVS fetch) so a later decrypt,
+ * e.g. the WiFi password at boot-time auto-connect, doesn't stall on the lazy
+ * NVS cold-start. Call once early in boot after NVS is available.
+ */
+void crypt_prewarm(void);
+
 #ifdef __cplusplus
 }
 #endif

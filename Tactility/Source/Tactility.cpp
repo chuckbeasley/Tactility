@@ -40,6 +40,7 @@
 #include <Tactility/Timer.h>
 #include <Tactility/settings/TouchCalibrationSettings.h>
 
+#include <crypt/crypt.h>
 #include <crypt/module.h>
 
 #include <gps/module.h>
@@ -250,6 +251,7 @@ namespace app {
     namespace usbsettings { extern const ::AppManifest manifest; }
     namespace btmanage { extern const ::AppManifest manifest; }
     namespace btpeersettings { extern const ::AppManifest manifest; }
+    namespace blespam { extern const ::AppManifest manifest; }
     namespace wifiapsettings { extern const ::AppManifest manifest; }
     namespace wificonnect { extern const ::AppManifest manifest; }
     namespace wifimanage { extern const ::AppManifest manifest; }
@@ -271,6 +273,7 @@ namespace app {
 
 #if defined(CONFIG_SOC_WIFI_SUPPORTED) || defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
     namespace chat { extern const ::AppManifest manifest; }
+    namespace wifimonitor { extern const ::AppManifest manifest; }
 #endif
 }
 
@@ -340,6 +343,7 @@ static void registerInternalApps() {
 
 #if defined(CONFIG_SOC_WIFI_SUPPORTED) || defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
     app_manager_add(&app::chat::manifest);
+    app_manager_add(&app::wifimonitor::manifest);
 #endif
 
     if (device_exists_of_type(&GROVE_TYPE)) {
@@ -358,6 +362,7 @@ static void registerInternalApps() {
 #if defined(CONFIG_BT_NIMBLE_ENABLED) && CONFIG_BT_NIMBLE_ENABLED
     app_manager_add(&app::btmanage::manifest);
     app_manager_add(&app::btpeersettings::manifest);
+    app_manager_add(&app::blespam::manifest);
 #endif
 }
 
@@ -437,8 +442,7 @@ static void stopAppFromToolbar(lv_event_t*) {
     // bound-waits (thread_join) for the app's own thread to finish, which needs the LVGL
     // lock to clean up - but this callback runs ON the LVGL task, which would deadlock
     // against itself.
-    AppEvent event { .type = APP_EVENT_CLOSE, .timestamp = 0, .result = {} };
-    app_event_emit(topmost, &event);
+    app_event_emit_close(topmost);
 }
 
 // The on-screen keyboard widget itself, constructed during windowManagerScreenInit
@@ -511,6 +515,10 @@ static void applySavedTouchCalibration() {
 #endif // CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED
 
 static void onLvglStarted() {
+    // Warm the secure-storage key now (NVS is mounted) so the boot-time WiFi
+    // password decrypt at auto-connect doesn't pay the lazy cold-start cost.
+    crypt_prewarm();
+
     window_manager_configure(windowManagerScreenInit);
     check(module_ensure_started(&lvgl_window_manager_module) == ERROR_NONE);
 
@@ -519,6 +527,7 @@ static void onLvglStarted() {
 
     addService(service::statusbar::manifest);
     addService(service::memorychecker::manifest);
+    addService(service::webserver::manifest);
 #if defined(CONFIG_TT_TDECK_WORKAROUND)
     addService(service::keyboardidle::manifest);
 #endif

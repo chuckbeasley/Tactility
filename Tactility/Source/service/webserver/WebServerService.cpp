@@ -24,9 +24,8 @@
 #include <lvgl/lvgl.h>
 #include <lvgl/icons/statusbar.h>
 
-#if TT_FEATURE_SCREENSHOT_ENABLED
-#include <lv_screenshot.h>
-#endif
+// The screenshot API (lv_snapshot_take / lv_draw_buf_*) is pulled in by <lvgl/lvgl.h> when
+// CONFIG_LV_USE_SNAPSHOT is enabled, which is what makes TT_FEATURE_SCREENSHOT_API true.
 
 #include "app/install.h"
 #include "app/manager.h"
@@ -222,13 +221,12 @@ bool WebServerService::onStart(ServiceContext& service) {
     statusbarIconId = lvgl::statusbar_icon_add();
     lvgl::statusbar_icon_set_visibility(statusbarIconId, false);
 
-    // Avoid filesystem reads during early startup; initialize from in-memory
-    // defaults and let explicit settings changes refresh from storage later.
+    // Read the persisted setting so an enabled server auto-starts on boot.
     bool serverEnabled;
     {
         auto lock = g_settingsMutex.asScopedLock();
         lock.lock();
-        g_cachedSettings = settings::webserver::getDefault();
+        g_cachedSettings = settings::webserver::loadOrGetDefault();
         g_settingsCached = true;
         serverEnabled = g_cachedSettings.webServerEnabled;
     }
@@ -1214,7 +1212,7 @@ esp_err_t WebServerService::handleApiSysinfo(httpd_req_t* request) {
 
     // Feature flags
     json << "\"features_enabled\":{";
-#if TT_FEATURE_SCREENSHOT_ENABLED
+#if TT_FEATURE_SCREENSHOT_API
     json << "\"screenshot\":true";
 #else
     json << "\"screenshot\":false";
@@ -1459,74 +1457,372 @@ esp_err_t WebServerService::handleApiWifi(httpd_req_t* request) {
     return ESP_OK;
 }
 
-// GET /api/screenshot - Capture and return screenshot as PNG
-// Screenshots are saved to SD card root (if available) or /data with incrementing numbers
+// GET /api/screenshot - Capture the active LVGL screen and return it as an image.
+// Defaults to PNG (truecolor RGB, compressed with miniz's deflate). Pass ?format=bmp for a
+// 24-bit BMP instead. Captures via LVGL's built-in snapshot API (lv_snapshot_take).
+static void screenshot_write_u32_be(std::vector<uint8_t>& v, uint32_t val) {
+    v.push_back((val >> 24) & 0xFF);
+    v.push_back((val >> 16) & 0xFF);
+    v.push_back((val >> 8) & 0xFF);
+    v.push_back(val & 0xFF);
+}
+
+static uint32_t screenshot_crc32(uint32_t crc, const uint8_t* data, size_t len) {
+    static uint32_t table[256];
+    static bool table_ready = false;
+    if (!table_ready) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            table[i] = c;
+        }
+        table_ready = true;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+static uint32_t screenshot_adler32(const uint8_t* data, size_t len) {
+    uint32_t a = 1;
+    uint32_t b = 0;
+    for (size_t i = 0; i < len; ++i) {
+        a = (a + data[i]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    return (b << 16) | a;
+}
+
+static void screenshot_png_chunk(std::vector<uint8_t>& out, const char* type, const uint8_t* data, size_t len) {
+    screenshot_write_u32_be(out, static_cast<uint32_t>(len));
+    // PNG CRC-32 is over the chunk type then the chunk data.
+    uint32_t crc = screenshot_crc32(0xFFFFFFFFu, reinterpret_cast<const uint8_t*>(type), 4);
+    if (len != 0) {
+        crc = screenshot_crc32(crc, data, len);
+    }
+    crc ^= 0xFFFFFFFFu;
+    out.insert(out.end(), type, type + 4);
+    if (len != 0) {
+        out.insert(out.end(), data, data + len);
+    }
+    screenshot_write_u32_be(out, crc);
+}
+
+// A small, self-contained deflate compressor (RFC 1951, fixed Huffman + LZ77 hash-chain) used for
+// the PNG IDAT payload. The ROM miniz deflate returned 0 on this chip, so this guarantees a small
+// PNG without depending on it. Produces a raw deflate stream (no zlib wrapper) with a single fixed
+// (BTYPE=01) block. Only fast enough for occasional screenshots.
+static bool screenshot_deflate(const uint8_t* src, size_t src_len, std::vector<uint8_t>& out) {
+    struct BitWriter {
+        std::vector<uint8_t> buf;
+        uint32_t bitbuf = 0;
+        int bitcount = 0;
+        void writeCode(uint32_t code, int num_bits) {
+            for (int i = num_bits - 1; i >= 0; --i) { // Huffman code: MSB first
+                if ((code >> i) & 1) bitbuf |= (1u << bitcount);
+                if (++bitcount == 8) { buf.push_back(static_cast<uint8_t>(bitbuf)); bitbuf = 0; bitcount = 0; }
+            }
+        }
+        void writeBits(uint32_t value, int num_bits) {
+            for (int i = 0; i < num_bits; ++i) { // extra bits: LSB first
+                if ((value >> i) & 1) bitbuf |= (1u << bitcount);
+                if (++bitcount == 8) { buf.push_back(static_cast<uint8_t>(bitbuf)); bitbuf = 0; bitcount = 0; }
+            }
+        }
+        void flush() {
+            if (bitcount > 0) { buf.push_back(static_cast<uint8_t>(bitbuf)); bitbuf = 0; bitcount = 0; }
+        }
+    };
+
+    // Fixed Huffman (RFC 1951 3.2.6): symbol -> (code, bits).
+    auto fixed_huff = [](uint32_t sym, uint32_t& bits) -> uint32_t {
+        if (sym <= 143) { bits = 8; return 0x30 + sym; }
+        if (sym <= 255) { bits = 9; return 0x190 + (sym - 144); }
+        if (sym <= 279) { bits = 7; return sym - 256; }
+        if (sym <= 287) { bits = 8; return 0xC0 + (sym - 280); }
+        bits = 5; return sym; // distance code 0-31
+    };
+
+    auto length_code = [](uint32_t len, uint32_t& code, uint32_t& extra, uint32_t& extra_bits) {
+        if (len <= 10) { code = 257 + len - 3; extra = 0; extra_bits = 0; }
+        else if (len <= 18) { code = 265 + (len - 11) / 2; extra = (len - 11) % 2; extra_bits = 1; }
+        else if (len <= 34) { code = 269 + (len - 19) / 4; extra = (len - 19) % 4; extra_bits = 2; }
+        else if (len <= 66) { code = 273 + (len - 35) / 8; extra = (len - 35) % 8; extra_bits = 3; }
+        else if (len <= 130) { code = 277 + (len - 67) / 16; extra = (len - 67) % 16; extra_bits = 4; }
+        else if (len <= 257) { code = 281 + (len - 131) / 32; extra = (len - 131) % 32; extra_bits = 5; }
+        else { code = 285; extra = 0; extra_bits = 0; }
+    };
+
+    auto dist_code = [](uint32_t dist, uint32_t& code, uint32_t& extra, uint32_t& extra_bits) {
+        if (dist <= 4) { code = dist - 1; extra = 0; extra_bits = 0; }
+        else if (dist <= 8) { code = 4 + (dist - 5) / 2; extra = (dist - 5) % 2; extra_bits = 1; }
+        else if (dist <= 16) { code = 6 + (dist - 9) / 4; extra = (dist - 9) % 4; extra_bits = 2; }
+        else if (dist <= 32) { code = 8 + (dist - 17) / 8; extra = (dist - 17) % 8; extra_bits = 3; }
+        else if (dist <= 64) { code = 10 + (dist - 33) / 16; extra = (dist - 33) % 16; extra_bits = 4; }
+        else if (dist <= 128) { code = 12 + (dist - 65) / 32; extra = (dist - 65) % 32; extra_bits = 5; }
+        else if (dist <= 256) { code = 14 + (dist - 129) / 64; extra = (dist - 129) % 64; extra_bits = 6; }
+        else if (dist <= 512) { code = 16 + (dist - 257) / 128; extra = (dist - 257) % 128; extra_bits = 7; }
+        else if (dist <= 1024) { code = 18 + (dist - 513) / 256; extra = (dist - 513) % 256; extra_bits = 8; }
+        else if (dist <= 2048) { code = 20 + (dist - 1025) / 512; extra = (dist - 1025) % 512; extra_bits = 9; }
+        else if (dist <= 4096) { code = 22 + (dist - 2049) / 1024; extra = (dist - 2049) % 1024; extra_bits = 10; }
+        else if (dist <= 8192) { code = 24 + (dist - 4097) / 2048; extra = (dist - 4097) % 2048; extra_bits = 11; }
+        else if (dist <= 16384) { code = 26 + (dist - 8193) / 4096; extra = (dist - 8193) % 4096; extra_bits = 12; }
+        else { code = 28 + (dist - 16385) / 8192; extra = (dist - 16385) % 8192; extra_bits = 13; }
+    };
+
+    constexpr uint32_t HASH_BITS = 15;
+    constexpr uint32_t HASH_SIZE = 1u << HASH_BITS;
+    constexpr uint32_t HASH_MASK = HASH_SIZE - 1;
+    std::vector<int> head(HASH_SIZE, -1);
+    std::vector<int> prev(src_len, -1); // ~2 bytes/byte of input; fine for occasional screenshots
+
+    auto hash3 = [HASH_MASK](const uint8_t* d, size_t i, size_t n) -> uint32_t {
+        if (i + 2 >= n) return 0;
+        return (((uint32_t)d[i] << 10) ^ ((uint32_t)d[i + 1] << 5) ^ d[i + 2]) & HASH_MASK;
+    };
+
+    BitWriter bw;
+    bw.writeBits(3, 3); // BFINAL=1, BTYPE=01 (fixed Huffman, single block)
+
+    size_t pos = 0;
+    while (pos < src_len) {
+        const uint32_t h = hash3(src, pos, src_len);
+        int best_len = 0;
+        int best_dist = 0;
+        int cand = head[h];
+        int chain = 0;
+        while (cand >= 0 && chain < 64 && static_cast<size_t>(cand) + 3 <= src_len) {
+            const size_t dist = pos - static_cast<size_t>(cand);
+            if (dist > 32768) break;
+            int len = 0;
+            while (pos + static_cast<size_t>(len) < src_len && len < 258 &&
+                   src[cand + len] == src[pos + static_cast<size_t>(len)]) {
+                ++len;
+            }
+            if (len >= 3 && len > best_len) {
+                best_len = len;
+                best_dist = static_cast<int>(dist);
+            }
+            cand = prev[cand];
+            ++chain;
+        }
+
+        if (best_len >= 3) {
+            uint32_t lc, le, leb;
+            length_code(static_cast<uint32_t>(best_len), lc, le, leb);
+            uint32_t clen;
+            bw.writeCode(fixed_huff(lc, clen), static_cast<int>(clen));
+            bw.writeBits(le, static_cast<int>(leb));
+            // Distance codes 0-31 use an FIXED 5-bit code equal to the code's own value (not a
+            // literal/length Huffman code, which is what fixed_huff() would otherwise produce).
+            uint32_t dc, de, deb;
+            dist_code(static_cast<uint32_t>(best_dist), dc, de, deb);
+            bw.writeCode(dc, 5);
+            bw.writeBits(de, static_cast<int>(deb));
+            for (int k = 0; k < best_len; ++k) {
+                const uint32_t hh = hash3(src, pos + static_cast<size_t>(k), src_len);
+                prev[pos + static_cast<size_t>(k)] = head[hh];
+                head[hh] = static_cast<int>(pos + static_cast<size_t>(k));
+            }
+            pos += static_cast<size_t>(best_len);
+        } else {
+            uint32_t clen;
+            bw.writeCode(fixed_huff(src[pos], clen), static_cast<int>(clen));
+            prev[pos] = head[h];
+            head[h] = static_cast<int>(pos);
+            ++pos;
+        }
+    }
+
+    uint32_t ebits;
+    bw.writeCode(fixed_huff(256, ebits), static_cast<int>(ebits)); // end of block
+    bw.flush();
+    out.swap(bw.buf);
+    return true;
+}
+
+static bool screenshot_encode_png(const uint8_t* rgb, uint32_t w, uint32_t h, std::vector<uint8_t>& out) {
+    // Each scanline is prefixed by a filter byte (0 = None) for PNG filtering.
+    const size_t raw_len = static_cast<size_t>(h) * (1 + static_cast<size_t>(w) * 3);
+    std::vector<uint8_t> raw;
+    raw.reserve(raw_len);
+    for (uint32_t y = 0; y < h; ++y) {
+        raw.push_back(0);
+        raw.insert(raw.end(), rgb + y * w * 3, rgb + (y + 1) * w * 3);
+    }
+
+    // IDAT payload: a zlib stream (zlib header + deflate + adler32). Compress the filtered scanlines
+    // with the self-contained deflate compressor; on the (rare) failure path, fall back to stored
+    // (uncompressed) deflate blocks so the PNG is always valid.
+    std::vector<uint8_t> zlib;
+    zlib.reserve(raw_len + raw_len / 65535 * 5 + 8);
+
+    std::vector<uint8_t> raw_deflate;
+    const bool compressed = screenshot_deflate(raw.data(), raw.size(), raw_deflate);
+
+    if (compressed && !raw_deflate.empty()) {
+        zlib.push_back(0x78); // CMF: deflate, 32K window
+        zlib.push_back(0x01); // FLG: fastest, valid check value
+        zlib.insert(zlib.end(), raw_deflate.begin(), raw_deflate.end());
+        const uint32_t adler = screenshot_adler32(raw.data(), raw.size());
+        zlib.push_back(static_cast<uint8_t>((adler >> 24) & 0xFF));
+        zlib.push_back(static_cast<uint8_t>((adler >> 16) & 0xFF));
+        zlib.push_back(static_cast<uint8_t>((adler >> 8) & 0xFF));
+        zlib.push_back(static_cast<uint8_t>(adler & 0xFF));
+    } else {
+        zlib.push_back(0x78); // CMF
+        zlib.push_back(0x01); // FLG
+        size_t pos = 0;
+        while (pos < raw.size()) {
+            const size_t chunk = (raw.size() - pos > 65535) ? 65535 : (raw.size() - pos);
+            const bool last = (pos + chunk == raw.size());
+            zlib.push_back(last ? 0x01 : 0x00); // BFINAL + BTYPE=00 => stored
+            zlib.push_back(static_cast<uint8_t>(chunk & 0xFF));
+            zlib.push_back(static_cast<uint8_t>((chunk >> 8) & 0xFF));
+            const uint16_t nlen = static_cast<uint16_t>(~chunk & 0xFFFF);
+            zlib.push_back(static_cast<uint8_t>(nlen & 0xFF));
+            zlib.push_back(static_cast<uint8_t>((nlen >> 8) & 0xFF));
+            zlib.insert(zlib.end(), raw.begin() + pos, raw.begin() + pos + chunk);
+            pos += chunk;
+        }
+        const uint32_t adler = screenshot_adler32(raw.data(), raw.size());
+        zlib.push_back(static_cast<uint8_t>((adler >> 24) & 0xFF));
+        zlib.push_back(static_cast<uint8_t>((adler >> 16) & 0xFF));
+        zlib.push_back(static_cast<uint8_t>((adler >> 8) & 0xFF));
+        zlib.push_back(static_cast<uint8_t>(adler & 0xFF));
+    }
+
+    static const uint8_t png_sig[8] = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+    out.insert(out.end(), png_sig, png_sig + 8);
+
+    uint8_t ihdr[13];
+    ihdr[0] = (w >> 24) & 0xFF; ihdr[1] = (w >> 16) & 0xFF; ihdr[2] = (w >> 8) & 0xFF; ihdr[3] = w & 0xFF;
+    ihdr[4] = (h >> 24) & 0xFF; ihdr[5] = (h >> 16) & 0xFF; ihdr[6] = (h >> 8) & 0xFF; ihdr[7] = h & 0xFF;
+    ihdr[8] = 8;  // bit depth
+    ihdr[9] = 2;  // color type: truecolor RGB
+    ihdr[10] = 0; // compression method
+    ihdr[11] = 0; // filter method
+    ihdr[12] = 0; // interlace
+    screenshot_png_chunk(out, "IHDR", ihdr, 13);
+    screenshot_png_chunk(out, "IDAT", zlib.data(), zlib.size());
+    screenshot_png_chunk(out, "IEND", nullptr, 0);
+    return true;
+}
+
+static bool screenshot_encode_bmp(const uint8_t* rgb, uint32_t w, uint32_t h, std::vector<uint8_t>& out) {
+    const uint32_t row_bytes = w * 3;
+    const uint32_t row_pad = (4 - (row_bytes % 4)) % 4;
+    const uint32_t pixel_offset = 54;
+    const uint32_t file_size = pixel_offset + (row_bytes + row_pad) * h;
+    out.assign(file_size, 0);
+
+    auto write_u16 = [&out](uint32_t off, uint16_t val) { out[off] = val & 0xFF; out[off + 1] = (val >> 8) & 0xFF; };
+    auto write_u32 = [&out](uint32_t off, uint32_t val) {
+        out[off] = val & 0xFF; out[off + 1] = (val >> 8) & 0xFF; out[off + 2] = (val >> 16) & 0xFF; out[off + 3] = (val >> 24) & 0xFF;
+    };
+
+    out[0] = 'B'; out[1] = 'M';
+    write_u32(2, file_size);
+    write_u16(6, 0);
+    write_u16(8, 0);
+    write_u32(10, pixel_offset);
+    write_u32(14, 40);
+    write_u32(18, w);
+    write_u32(22, h); // positive height -> bottom-up
+    write_u16(26, 1); // planes
+    write_u16(28, 24); // bits per pixel
+    write_u32(30, 0); // compression
+    write_u32(34, row_bytes * h);
+    write_u32(38, 0);
+    write_u32(42, 0);
+    write_u32(46, 0);
+    write_u32(50, 0);
+
+    uint32_t dst = pixel_offset;
+    for (uint32_t y = h; y > 0; --y) {
+        const uint8_t* row = rgb + (y - 1) * w * 3;
+        for (uint32_t x = 0; x < w; ++x) {
+            out[dst++] = row[x * 3 + 2]; // blue
+            out[dst++] = row[x * 3 + 1]; // green
+            out[dst++] = row[x * 3 + 0]; // red
+        }
+        dst += row_pad;
+    }
+    return true;
+}
+
 esp_err_t WebServerService::handleApiScreenshot(httpd_req_t* request) {
     LOG_I(TAG, "GET /api/screenshot");
 
-#if TT_FEATURE_SCREENSHOT_ENABLED
-    // Determine save location: prefer SD card root if mounted, otherwise /data
-    std::string save_path = getUserDataPath();
-
-    // Find next available filename with incrementing number
-    std::string screenshot_path;
-    bool found_slot = false;
-    for (int i = 1; i <= 9999; ++i) {
-        screenshot_path = std::format("{}/webscreenshot{}.png", save_path, i);
-        if (!file::isFile(screenshot_path)) {
-            found_slot = true;
-            break;
-        }
-    }
-    if (!found_slot) {
-        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "no available screenshot slots");
-        return ESP_FAIL;
+#if TT_FEATURE_SCREENSHOT_API
+    std::string format = "png";
+    std::string format_param;
+    if (getQueryParam(request, "format", format_param) && !format_param.empty()) {
+        format = format_param;
     }
 
-    LOG_I(TAG, "Screenshot will be saved to: %s", screenshot_path.c_str());
+    uint32_t w = 0;
+    uint32_t h = 0;
+    std::vector<uint8_t> rgb; // R,G,B bytes, row-major, top-down
 
-    // LVGL's lodepng uses lv_fs which requires the "A:" prefix
-    std::string lvgl_screenshot_path = lvgl::PATH_PREFIX + screenshot_path;
-
-    // Capture screenshot using LVGL
     if (lvgl_try_lock(pdMS_TO_TICKS(100))) {
-        bool success = lv_screenshot_create(lv_scr_act(), LV_100ASK_SCREENSHOT_SV_PNG, lvgl_screenshot_path.c_str());
-        lvgl_unlock();
-
-        if (!success) {
-            LOG_E(TAG, "lv_screenshot_create failed for path: %s", lvgl_screenshot_path.c_str());
+        lv_draw_buf_t* draw_buf = lv_snapshot_take(lv_scr_act(), LV_COLOR_FORMAT_RGB565);
+        if (draw_buf == nullptr) {
+            lvgl_unlock();
             httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "screenshot capture failed");
             return ESP_FAIL;
         }
-        LOG_I(TAG, "Screenshot captured successfully");
+
+        w = draw_buf->header.w;
+        h = draw_buf->header.h;
+        const uint32_t stride = draw_buf->header.stride;
+        const uint8_t* data = draw_buf->data;
+
+        rgb.reserve(static_cast<size_t>(w) * h * 3);
+        for (uint32_t y = 0; y < h; ++y) {
+            const uint8_t* row = data + y * stride;
+            for (uint32_t x = 0; x < w; ++x) {
+                const uint16_t px = static_cast<uint16_t>(row[x * 2] | (row[x * 2 + 1] << 8));
+                const uint8_t r5 = (px >> 11) & 0x1F;
+                const uint8_t g6 = (px >> 5) & 0x3F;
+                const uint8_t b5 = px & 0x1F;
+                // The ST7796 panel senses BGR while LVGL renders RGB565, so the panel shows every
+                // pixel with red and blue swapped. Swap R/B here so the screenshot matches the
+                // colors the panel actually displays (blue -> yellow-orange, dark stays dark).
+                rgb.push_back(static_cast<uint8_t>((b5 << 3) | (b5 >> 2))); // red
+                rgb.push_back(static_cast<uint8_t>((g6 << 2) | (g6 >> 4))); // green
+                rgb.push_back(static_cast<uint8_t>((r5 << 3) | (r5 >> 2))); // blue
+            }
+        }
+
+        lv_draw_buf_destroy(draw_buf);
+        lvgl_unlock();
     } else {
         LOG_E(TAG, "Could not acquire LVGL lock within 100ms");
         httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "could not acquire LVGL lock");
         return ESP_FAIL;
     }
 
-    // Send the file (use regular path for fopen, not LVGL path)
-    httpd_resp_set_type(request, "image/png");
-
-    FILE* fp = fopen(screenshot_path.c_str(), "rb");
-    if (!fp) {
-        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to open screenshot");
+    std::vector<uint8_t> image;
+    bool ok = false;
+    if (format == "bmp") {
+        ok = screenshot_encode_bmp(rgb.data(), w, h, image);
+        httpd_resp_set_type(request, "image/bmp");
+    } else {
+        ok = screenshot_encode_png(rgb.data(), w, h, image);
+        httpd_resp_set_type(request, "image/png");
+    }
+    if (!ok) {
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "image encoding failed");
         return ESP_FAIL;
     }
 
-    char buf[512];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        if (httpd_resp_send_chunk(request, buf, n) != ESP_OK) {
-            fclose(fp);
-            return ESP_FAIL;
-        }
-    }
-    fclose(fp);
+    httpd_resp_send_chunk(request, reinterpret_cast<const char*>(image.data()), image.size());
     httpd_resp_send_chunk(request, nullptr, 0);
-
-    // File is kept on storage (not deleted) for user access
-    LOG_I(TAG, "[200] /api/screenshot -> %s", screenshot_path.c_str());
+    LOG_I(TAG, "[200] /api/screenshot as %s (%u bytes)", format.c_str(), static_cast<unsigned>(image.size()));
     return ESP_OK;
 #else
     httpd_resp_send_err(request, HTTPD_501_METHOD_NOT_IMPLEMENTED, "screenshot feature not enabled");
