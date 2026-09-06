@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -93,6 +94,22 @@ void hidHostDisconnect();
 
 /** @return true when a BLE HID peripheral is fully subscribed and acting as LVGL input device */
 bool hidHostIsConnected();
+
+// ---- BLE raw advertising (peripheral role, custom payload) ----
+
+/**
+ * @brief Start advertising with raw advertising data (the full AD structure bytes,
+ * including length/type/company fields). Replaces any active advertising.
+ * @param[in] advData raw advertising data bytes (max 31)
+ * @param[in] advLen length of advData
+ * @param[in] connectable true for connectable advertising, false for non-connectable
+ * @param[in] randomizeAddress true to broadcast with a fresh random BLE address
+ * @return true on success
+ */
+bool startAdvertising(const uint8_t* advData, size_t advLen, bool connectable, bool randomizeAddress);
+
+/** @brief Stop any active advertising. */
+bool stopAdvertising();
 
 /**
  * @brief Initialize the Bluetooth bridge layer and optionally enable the radio.

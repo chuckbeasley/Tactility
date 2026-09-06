@@ -12,6 +12,7 @@
 #include <lvgl_window_manager/window_manager.h>
 
 #include <tactility/log.h>
+#include <tactility/concurrent/task_event_group.h>
 
 #include <lvgl/lvgl.h>
 
@@ -147,9 +148,10 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
     ctx.state.setScanning(service::wifi::isScanning());
     ctx.state.updateApRecords();
 
+    TaskEventGroup event_group;
+    task_event_group_construct(&event_group);
     AppEventSubscription sub {};
-    sub.app_instance_id = appInstanceId;
-    app_event_subscribe(&sub);
+    app_event_subscribe(&sub, &event_group);
 
     WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
     service::wifi::setAutoScanPaused(true);
@@ -170,17 +172,18 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
         (int)service::wifi::isScanning(),
         connection_target.empty() ? "(none)" : connection_target.c_str(),
         (int)can_scan);
-    if (can_scan && !service::wifi::isScanning()) {
+    if (can_scan) {
         // The service no longer scans on its own when it can connect straight to a saved AP,
         // and it stops scanning entirely once connected, so refresh the list on show.
+        // Don't gate on isScanning(): a stale/duplicate scan flag would otherwise leave the
+        // list empty while connected. A duplicate scan request is rejected harmlessly.
         service::wifi::scan();
     }
     bool shouldClose = false;
     while (!shouldClose) {
+        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
         AppEvent event {};
-        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
-            break;
-        }
+        while (app_event_poll(&sub, &event) == ERROR_NONE) {
         switch (event.type) {
             case APP_EVENT_CLOSE:
                 app_manager_finish(appInstanceId);
@@ -195,6 +198,7 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
             default:
                 break;
         }
+        }
     }
 
     ctx.lock();
@@ -205,6 +209,7 @@ int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
 
     window_manager_remove(window);
     app_event_unsubscribe(&sub);
+    task_event_group_destruct(&event_group);
 
     return 0;
 }

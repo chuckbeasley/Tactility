@@ -6,7 +6,7 @@ idf_component_register(
         "Libraries/minmea/include"
         "Libraries/minitar/include"
         "Modules/lvgl-module/include"
-    REQUIRES esp_timer app-module crypt-module gps-module lvgl-module lvgl-window-manager-module service-module
+    REQUIRES esp_timer freertos esp_netif nvs_flash app-module crypt-module gps-module lvgl-module lvgl-window-manager-module service-module
 )
 
 # Regular and core features

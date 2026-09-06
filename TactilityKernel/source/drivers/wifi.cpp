@@ -55,6 +55,18 @@ error_t wifi_station_disconnect(struct Device* device) {
     return WIFI_API(device)->station_disconnect(device);
 }
 
+error_t wifi_set_channel(struct Device* device, uint8_t channel) {
+    auto* api = WIFI_API(device);
+    if (api->set_channel == nullptr) return ERROR_NOT_SUPPORTED;
+    return api->set_channel(device, channel);
+}
+
+error_t wifi_send_raw_frame(struct Device* device, const uint8_t* frame, size_t length) {
+    auto* api = WIFI_API(device);
+    if (api->send_raw_frame == nullptr) return ERROR_NOT_SUPPORTED;
+    return api->send_raw_frame(device, frame, length);
+}
+
 error_t wifi_station_get_rssi(struct Device* device, int32_t* rssi) {
     return WIFI_API(device)->station_get_rssi(device, rssi);
 }

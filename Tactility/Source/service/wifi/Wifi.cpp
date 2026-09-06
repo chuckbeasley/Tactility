@@ -165,8 +165,10 @@ void dispatchSetEnabled(bool enabled) {
         // Get online immediately instead of waiting for onAutoConnectTimer() to become eligible:
         // shouldScanForAutoConnect() compares against absolute uptime, so lastScanTime=0 means
         // "once the system has been up AUTO_SCAN_INTERVAL", not "now". This also skips the full
-        // dual-band scan entirely when a saved network is available.
-        getMainDispatcher().dispatch([] { dispatchInitialAutoConnect(); });
+        // dual-band scan entirely when a saved network is available. Call directly (we're already
+        // on the main dispatcher) rather than re-queueing, so the link-up isn't held up behind the
+        // deferred-connectivity boot work.
+        dispatchInitialAutoConnect();
     } else {
         publishRadioState(WIFI_RADIO_STATE_OFF_PENDING);
 
@@ -198,14 +200,10 @@ void dispatchScan() {
 // Finds a saved auto-connect AP without needing scan results. esp_wifi_connect() does its own
 // targeted search for the SSID, so a full discovery sweep is unnecessary just to get online.
 bool findSavedAutoConnectAp(settings::WifiApSettings& out) {
-    for (const auto& ssid : settings::getSavedSsids()) {
-        settings::WifiApSettings loaded;
-        if (settings::load(ssid, loaded) && loaded.autoConnect) {
-            out = loaded;
-            return true;
-        }
-    }
-    return false;
+    // settings::findFirstAutoConnectAp() reads each saved-network file once, rather than
+    // enumerating every file (getSavedSsids) and then re-reading the matched one (load). On
+    // this boot path that per-file read dominates, so the single-pass version is faster.
+    return settings::findFirstAutoConnectAp(out);
 }
 
 // Runs once when the radio comes up. A full scan on this dual-band part sweeps ~38 channels
@@ -214,6 +212,10 @@ bool findSavedAutoConnectAp(settings::WifiApSettings& out) {
 // scanning so the UI still gets a network list and auto-connect can pick something up later.
 void dispatchInitialAutoConnect() {
     if (!started || state.device == nullptr || !device_is_ready(state.device)) return;
+
+    // Honor an external scan/auto-connect pause (e.g. Wi-Fi Monitor capture) so a
+    // radio-on transition doesn't immediately reconnect and lock the channel.
+    if (state.externalScanPause.load()) return;
 
     settings::WifiApSettings target;
     if (!state.userDisconnected && findSavedAutoConnectAp(target)) {
@@ -579,6 +581,10 @@ public:
 
     bool onStart(ServiceContext& /*service*/) override {
         check(!started);
+
+        // Move any legacy saved-network files into the dedicated settings/wifi
+        // subdirectory so the saved-SSID scan isn't slowed by other files.
+        settings::migrateLegacyApSettings();
 
         wifi_auto_scan_set_paused_function(autoScanSetPaused);
 

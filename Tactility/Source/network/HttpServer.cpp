@@ -18,6 +18,9 @@ bool HttpServer::startInternal() {
     config.server_port = port;
     config.uri_match_fn = matchUri;
     config.max_uri_handlers = handlers.size() + INTERNAL_URI_HANDLER_COUNT;
+    // HTTPD_DEFAULT_CONFIG() sets max_open_sockets to 7, which exceeds what
+    // low-memory targets allow (LWIP_MAX_SOCKETS=6 on ESP32-C5 leaves only 3).
+    config.max_open_sockets = 3;
 
     if (httpd_start(&server, &config) != ESP_OK) {
         LOG_E(TAG, "Failed to start http server on port %u", (unsigned)port);

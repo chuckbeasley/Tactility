@@ -12,6 +12,7 @@
 #include <host/ble_att.h>
 #include <host/ble_gap.h>
 #include <host/ble_hs.h>
+#include <host/ble_hs_id.h>
 #include <host/ble_sm.h>
 #include <host/ble_store.h>
 #include <host/ble_uuid.h>
@@ -1081,6 +1082,76 @@ static error_t api_get_device_name(struct Device* device, char* buf, size_t buf_
     return ERROR_NONE;
 }
 
+static error_t api_start_advertising(struct Device* device, const uint8_t* adv_data, size_t adv_len, bool connectable, bool randomize_address) {
+    BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
+    if (!ctx) return ERROR_INVALID_STATE;
+    if (adv_data == nullptr && adv_len != 0) return ERROR_INVALID_ARGUMENT;
+    if (ctx->radio_state.load() != BT_RADIO_STATE_ON) {
+        LOG_W(TAG, "start_advertising: radio not on");
+        return ERROR_INVALID_STATE;
+    }
+    // Legacy advertising payload limit (NimBLE's BLE_ADV_DATA_LEN).
+    if (adv_len > 31) {
+        LOG_E(TAG, "start_advertising: adv_data too long (%u > 31)", (unsigned)adv_len);
+        return ERROR_INVALID_ARGUMENT;
+    }
+
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
+
+    uint8_t own_addr_type = s_own_addr_type;
+    if (randomize_address) {
+        // Generate a fresh non-resolvable private address so each advertising burst
+        // appears to come from a different device (defeats address-based dedup on the
+        // receiving phone).
+        ble_addr_t addr;
+        int gen_rc = ble_hs_id_gen_rnd(1, &addr);
+        int set_rc = (gen_rc == 0) ? ble_hs_id_set_rnd(addr.val) : gen_rc;
+        if (set_rc == 0) {
+            own_addr_type = BLE_OWN_ADDR_RANDOM;
+        } else {
+            LOG_W(TAG, "start_advertising: random address failed rc=%d, using existing", set_rc);
+        }
+    }
+
+    // Clear any prior scan response so only the raw advertising data is broadcast.
+    struct ble_hs_adv_fields rsp;
+    memset(&rsp, 0, sizeof(rsp));
+    ble_gap_adv_rsp_set_fields(&rsp);
+
+    int rc = ble_gap_adv_set_data(adv_data, (int)adv_len);
+    if (rc != 0) {
+        LOG_E(TAG, "start_advertising: set_data failed rc=%d", rc);
+        return ERROR_UNDEFINED;
+    }
+
+    struct ble_gap_adv_params adv_params;
+    memset(&adv_params, 0, sizeof(adv_params));
+    adv_params.conn_mode = connectable ? BLE_GAP_CONN_MODE_UND : BLE_GAP_CONN_MODE_NON;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    adv_params.itvl_min  = 160; // 100 ms
+    adv_params.itvl_max  = 240; // 150 ms
+
+    rc = ble_gap_adv_start(own_addr_type, nullptr, BLE_HS_FOREVER,
+                           &adv_params, gap_event_handler, device);
+    if (rc != 0 && rc != BLE_HS_EALREADY) {
+        LOG_E(TAG, "start_advertising: adv_start failed rc=%d", rc);
+        return ERROR_UNDEFINED;
+    }
+    LOG_I(TAG, "start_advertising: OK (len=%u connectable=%d random=%d)", (unsigned)adv_len, (int)connectable, (int)randomize_address);
+    return ERROR_NONE;
+}
+
+static error_t api_stop_advertising(struct Device* device) {
+    BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
+    if (!ctx) return ERROR_INVALID_STATE;
+    if (ble_gap_adv_active()) {
+        ble_gap_adv_stop();
+    }
+    return ERROR_NONE;
+}
+
 static void api_set_hid_host_active(struct Device* device, bool active) {
     BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
     if (ctx) ctx->hid_host_active.store(active);
@@ -1108,6 +1179,8 @@ const BluetoothApi nimble_bluetooth_api = {
     .event_unsubscribe      = api_event_unsubscribe,
     .set_device_name        = api_set_device_name,
     .get_device_name        = api_get_device_name,
+    .start_advertising      = api_start_advertising,
+    .stop_advertising       = api_stop_advertising,
     .set_hid_host_active    = api_set_hid_host_active,
     .fire_event             = api_fire_event,
 };

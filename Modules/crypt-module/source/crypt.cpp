@@ -229,3 +229,14 @@ int crypt_decrypt(const uint8_t iv[16], const uint8_t* inData, uint8_t* outData,
     mbedtls_platform_zeroize(key, sizeof(key));
     return result;
 }
+
+void crypt_prewarm() {
+    // Force the key derivation (NVS fetch + MAC) now rather than on first use, so a
+    // boot-time decrypt (e.g. the WiFi password at auto-connect) doesn't stall on a
+    // cold secure-storage read.
+    uint8_t iv[16];
+    crypt_generate_iv(iv);
+    uint8_t dummy[16] = {0};
+    uint8_t out[16];
+    crypt_encrypt(iv, dummy, out, 16);
+}

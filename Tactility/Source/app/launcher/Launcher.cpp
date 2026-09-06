@@ -17,6 +17,7 @@
 #include <tactility/device.h>
 #include <tactility/drivers/power_supply.h>
 #include <tactility/log.h>
+#include <tactility/concurrent/task_event_group.h>
 
 #include <Tactility/app/setup/Setup.h>
 #include <Tactility/settings/TouchCalibrationSettings.h>
@@ -251,43 +252,44 @@ void runAutoStart(uint32_t appInstanceId) {
 }
 
 int32_t appMain(uint32_t appInstanceId, int argc, char* argv[]) {
+    TaskEventGroup event_group;
+    task_event_group_construct(&event_group);
     AppEventSubscription sub {};
-    sub.app_instance_id = appInstanceId;
-    app_event_subscribe(&sub);
+    app_event_subscribe(&sub, &event_group);
 
     WindowId window = window_manager_create(appInstanceId, createWidgets, nullptr);
     runAutoStart(appInstanceId);
 
     // The launcher is meant to stay resident (it's the home screen) - it only gives up its
     // thread when app-module's scheduler asks it to (e.g. another new-model app is started).
-    while (true) {
+    bool shouldClose = false;
+    while (!shouldClose) {
+        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
         AppEvent event {};
-        if (app_event_await(&sub, &event, portMAX_DELAY) != ERROR_NONE) {
-            break;
-        }
-        switch (event.type) {
-            case APP_EVENT_CLOSE:
-                app_manager_finish(appInstanceId);
-                break;
-            case APP_EVENT_RESULT:
+        while (app_event_poll(&sub, &event) == ERROR_NONE) {
+            switch (event.type) {
+                case APP_EVENT_CLOSE:
+                    app_manager_finish(appInstanceId);
+                    shouldClose = true;
+                    break;
+                case APP_EVENT_RESULT:
 #if defined(CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED)
-                if (event.result.launch_id == pendingCalibrationDialogId) {
-                    pendingCalibrationDialogId = 0;
-                    runAutoStart(appInstanceId);
-                }
+                    if (event.result.launch_id == pendingCalibrationDialogId) {
+                        pendingCalibrationDialogId = 0;
+                        runAutoStart(appInstanceId);
+                    }
 #endif
-                app_manager_stop(event.result.launch_id);
-                break;
-            default:
-                break;
-        }
-        if (event.type == APP_EVENT_CLOSE) {
-            break;
+                    app_manager_stop(event.result.launch_id);
+                    break;
+                default:
+                    break;
+            }
         }
     }
 
     window_manager_remove(window);
     app_event_unsubscribe(&sub);
+    task_event_group_destruct(&event_group);
     return 0;
 }
 

@@ -125,6 +125,14 @@ error_t bluetooth_get_device_name(struct Device* device, char* buf, size_t buf_l
     return BT_API(device)->get_device_name(device, buf, buf_len);
 }
 
+error_t bluetooth_start_advertising(struct Device* device, const uint8_t* adv_data, size_t adv_len, bool connectable, bool randomize_address) {
+    return BT_API(device)->start_advertising(device, adv_data, adv_len, connectable, randomize_address);
+}
+
+error_t bluetooth_stop_advertising(struct Device* device) {
+    return BT_API(device)->stop_advertising(device);
+}
+
 // ---- HID host active flag ----
 
 void bluetooth_set_hid_host_active(struct Device* device, bool active) {

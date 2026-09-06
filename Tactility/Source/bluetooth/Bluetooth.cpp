@@ -523,6 +523,28 @@ bool isProfileSupported(int profileId) {
            profileId == BT_PROFILE_MIDI;
 }
 
+bool startAdvertising(const uint8_t* advData, size_t advLen, bool connectable, bool randomizeAddress) {
+    Device* dev = nullptr;
+    if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) != ERROR_NONE) {
+        LOG_E(TAG, "startAdvertising: no active BLE device");
+        return false;
+    }
+    error_t result = bluetooth_start_advertising(dev, advData, advLen, connectable, randomizeAddress);
+    device_put(dev);
+    return result == ERROR_NONE;
+}
+
+bool stopAdvertising() {
+    Device* dev = nullptr;
+    if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) != ERROR_NONE) {
+        LOG_E(TAG, "stopAdvertising: no active BLE device");
+        return false;
+    }
+    error_t result = bluetooth_stop_advertising(dev);
+    device_put(dev);
+    return result == ERROR_NONE;
+}
+
 } // namespace tt::bluetooth
 
 #endif // CONFIG_BT_NIMBLE_ENABLED
