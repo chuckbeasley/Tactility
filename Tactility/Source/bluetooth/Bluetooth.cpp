@@ -259,6 +259,17 @@ void systemStart() {
         return;
     }
 
+    // Backported upstream lifecycle: ble0 is started for the process lifetime (once enabled in
+    // the devicetree) so event subscriptions (e.g. MediaKeys) can register even while the radio
+    // is off, and the radio can be toggled without tearing the device down.
+    if (!device_is_ready(dev)) {
+        LOG_I(TAG, "Starting BLE device for process lifetime");
+        if (device_start(dev) != ERROR_NONE) {
+            LOG_E(TAG, "Failed to start BLE device");
+            return;
+        }
+    }
+
     if (settings::shouldEnableOnBoot()) {
         start(dev);
     }
@@ -319,11 +330,8 @@ bool stop(Device* dev) {
         return false;
     }
 
-    if (device_stop(dev) != ERROR_NONE) {
-        LOG_E(TAG, "Failed to stop BT device");
-        return false;
-    }
-
+    // Backported upstream lifecycle: do NOT device_stop() here. ble0 stays started for the
+    // process lifetime so event subscriptions can remain registered across radio toggles.
     return true;
 }
 

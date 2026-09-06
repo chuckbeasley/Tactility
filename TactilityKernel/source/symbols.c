@@ -336,6 +336,9 @@ const struct ModuleSymbol KERNEL_SYMBOLS[] = {
     DEFINE_MODULE_SYMBOL(bluetooth_disconnect),
     DEFINE_MODULE_SYMBOL(bluetooth_add_event_callback),
     DEFINE_MODULE_SYMBOL(bluetooth_remove_event_callback),
+    DEFINE_MODULE_SYMBOL(bluetooth_event_subscribe),
+    DEFINE_MODULE_SYMBOL(bluetooth_event_unsubscribe),
+    DEFINE_MODULE_SYMBOL(bluetooth_event_poll),
     DEFINE_MODULE_SYMBOL(bluetooth_set_device_name),
     DEFINE_MODULE_SYMBOL(bluetooth_get_device_name),
     DEFINE_MODULE_SYMBOL(bluetooth_start_advertising),
@@ -360,6 +363,7 @@ const struct ModuleSymbol KERNEL_SYMBOLS[] = {
     DEFINE_MODULE_SYMBOL(BLUETOOTH_MIDI_TYPE),
     // drivers/bluetooth_hid_device
     DEFINE_MODULE_SYMBOL(bluetooth_hid_device_get_device),
+    DEFINE_MODULE_SYMBOL(bluetooth_hid_device_get),
     DEFINE_MODULE_SYMBOL(bluetooth_hid_device_start),
     DEFINE_MODULE_SYMBOL(bluetooth_hid_device_stop),
     DEFINE_MODULE_SYMBOL(bluetooth_hid_device_send_key),

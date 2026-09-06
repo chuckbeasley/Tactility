@@ -110,6 +110,19 @@ void ble_publish_event(struct Device* device, struct BtEvent event) {
     for (size_t i = 0; i < count; i++) {
         local[i].fn(ctx->device, local[i].ctx, event);
     }
+    // Also deliver to any event subscriptions (upstream-style FIFO queues + event group bits).
+    mutex_lock(&ctx->subscriptions_mutex);
+    for (BtEventSubscription* sub = ctx->subscriptions; sub != nullptr; sub = sub->internal.next) {
+        mutex_lock(&sub->internal.ring_mutex);
+        if (sub->internal.count < BT_EVENT_QUEUE_CAPACITY) {
+            uint8_t tail = (sub->internal.head + sub->internal.count) % BT_EVENT_QUEUE_CAPACITY;
+            sub->internal.queue[tail] = event;
+            sub->internal.count++;
+        }
+        mutex_unlock(&sub->internal.ring_mutex);
+        task_event_group_signal(sub->internal.event_group, sub->bit);
+    }
+    mutex_unlock(&ctx->subscriptions_mutex);
 }
 
 // ---- Advertising restart helper ----
@@ -1039,6 +1052,54 @@ static error_t api_remove_event_callback(struct Device* device, BtEventCallback 
     return ERROR_NOT_FOUND;
 }
 
+static error_t api_event_subscribe(struct Device* device, BtEventSubscription* sub, TaskEventGroup* event_group) {
+    BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
+    if (!ctx || !sub || !event_group) return ERROR_INVALID_ARGUMENT;
+
+    uint32_t bit;
+    error_t claim_result = task_event_group_claim_bit(event_group, &bit);
+    if (claim_result != ERROR_NONE) {
+        return claim_result;
+    }
+
+    mutex_lock(&ctx->subscriptions_mutex);
+    // Avoid a cyclic subscription list that would loop forever.
+    for (BtEventSubscription* existing = ctx->subscriptions; existing != nullptr; existing = existing->internal.next) {
+        if (existing == sub) {
+            mutex_unlock(&ctx->subscriptions_mutex);
+            task_event_group_release_bit(event_group, bit);
+            return ERROR_INVALID_STATE;
+        }
+    }
+    sub->internal.event_group = event_group;
+    sub->bit = bit;
+    sub->internal.next = ctx->subscriptions;
+    ctx->subscriptions = sub;
+    mutex_unlock(&ctx->subscriptions_mutex);
+    return ERROR_NONE;
+}
+
+static error_t api_event_unsubscribe(struct Device* device, BtEventSubscription* sub) {
+    BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
+    if (!ctx || !sub) return ERROR_INVALID_ARGUMENT;
+
+    error_t result = ERROR_NOT_FOUND;
+    mutex_lock(&ctx->subscriptions_mutex);
+    for (BtEventSubscription** link = &ctx->subscriptions; *link != nullptr; link = &(*link)->internal.next) {
+        if (*link == sub) {
+            *link = sub->internal.next;
+            result = ERROR_NONE;
+            break;
+        }
+    }
+    mutex_unlock(&ctx->subscriptions_mutex);
+
+    if (result == ERROR_NONE) {
+        task_event_group_release_bit(sub->internal.event_group, sub->bit);
+    }
+    return result;
+}
+
 static error_t api_set_device_name(struct Device* device, const char* name) {
     BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
     if (!ctx || !name) return ERROR_INVALID_ARGUMENT;
@@ -1161,6 +1222,8 @@ const BluetoothApi nimble_bluetooth_api = {
     .disconnect             = api_disconnect,
     .add_event_callback     = api_add_event_callback,
     .remove_event_callback  = api_remove_event_callback,
+    .event_subscribe        = api_event_subscribe,
+    .event_unsubscribe      = api_event_unsubscribe,
     .set_device_name        = api_set_device_name,
     .get_device_name        = api_get_device_name,
     .start_advertising      = api_start_advertising,
@@ -1274,6 +1337,9 @@ static error_t esp32_ble_start_device(struct Device* device) {
             vSemaphoreDelete(ctx->radio_mutex);
             ctx->radio_mutex = nullptr;
         }
+        if (ctx->subscriptions_mutex.handle != nullptr) {
+            mutex_destruct(&ctx->subscriptions_mutex);
+        }
         delete ctx;
     };
 
@@ -1289,6 +1355,8 @@ static error_t esp32_ble_start_device(struct Device* device) {
     ctx->scan_active.store(false);
     ctx->hid_host_active.store(false);
     ctx->callback_count = 0;
+    ctx->subscriptions = nullptr;
+    mutex_construct(&ctx->subscriptions_mutex);
     ctx->spp_conn_handle.store(BLE_HS_CONN_HANDLE_NONE);
     ctx->spp_active.store(false);
     ctx->midi_conn_handle.store(BLE_HS_CONN_HANDLE_NONE);

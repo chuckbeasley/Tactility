@@ -58,6 +58,11 @@ struct BleCtx {
     BleCallbackEntry callbacks[BLE_MAX_CALLBACKS];
     size_t           callback_count;
 
+    // Event subscriptions (guarded by subscriptions_mutex); backported from upstream Tactility
+    // while the legacy callback list above is retained.
+    struct BtEventSubscription* subscriptions;
+    struct Mutex                subscriptions_mutex;
+
     // Connection handles + active flags (atomic — accessed from multiple tasks)
     std::atomic<uint16_t> spp_conn_handle;
     std::atomic<bool>     spp_active;
