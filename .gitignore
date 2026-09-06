@@ -3,6 +3,7 @@
 
 build*/
 !.github/actions/build*/
+!Buildscripts/
 cmake*/
 CMakeCache.txt
 *.cbp
