@@ -125,7 +125,7 @@ static error_t stop(Device* device) {
 
 // endregion
 
-extern Module kernel_module;
+extern Module root_module;
 
 Driver gpio_backlight_driver = {
     .name = "gpio_backlight",
@@ -134,7 +134,7 @@ Driver gpio_backlight_driver = {
     .stop_device = stop,
     .api = &GPIO_BACKLIGHT_API,
     .device_type = &BACKLIGHT_TYPE,
-    .owner = &kernel_module,
+    .owner = &root_module,
     .internal = nullptr
 };
 
