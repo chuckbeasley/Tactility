@@ -16,6 +16,10 @@ bool HttpServer::startInternal() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = stackSize;
     config.server_port = port;
+    // Each HttpServer instance needs its own control socket port; HTTPD_DEFAULT_CONFIG()
+    // hardcodes ctrl_port=32768, so a second server (e.g. Web Server on 80 alongside the
+    // development service on 6666) would fail to bind its control socket.
+    config.ctrl_port = (uint16_t)(port + 1);
     config.uri_match_fn = matchUri;
     config.max_uri_handlers = handlers.size() + INTERNAL_URI_HANDLER_COUNT;
     // HTTPD_DEFAULT_CONFIG() sets max_open_sockets to 7, which exceeds what
