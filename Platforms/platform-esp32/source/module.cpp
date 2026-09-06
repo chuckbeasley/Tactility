@@ -86,6 +86,8 @@ extern "C" {
     long long __moddi3(long long a, long long b);
     unsigned long long __udivdi3(unsigned long long a, unsigned long long b);
     unsigned long long __umoddi3(unsigned long long a, unsigned long long b);
+    // GCC integer/bitwise helpers (compiler-rt)
+    int __clzsi2(unsigned int x);
 #else
     extern double __adddf3(double a, double b);
     extern double __subdf3(double a, double b);
@@ -284,6 +286,7 @@ static const ModuleSymbol platform_esp32_symbols[] = {
     DEFINE_MODULE_SYMBOL(__moddi3),
     DEFINE_MODULE_SYMBOL(__udivdi3),
     DEFINE_MODULE_SYMBOL(__umoddi3),
+    DEFINE_MODULE_SYMBOL(__clzsi2),
 #else
     DEFINE_MODULE_SYMBOL(__adddf3),
     DEFINE_MODULE_SYMBOL(__subdf3),
