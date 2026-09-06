@@ -32,3 +32,6 @@ sdkconfig.board.*.dev
 .ai/mcp
 
 __pycache__
+
+# Device screenshot captures
+/screenshots/

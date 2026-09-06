@@ -32,8 +32,10 @@ constexpr size_t APP_INSTANCE_ID_THREAD_SLOT_INDEX = 1;
 // Matches TactilityKernel's Thread wrapper's THREAD_PRIORITY_NORMAL.
 constexpr UBaseType_t APP_TASK_PRIORITY = 4;
 
-// Used when an app's manifest doesn't request a specific stack depth (0). 8192 bytes' worth.
-constexpr size_t APP_DEFAULT_STACK_DEPTH = 8192 / sizeof(StackType_t);
+// Used when an app's manifest doesn't request a specific stack depth (0). 32768 bytes' worth.
+// Raised from 8192 for extra headroom; some ELF-loaded apps still overflow regardless of
+// stack size (unbounded recursion after migration), so this is a best-effort improvement.
+constexpr size_t APP_DEFAULT_STACK_DEPTH = 32768 / sizeof(StackType_t);
 
 // Task control blocks must stay in internal RAM; only the stack itself may live in external memory.
 constexpr MemoryPolicy APP_TASK_TCB_POLICY = { MEMORY_CAPABILITY_INTERNAL, 0, 0 };
@@ -330,6 +332,13 @@ error_t app_scheduler_start(AppInstanceId app_instance_id, AppLocation location,
     if (stack_buffer == nullptr) {
         MemoryPolicy internal_policy = { .required = MEMORY_CAPABILITY_INTERNAL, .desired = 0, .alignment = 0 };
         stack_buffer = static_cast<StackType_t*>(memory_alloc_with_policy(effective_stack_depth * sizeof(StackType_t), &internal_policy));
+    }
+    if (stack_buffer == nullptr) {
+        // A larger default stack (or internal-RAM pressure) can't always fit in internal RAM.
+        // The stack itself may live in external PSRAM (only the TCB must stay internal - see
+        // APP_TASK_TCB_POLICY), so fall back to it rather than failing the app launch.
+        MemoryPolicy external_policy = { .required = MEMORY_CAPABILITY_EXTERNAL, .desired = 0, .alignment = 0 };
+        stack_buffer = static_cast<StackType_t*>(memory_alloc_with_policy(effective_stack_depth * sizeof(StackType_t), &external_policy));
     }
     if (stack_buffer == nullptr) {
         LOG_E(TAG, "[instance %lu] Failed to allocate app stack", app_instance_id);
