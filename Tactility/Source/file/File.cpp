@@ -187,24 +187,15 @@ bool writeString(const std::string& filepath, const std::string& content) {
 }
 
 static bool findOrCreateDirectoryInternal(std::string path, mode_t mode) {
+    // Check stat first: mkdir() on a mounted filesystem root returns EINVAL (not EEXIST),
+    // so mkdir-first logic reports a spurious failure for paths like /data on ESP32 and
+    // makes every directory under it uncreatable.
     struct stat dir_stat;
-    if (mkdir(path.c_str(), mode) == 0) {
-        return true;
+    if (stat(path.c_str(), &dir_stat) == 0) {
+        return S_ISDIR(dir_stat.st_mode);
     }
 
-    if (errno != EEXIST) {
-        return false;
-    }
-
-    if (stat(path.c_str(), &dir_stat) != 0) {
-        return false;
-    }
-
-    if (!S_ISDIR(dir_stat.st_mode)) {
-        return false;
-    }
-
-    return true;
+    return mkdir(path.c_str(), mode) == 0;
 }
 
 std::string getLastPathSegment(const std::string& path) {
