@@ -4,6 +4,11 @@ include("${CMAKE_CURRENT_LIST_DIR}/../Buildscripts/module.cmake")
 
 get_filename_component(PROJECT_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 
+# Opt-in at build time (idf.py build -DTACTILITY_SYNC_APPS=ON) to populate
+# Data/data/tactility/app from the TactilityApps repo before the data image is
+# generated, so the flashed data.bin carries pre-installed apps.
+option(TACTILITY_SYNC_APPS "Populate Data/data from TactilityApps before building data.bin" OFF)
+
 file(GLOB_RECURSE SOURCE_FILES Source/*.c*)
 
 # Get the project and device id
@@ -174,6 +179,14 @@ if (DEFINED ENV{ESP_IDF_VERSION})
         # Read-write (skipped when user data lives on the SD card instead of internal flash)
         if (NOT CONFIG_TT_USER_DATA_LOCATION_SD)
             fatfs_create_spiflash_image(data "${CMAKE_CURRENT_SOURCE_DIR}/../Data/data" FLASH_IN_PROJECT PRESERVE_TIME)
+            if (TACTILITY_SYNC_APPS)
+                idf_build_get_property(python PYTHON)
+                add_custom_target(sync_apps
+                    COMMAND "${python}" "${PROJECT_ROOT}/Buildscripts/sync-apps.py" --platform "${IDF_TARGET}"
+                    COMMENT "Syncing pre-installed apps from TactilityApps into Data/data"
+                    VERBATIM)
+                add_dependencies(fatfs_data_bin sync_apps)
+            endif ()
         endif ()
     endif ()
 else ()
