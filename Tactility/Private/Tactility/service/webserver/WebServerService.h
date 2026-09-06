@@ -76,6 +76,8 @@ private:
     static esp_err_t handleApiAppsInstall(httpd_req_t* request);
     static esp_err_t handleApiWifi(httpd_req_t* request);
     static esp_err_t handleApiScreenshot(httpd_req_t* request);
+    static esp_err_t handleApiVideoStart(httpd_req_t* request);
+    static esp_err_t handleApiVideoStop(httpd_req_t* request);
 
     // Dynamic asset serving
     static esp_err_t handleAssets(httpd_req_t* request);

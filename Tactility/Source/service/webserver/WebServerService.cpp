@@ -9,6 +9,7 @@
 #include <Tactility/file/File.h>
 #include <Tactility/lvgl/Statusbar.h>
 #include <Tactility/Mutex.h>
+#include <Tactility/video/VideoRecorder.h>
 
 #include <Tactility/DeprecatedPaths.h>
 #include <Tactility/StringUtils.h>
@@ -37,6 +38,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <esp_chip_info.h>
 #include <esp_flash.h>
@@ -1057,6 +1059,12 @@ esp_err_t WebServerService::handleApiPost(httpd_req_t* request) {
     if (strncmp(uri, "/api/apps/uninstall", 19) == 0) {
         return handleApiAppsUninstall(request);
     }
+    if (strncmp(uri, "/api/video/start", 15) == 0) {
+        return handleApiVideoStart(request);
+    }
+    if (strncmp(uri, "/api/video/stop", 15) == 0) {
+        return handleApiVideoStop(request);
+    }
 
     LOG_W(TAG, "POST %s - not found in api dispatcher", uri);
     httpd_resp_send_err(request, HTTPD_404_NOT_FOUND, "not found");
@@ -1534,6 +1542,56 @@ esp_err_t WebServerService::handleApiScreenshot(httpd_req_t* request) {
     httpd_resp_send_err(request, HTTPD_501_METHOD_NOT_IMPLEMENTED, "screenshot feature not enabled");
     return ESP_FAIL;
 #endif
+}
+
+// POST /api/video/start?fps=N - Start recording the active screen
+esp_err_t WebServerService::handleApiVideoStart(httpd_req_t* request) {
+    LOG_I(TAG, "POST /api/video/start");
+
+    uint32_t fps = 5;
+    std::string fps_param;
+    if (getQueryParam(request, "fps", fps_param) && !fps_param.empty()) {
+        fps = static_cast<uint32_t>(std::atoi(fps_param.c_str()));
+        if (fps == 0 || fps > 30) {
+            fps = 5;
+        }
+    }
+
+    // Default to uncompressed RGB so Windows Media Player can decode it. 'mjpeg' opt-in for small files.
+    uint32_t codec = TT_VIDEO_CODEC_RGB;
+    std::string codec_param;
+    if (getQueryParam(request, "codec", codec_param) && !codec_param.empty()) {
+        if (codec_param == "mjpeg") {
+            codec = TT_VIDEO_CODEC_MJPEG;
+        }
+    }
+
+    if (tt_video_start(fps, codec)) {
+        LOG_I(TAG, "video recording started (%u fps, codec=%u)", fps, codec);
+        httpd_resp_sendstr(request, "ok");
+        return ESP_OK;
+    }
+
+    httpd_resp_send_err(request, HTTPD_400_BAD_REQUEST, "already recording");
+    return ESP_FAIL;
+}
+
+// POST /api/video/stop - Stop recording and return the Motion-JPEG AVI
+esp_err_t WebServerService::handleApiVideoStop(httpd_req_t* request) {
+    LOG_I(TAG, "POST /api/video/stop");
+
+    std::vector<uint8_t> avi;
+    uint32_t frames = 0;
+    if (!tt_video_stop(&avi, &frames) || avi.empty()) {
+        httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "video not available");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(request, "video/x-msvideo"); // .avi
+    httpd_resp_send_chunk(request, reinterpret_cast<const char*>(avi.data()), avi.size());
+    httpd_resp_send_chunk(request, nullptr, 0);
+    LOG_I(TAG, "[200] /api/video/stop %u frames (%u bytes)", frames, static_cast<unsigned>(avi.size()));
+    return ESP_OK;
 }
 
 esp_err_t WebServerService::handleFsTree(httpd_req_t* request) {

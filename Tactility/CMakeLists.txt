@@ -44,6 +44,7 @@ list(APPEND REQUIRES_LIST
     # Libraries/*
     lv_screenshot
     minitar
+    espressif__esp_new_jpeg
 )
 
 # Check if device has Bluetooth enabled
