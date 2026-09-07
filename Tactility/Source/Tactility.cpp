@@ -186,6 +186,7 @@ namespace app {
     namespace btmanage { extern const ::AppManifest manifest; }
     namespace btpeersettings { extern const ::AppManifest manifest; }
     namespace blespam { extern const ::AppManifest manifest; }
+    namespace bletoolbox { extern const ::AppManifest manifest; }
     namespace wifiapsettings { extern const ::AppManifest manifest; }
     namespace wificonnect { extern const ::AppManifest manifest; }
     namespace wifimanage { extern const ::AppManifest manifest; }
@@ -299,6 +300,7 @@ static void registerInternalApps() {
     app_manager_add(&app::btmanage::manifest);
     app_manager_add(&app::btpeersettings::manifest);
     app_manager_add(&app::blespam::manifest);
+    app_manager_add(&app::bletoolbox::manifest);
 #endif
 }
 

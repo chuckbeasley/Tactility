@@ -55,6 +55,14 @@ int ble_gap_disc_event_handler(struct ble_gap_event* event, void* arg) {
                     memcpy(record.name, fields.name, copy_len);
                     record.name[copy_len] = '\0';
                 }
+                // Capture manufacturer-specific data (company ID + payload) so consumers such as
+                // the BLE Toolbox AirTag monitor can classify Apple 0x004C devices by their
+                // 0x12 offline-finding ("Nearby Info") advertisement type.
+                if (fields.mfg_data != nullptr && fields.mfg_data_len > 0) {
+                    size_t mlen = std::min<size_t>(fields.mfg_data_len, sizeof(record.manuf_data));
+                    memcpy(record.manuf_data, fields.mfg_data, mlen);
+                    record.manuf_len = static_cast<uint8_t>(mlen);
+                }
             }
 
             {

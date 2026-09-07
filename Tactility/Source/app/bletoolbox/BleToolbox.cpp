@@ -1,0 +1,699 @@
+#include <sdkconfig.h>
+
+#include <Tactility/Tactility.h>
+#include <Tactility/Timer.h>
+#include <Tactility/bluetooth/Bluetooth.h>
+
+#include <app/event.h>
+#include <app/manager.h>
+#include <app/start.h>
+#include <app/manifest.h>
+#include <app/scheduler.h>
+
+#include <lvgl_window_manager/window_manager.h>
+
+#include <lvgl/lvgl.h>
+#include <lvgl/widgets/toolbar.h>
+
+#include <tactility/concurrent/task_event_group.h>
+#include <tactility/device.h>
+#include <tactility/drivers/bluetooth.h>
+#include <tactility/log.h>
+#include <tactility/time.h>
+
+#include <array>
+#include <cstdio>
+#include <cstring>
+#include <format>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace tt::app::bletoolbox {
+
+constexpr auto* TAG = "BleToolbox";
+
+extern const ::AppManifest manifest;
+
+namespace {
+
+enum class Screen { Main, Scan, Spam, Airtag };
+
+// AirTag / Apple "Find My" device advertisement signature (from the offline-finding protocol,
+// see "Who Can Find My Devices?", PETS 2021): manufacturer data with Apple company ID 0x004C,
+// then type 0x12 (Nearby Info / offline finding) and data length 0x19 (25).
+constexpr uint8_t APPLE_COMPANY_LO = 0x4C;
+constexpr uint8_t APPLE_COMPANY_HI = 0x00;
+constexpr uint8_t AIRTAG_OF_TYPE = 0x12;
+
+constexpr uint32_t POLL_INTERVAL_MS = 300;
+constexpr uint32_t SPAM_INTERVAL_MS = 200;
+constexpr size_t MAX_SCAN_RESULTS = 64;
+
+// One BLE spam advertisement payload (full AD structure bytes), verbatim to ble_gap_adv_set_data().
+struct SpamPayload {
+    const char* label;
+    const uint8_t* data;
+    size_t length;
+};
+
+// ---- Spam payloads (AppleJuice / Momentum ble_spam data) ----
+
+// AirTag: offline-finding manufacturer record (company 0x004C, type 0x12, status + key + hint).
+static const uint8_t kAirtag[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x12, 0x19, 0x01,
+    // 22-byte public key (zeros) + key bits + hint
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00,
+    0x00, 0x00,
+};
+
+static const uint8_t kAirpods[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x02, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
+    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t kAirpodsPro[] = {
+    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0e, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
+    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t kAppleTvPair[] = {
+    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc0, 0x06, 0x60, 0x4c,
+    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t kAppleWatch[] = {
+    0x0a, 0xff, 0x4c, 0x00, 0x0f, 0x05, 0xc0, 0x05, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t kSetupNewIphone[] = {
+    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc0, 0x09, 0x60, 0x4c,
+    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t kHomePodSetup[] = {
+    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc0, 0x0b, 0x60, 0x4c,
+    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t kPixelBuds[] = {
+    0x03, 0x03, 0x2c, 0xfe, 0x06, 0x16, 0x2c, 0xfe, 0x92, 0xbb, 0xbd, 0x02, 0x0a, 0x00,
+};
+
+static const uint8_t kPixelBudsPro[] = {
+    0x03, 0x03, 0x2c, 0xfe, 0x06, 0x16, 0x2c, 0xfe, 0x9a, 0xdb, 0x11, 0x02, 0x0a, 0x00,
+};
+
+static const uint8_t kSwiftPairCore[] = {
+    0x06, 0xff, 0x06, 0x00, 0x03, 0x00, 0x80,
+};
+
+static const uint8_t kGalaxyWatch[] = {
+    0x0e, 0xff, 0x75, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01, 0xff, 0x00, 0x00, 0x43, 0x1a,
+};
+
+const SpamPayload kSpamPayloads[] = {
+    { "AirTag",          kAirtag,         sizeof(kAirtag)         },
+    { "AirPods",         kAirpods,        sizeof(kAirpods)        },
+    { "AirPods Pro",     kAirpodsPro,     sizeof(kAirpodsPro)     },
+    { "Apple TV Pair",   kAppleTvPair,    sizeof(kAppleTvPair)    },
+    { "Apple Watch",     kAppleWatch,     sizeof(kAppleWatch)     },
+    { "iPhone Setup",    kSetupNewIphone, sizeof(kSetupNewIphone) },
+    { "HomePod Setup",   kHomePodSetup,   sizeof(kHomePodSetup)   },
+    { "Pixel Buds",      kPixelBuds,      sizeof(kPixelBuds)      },
+    { "Pixel Buds Pro",  kPixelBudsPro,   sizeof(kPixelBudsPro)   },
+    { "Swift Pair",      kSwiftPairCore,  sizeof(kSwiftPairCore)  },
+    { "Galaxy Watch",    kGalaxyWatch,    sizeof(kGalaxyWatch)    },
+};
+constexpr size_t kSpamPayloadCount = sizeof(kSpamPayloads) / sizeof(kSpamPayloads[0]);
+
+// A device discovered during scan/monitor. `manuf` carries the advertisement manufacturer bytes.
+struct Peer {
+    std::array<uint8_t, 6> addr;
+    char name[BT_NAME_MAX + 1];
+    int8_t rssi;
+    uint8_t addr_type;
+    uint8_t manuf[24];
+    uint8_t manuf_len;
+    uint32_t seenCount;
+};
+
+struct Context {
+    uint32_t appInstanceId = 0;
+    Screen screen = Screen::Main;
+
+    Device* dev = nullptr;
+    BtEventSubscription btSub {};
+
+    // Scan (all devices) + AirTag monitor share the same scan subscription.
+    bool scanRunning = false;
+    bool airtagRunning = false;
+    bool spamRunning = false;
+    size_t currentPayload = 0;
+    bool randomizeAddress = true;
+
+    std::vector<Peer> scanPeers;
+    std::vector<Peer> airtagPeers;
+    uint32_t scanCount = 0;
+
+    std::unique_ptr<Timer> pollTimer;
+    std::unique_ptr<Timer> spamTimer;
+
+    // UI widgets.
+    lv_obj_t* body = nullptr;
+    lv_obj_t* statusLabel = nullptr;
+    lv_obj_t* countLabel = nullptr;
+    lv_obj_t* list = nullptr;
+    lv_obj_t* startButtonLabel = nullptr;
+    lv_obj_t* spamLabel = nullptr;
+
+    bool uiDirty = false;
+    bool listDirty = false;
+};
+
+// ---- Helpers ----
+
+static void formatAddr(const uint8_t addr[6], char* out, size_t outLen) {
+    std::snprintf(out, outLen, "%02x:%02x:%02x:%02x:%02x:%02x",
+        addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
+}
+
+// Apple offline-finding ("Nearby Info", 0x12) devices — i.e. AirTag / Find My trackers.
+static bool isOfflineFinding(const uint8_t* manuf, uint8_t manufLen) {
+    return manufLen >= 4 &&
+           manuf[0] == APPLE_COMPANY_LO && manuf[1] == APPLE_COMPANY_HI &&
+           manuf[2] == AIRTAG_OF_TYPE;
+}
+
+static void ensureBluetoothOn(Device* dev) {
+    if (!bluetooth::isRadioOnOrPending(dev)) {
+        LOG_I(TAG, "Enabling Bluetooth radio");
+        bluetooth::start(dev);
+    }
+}
+
+// ---- Event-driven list update (called from the app task, which owns LVGL) ----
+
+static void updatePeers(Peer* peer, std::vector<Peer>& peers) {
+    for (auto& existing : peers) {
+        if (existing.addr == peer->addr) {
+            existing.rssi = peer->rssi;
+            existing.seenCount++;
+            if (peer->name[0] != '\0') {
+                std::strncpy(existing.name, peer->name, BT_NAME_MAX);
+                existing.name[BT_NAME_MAX] = '\0';
+            }
+            return;
+        }
+    }
+    if (peers.size() < MAX_SCAN_RESULTS) {
+        peers.push_back(*peer);
+    }
+}
+
+static std::string peerLabel(const Peer& peer) {
+    char addr[18];
+    formatAddr(peer.addr.data(), addr, sizeof(addr));
+    std::string label;
+    if (isOfflineFinding(peer.manuf, peer.manuf_len)) {
+        label = "AirTag ";
+    }
+    if (peer.name[0] != '\0') {
+        label += peer.name;
+        label += " ";
+        label += addr;
+    } else {
+        label += addr;
+    }
+    label += "  ";
+    label += std::to_string(peer.rssi);
+    label += "dBm";
+    return label;
+}
+
+static void rebuildList(Context* ctx) {
+    if (ctx->list == nullptr) return;
+    lv_obj_clean(ctx->list);
+    const bool airtag = (ctx->screen == Screen::Airtag);
+    const auto& peers = airtag ? ctx->airtagPeers : ctx->scanPeers;
+    for (const auto& peer : peers) {
+        auto* btn = lv_list_add_button(ctx->list, nullptr, peerLabel(peer).c_str());
+        lv_obj_set_width(btn, LV_PCT(100));
+    }
+}
+
+// ---- BLE event handling ----
+
+static void onBtEvent(Context* ctx, const BtEvent& event) {
+    switch (event.type) {
+        case BT_EVENT_SCAN_STARTED:
+            ctx->scanCount = 0;
+            ctx->scanPeers.clear();
+            ctx->airtagPeers.clear();
+            ctx->listDirty = true;
+            break;
+
+        case BT_EVENT_PEER_FOUND: {
+            Peer peer {};
+            memcpy(peer.addr.data(), event.peer.addr, 6);
+            peer.addr_type = event.peer.addr_type;
+            peer.rssi = event.peer.rssi;
+            peer.manuf_len = event.peer.manuf_len;
+            if (peer.manuf_len > 0) memcpy(peer.manuf, event.peer.manuf_data, peer.manuf_len);
+            if (event.peer.name[0] != '\0') {
+                std::strncpy(peer.name, event.peer.name, BT_NAME_MAX);
+                peer.name[BT_NAME_MAX] = '\0';
+            }
+            peer.seenCount = 1;
+            if (ctx->airtagRunning || ctx->scanRunning) {
+                updatePeers(&peer, ctx->scanPeers);
+                ctx->scanCount = static_cast<uint32_t>(ctx->scanPeers.size());
+            }
+            if (ctx->airtagRunning && isOfflineFinding(peer.manuf, peer.manuf_len)) {
+                updatePeers(&peer, ctx->airtagPeers);
+            }
+            ctx->listDirty = true;
+            break;
+        }
+
+        case BT_EVENT_RADIO_STATE_CHANGED:
+            // Scan can only start once the radio is actually on. If a scan/monitor was requested
+            // while the radio was still turning on, kick it off now instead of firing a
+            // scan_start() too early (which the driver would drop).
+            if (event.radio_state == BT_RADIO_STATE_ON && (ctx->scanRunning || ctx->airtagRunning) &&
+                ctx->dev != nullptr && !bluetooth_is_scanning(ctx->dev)) {
+                bluetooth_scan_start(ctx->dev);
+            }
+            break;
+
+        case BT_EVENT_SCAN_FINISHED:
+            // For a continuous monitor, immediately restart the next scan cycle.
+            if (ctx->airtagRunning) {
+                Device* dev = ctx->dev;
+                if (dev != nullptr && !bluetooth_is_scanning(dev)) {
+                    bluetooth_scan_start(dev);
+                }
+            }
+            ctx->uiDirty = true;
+            break;
+
+        default:
+            break;
+    }
+    ctx->uiDirty = true;
+}
+
+// ---- Spam timer (runs on the FreeRTOS timer task; touches only BLE + atomic-ish state) ----
+
+static void onSpamTick(Context* ctx) {
+    if (!ctx->spamRunning) return;
+    if (bluetooth::getRadioState() != bluetooth::RadioState::On) return;
+    if (kSpamPayloadCount == 0) return;
+    ctx->currentPayload = (ctx->currentPayload + 1) % kSpamPayloadCount;
+    const SpamPayload& payload = kSpamPayloads[ctx->currentPayload];
+    bluetooth::startAdvertising(payload.data, payload.length, false, ctx->randomizeAddress);
+}
+
+// ---- UI screens ----
+
+static void showMainScreen(Context* ctx);
+static void showScanScreen(Context* ctx);
+static void showSpamScreen(Context* ctx);
+static void showAirtagScreen(Context* ctx);
+
+static void ShowScreen(Context* ctx, Screen screen) {
+    ctx->screen = screen;
+    if (ctx->body != nullptr) {
+        lv_obj_clean(ctx->body);
+    }
+    ctx->statusLabel = nullptr;
+    ctx->countLabel = nullptr;
+    ctx->list = nullptr;
+    ctx->startButtonLabel = nullptr;
+    ctx->spamLabel = nullptr;
+
+    switch (screen) {
+        case Screen::Main: showMainScreen(ctx); break;
+        case Screen::Scan: showScanScreen(ctx); break;
+        case Screen::Spam: showSpamScreen(ctx); break;
+        case Screen::Airtag: showAirtagScreen(ctx); break;
+    }
+    ctx->uiDirty = true;
+    ctx->listDirty = true;
+}
+
+static void stopAllActive(Context* ctx) {
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+    ctx->spamRunning = false;
+    if (ctx->spamTimer != nullptr) ctx->spamTimer->stop();
+    bluetooth::stopAdvertising();
+    ctx->scanRunning = false;
+    ctx->airtagRunning = false;
+    if (ctx->dev != nullptr && bluetooth_is_scanning(ctx->dev)) {
+        bluetooth_scan_stop(ctx->dev);
+    }
+#endif
+}
+
+static void onBackPressed(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    if (ctx->screen == Screen::Main) {
+        stopAllActive(ctx);
+        app_event_emit_close(ctx->appInstanceId);
+    } else {
+        stopAllActive(ctx);
+        ShowScreen(ctx, Screen::Main);
+    }
+}
+
+static void addMenuButton(Context* ctx, const char* text, void (*cb)(lv_event_t*)) {
+    auto* btn = lv_button_create(ctx->body);
+    lv_obj_set_width(btn, LV_PCT(100));
+    lv_obj_set_height(btn, 44);
+    auto* label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    lv_obj_center(label);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_SHORT_CLICKED, ctx);
+}
+
+static void onGoScan(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Scan); }
+static void onGoSpam(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Spam); }
+static void onGoAirtag(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Airtag); }
+
+// ---- Main ----
+
+static void showMainScreen(Context* ctx) {
+    addMenuButton(ctx, "BLE Scan", onGoScan);
+    addMenuButton(ctx, "BLE Spam", onGoSpam);
+    addMenuButton(ctx, "AirTag Monitor", onGoAirtag);
+}
+
+// ---- Scan ----
+
+static void onStartScan(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+    if (ctx->scanRunning || ctx->airtagRunning) {
+        ctx->scanRunning = false;
+        ctx->airtagRunning = false;
+        Device* dev = ctx->dev;
+        if (dev != nullptr && bluetooth_is_scanning(dev)) {
+            bluetooth_scan_stop(dev);
+        }
+        ctx->uiDirty = true;
+        ctx->listDirty = true;
+        return;
+    }
+    if (ctx->dev != nullptr && !bluetooth_is_scanning(ctx->dev)) {
+        ensureBluetoothOn(ctx->dev);
+        ctx->scanRunning = true;
+        ctx->uiDirty = true;
+        ctx->listDirty = true;
+        if (bluetooth::getRadioState() == bluetooth::RadioState::On) {
+            bluetooth_scan_start(ctx->dev);
+        }
+    }
+#endif
+}
+
+static void showScanScreen(Context* ctx) {
+    auto* label = lv_label_create(ctx->body);
+    lv_label_set_text(label, "Nearby BLE devices.");
+    ctx->statusLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->statusLabel, "Stopped");
+
+    ctx->list = lv_list_create(ctx->body);
+    lv_obj_set_width(ctx->list, LV_PCT(100));
+    lv_obj_set_flex_grow(ctx->list, 1);
+    lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
+    lv_obj_set_style_pad_all(ctx->list, 0, LV_STATE_DEFAULT);
+
+    auto* button = lv_button_create(ctx->body);
+    lv_obj_set_width(button, LV_PCT(100));
+    ctx->startButtonLabel = lv_label_create(button);
+    lv_label_set_text(ctx->startButtonLabel, "Start Scan");
+    lv_obj_center(ctx->startButtonLabel);
+    lv_obj_add_event_cb(button, onStartScan, LV_EVENT_SHORT_CLICKED, ctx);
+
+    ctx->countLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->countLabel, "0 devices");
+}
+
+// ---- Spam ----
+
+static void onSpamStartStop(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+    ctx->spamRunning = !ctx->spamRunning;
+    if (ctx->spamRunning) {
+        ensureBluetoothOn(ctx->dev);
+        ctx->spamTimer->start();
+    } else {
+        ctx->spamTimer->stop();
+        bluetooth::stopAdvertising();
+    }
+#endif
+    ctx->uiDirty = true;
+}
+
+static void onRandomizeSwitch(lv_event_t* event) {
+    auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    ctx->randomizeAddress = lv_obj_has_state(sw, LV_STATE_CHECKED);
+}
+
+static void showSpamScreen(Context* ctx) {
+    auto* label = lv_label_create(ctx->body);
+    lv_label_set_text(label, "Spoofs BLE advertisements.");
+    ctx->spamLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->spamLabel, kSpamPayloads[ctx->currentPayload].label);
+
+    // Randomize address toggle.
+    auto* btn = lv_button_create(ctx->body);
+    lv_obj_set_width(btn, LV_PCT(100));
+    lv_obj_set_height(btn, 40);
+    auto* btnLabel = lv_label_create(btn);
+    lv_label_set_text(btnLabel, "Randomize address");
+    lv_obj_center(btnLabel);
+    auto* sw = lv_switch_create(btn);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -8, 0);
+    if (ctx->randomizeAddress) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(sw, onRandomizeSwitch, LV_EVENT_VALUE_CHANGED, ctx);
+
+    auto* button = lv_button_create(ctx->body);
+    lv_obj_set_width(button, LV_PCT(100));
+    ctx->startButtonLabel = lv_label_create(button);
+    lv_label_set_text(ctx->startButtonLabel, "Start Spam");
+    lv_obj_center(ctx->startButtonLabel);
+    lv_obj_add_event_cb(button, onSpamStartStop, LV_EVENT_SHORT_CLICKED, ctx);
+
+    ctx->statusLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->statusLabel, "Stopped");
+}
+
+// ---- AirTag monitor ----
+
+static void onStartAirtag(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+    if (ctx->airtagRunning) {
+        ctx->airtagRunning = false;
+        Device* dev = ctx->dev;
+        if (dev != nullptr && bluetooth_is_scanning(dev)) {
+            bluetooth_scan_stop(dev);
+        }
+        ctx->uiDirty = true;
+        ctx->listDirty = true;
+        return;
+    }
+    if (ctx->dev != nullptr) {
+        ensureBluetoothOn(ctx->dev);
+        ctx->airtagRunning = true;
+        ctx->uiDirty = true;
+        ctx->listDirty = true;
+        if (bluetooth::getRadioState() == bluetooth::RadioState::On && !bluetooth_is_scanning(ctx->dev)) {
+            bluetooth_scan_start(ctx->dev);
+        }
+    }
+#endif
+}
+
+static void showAirtagScreen(Context* ctx) {
+    auto* label = lv_label_create(ctx->body);
+    lv_label_set_text(label, "Detects Apple Find My trackers.");
+    ctx->statusLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->statusLabel, "Stopped");
+
+    ctx->list = lv_list_create(ctx->body);
+    lv_obj_set_width(ctx->list, LV_PCT(100));
+    lv_obj_set_flex_grow(ctx->list, 1);
+    lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
+    lv_obj_set_style_pad_all(ctx->list, 0, LV_STATE_DEFAULT);
+
+    auto* button = lv_button_create(ctx->body);
+    lv_obj_set_width(button, LV_PCT(100));
+    ctx->startButtonLabel = lv_label_create(button);
+    lv_label_set_text(ctx->startButtonLabel, "Start Monitor");
+    lv_obj_center(ctx->startButtonLabel);
+    lv_obj_add_event_cb(button, onStartAirtag, LV_EVENT_SHORT_CLICKED, ctx);
+
+    ctx->countLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->countLabel, "0 AirTag(s)");
+}
+
+// ---- Polling (timer task) ----
+
+static void onPollTick(Context* ctx) {
+    if (ctx->statusLabel != nullptr) {
+        const char* text = ctx->spamRunning ? "Spamming"
+            : (ctx->airtagRunning ? "Monitoring" : (ctx->scanRunning ? "Scanning" : "Stopped"));
+        lv_label_set_text(ctx->statusLabel, text);
+    }
+    if (ctx->startButtonLabel != nullptr) {
+        const char* text = ctx->scanRunning ? "Stop Scan" : "Start Scan";
+        if (ctx->screen == Screen::Spam) {
+            text = ctx->spamRunning ? "Stop Spam" : "Start Spam";
+        } else if (ctx->screen == Screen::Airtag) {
+            text = ctx->airtagRunning ? "Stop Monitor" : "Start Monitor";
+        }
+        lv_label_set_text(ctx->startButtonLabel, text);
+    }
+    if (ctx->screen == Screen::Airtag && ctx->countLabel != nullptr) {
+        lv_label_set_text(ctx->countLabel, std::format("{} AirTag(s)", (unsigned)ctx->airtagPeers.size()).c_str());
+    }
+    if (ctx->screen == Screen::Scan && ctx->countLabel != nullptr) {
+        lv_label_set_text(ctx->countLabel, std::format("{} devices", (unsigned)ctx->scanPeers.size()).c_str());
+    }
+    if (ctx->screen == Screen::Spam && ctx->spamLabel != nullptr) {
+        lv_label_set_text(ctx->spamLabel, kSpamPayloads[ctx->currentPayload].label);
+    }
+}
+
+// ---- App entry ----
+
+static void createWidgets(lv_obj_t* parent, void* userData) {
+    auto* ctx = static_cast<Context*>(userData);
+    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
+
+    auto* toolbar = lvgl_toolbar_create(parent, "BLE Toolbox");
+    lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
+
+    ctx->body = lv_obj_create(parent);
+    lv_obj_set_width(ctx->body, LV_PCT(100));
+    lv_obj_set_flex_grow(ctx->body, 1);
+    lv_obj_set_flex_flow(ctx->body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(ctx->body, 8, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_column(ctx->body, 6, LV_STATE_DEFAULT);
+    lv_obj_set_scroll_dir(ctx->body, LV_DIR_VER);
+    lv_obj_scroll_to_y(ctx->body, 0, LV_ANIM_OFF);
+
+    showMainScreen(ctx);
+}
+
+int32_t appMain(int argc, char* argv[]) {
+    uint32_t appInstanceId = app_scheduler_current_app_id();
+    Context ctx;
+    ctx.appInstanceId = appInstanceId;
+
+    TaskEventGroup event_group;
+    task_event_group_construct(&event_group);
+    AppEventSubscription sub{};
+    app_event_subscribe(&sub, &event_group);
+
+    // Resolve the BLE device and subscribe to scan/radio events.
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+    Device* dev = nullptr;
+    if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
+        ctx.dev = dev;
+        if (bluetooth_event_subscribe(dev, &ctx.btSub, &event_group) == ERROR_NONE) {
+            LOG_I(TAG, "Subscribed to BLE events");
+        } else {
+            LOG_W(TAG, "Failed to subscribe to BLE events");
+        }
+    } else {
+        LOG_W(TAG, "No active BLE device");
+    }
+#endif
+
+    ctx.pollTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(POLL_INTERVAL_MS), [&ctx] {
+        onPollTick(&ctx);
+    });
+    ctx.spamTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(SPAM_INTERVAL_MS), [&ctx] {
+        onSpamTick(&ctx);
+    });
+    ctx.pollTimer->start();
+
+    WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
+
+    bool shouldClose = false;
+    while (!shouldClose) {
+        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
+
+        AppEvent event{};
+        while (app_event_poll(&sub, &event) == ERROR_NONE) {
+            if (event.type == APP_EVENT_CLOSE) {
+                shouldClose = true;
+                break;
+            }
+        }
+
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+        if (ctx.dev != nullptr) {
+            BtEvent bt_event{};
+            while (bluetooth_event_poll(&ctx.btSub, &bt_event) == ERROR_NONE) {
+                onBtEvent(&ctx, bt_event);
+            }
+        }
+#endif
+
+        // Rebuild the device list on the LVGL task after event-driven changes.
+        if (ctx.listDirty) {
+            ctx.listDirty = false;
+            rebuildList(&ctx);
+        }
+    }
+
+    stopAllActive(&ctx);
+    ctx.pollTimer->stop();
+    ctx.spamTimer->stop();
+
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+    if (ctx.dev != nullptr) {
+        bluetooth_event_unsubscribe(ctx.dev, &ctx.btSub);
+        if (bluetooth_is_scanning(ctx.dev)) {
+            bluetooth_scan_stop(ctx.dev);
+        }
+        device_put(ctx.dev);
+        ctx.dev = nullptr;
+    }
+#endif
+
+    window_manager_remove(window);
+    app_event_unsubscribe(&sub);
+    task_event_group_destruct(&event_group);
+    return 0;
+}
+
+} // namespace
+
+uint32_t start() {
+    uint32_t instanceId = 0;
+    app_start(manifest.id, 0, nullptr, &instanceId);
+    return instanceId;
+}
+
+extern const ::AppManifest manifest = {
+    .id = "BleToolbox",
+    .name = "BLE Toolbox",
+    .category = APP_CATEGORY_USER,
+    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
+    .flags = 0,
+    .stack = {}
+};
+
+} // namespace tt::app::bletoolbox

@@ -51,6 +51,14 @@ struct BtPeerRecord {
     int8_t rssi;
     bool paired;
     bool connected;
+
+    /** Manufacturer-specific data from the advertisement (includes the 2-byte company ID at
+     * manuf_data[0..1], little-endian). Copied from the advertising packet during scan; empty
+     * (manuf_len == 0) when the peer advertised no manufacturer data. Used e.g. to identify
+     * Apple AirTag / Find My trackers by their 0x004C company ID + 0x12 offline-finding type. */
+    uint8_t manuf_data[24];
+    /** Number of valid bytes in manuf_data (0 = none). */
+    uint8_t manuf_len;
 };
 
 // ---- Profile identifiers ----
