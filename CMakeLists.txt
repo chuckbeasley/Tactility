@@ -103,6 +103,28 @@ if (DEFINED ENV{ESP_IDF_VERSION})
     if(CONFIG_IDF_TARGET_ARCH_RISCV)
         idf_build_set_property(COMPILE_OPTIONS "-fno-omit-frame-pointer" APPEND)
     endif()
+
+    # ESP32-C5 deauth injection.
+    # The stock IDF v6.1 libnet80211.a rejects deauth frames ("unsupport frame
+    # type: 0c0"). patch_deauth_libnet.py applies the ESP32-C5 Deauther's
+    # single-byte fix. Run it automatically before linking so a bare `idf.py
+    # build` always produces a deauth-capable firmware. The script is idempotent
+    # (a no-op once the byte is already 0x0c), so this is safe on every build.
+    if(CONFIG_IDF_TARGET STREQUAL "esp32c5")
+        set(TT_DEAUTH_PATCH_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/Tactility/Source/app/wifitoolbox/patch_deauth_libnet.py")
+        if(EXISTS "${TT_DEAUTH_PATCH_SCRIPT}")
+            find_package(Python3 COMPONENTS Interpreter QUIET)
+            if(Python3_EXECUTABLE)
+                add_custom_target(tactility_deauth_patch
+                    COMMAND ${Python3_EXECUTABLE} "${TT_DEAUTH_PATCH_SCRIPT}"
+                    VERBATIM
+                    USES_TERMINAL
+                    COMMENT "Patching ESP32-C5 libnet80211.a for deauth injection"
+                )
+                add_dependencies(Tactility.elf tactility_deauth_patch)
+            endif()
+        endif()
+    endif()
 endif ()
 
 # Defined as regular project for PC and component for ESP

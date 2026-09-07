@@ -30,19 +30,43 @@
 | Deauth `0xC0` (clean patch, `en_sys_seq=true`) | `esp_err=0` (works) |
 | Beacon `0x80` (clean patch) | `esp_err=0` (works) |
 
-## How to apply the fix (one-time, per IDF install)
+## How the fix is applied
 
-The patch is applied to the machine-local ESP-IDF install (not the repo). Use the
-provided script, which backs up the stock lib and applies the clean one-byte
-change directly in `ieee80211_output.o`:
+The patch targets the machine-local ESP-IDF install (not the repo), because
+`libnet80211.a` is a precompiled binary shipped with IDF. Two layers make this
+automatic:
+
+### 1. Build-time automation (no manual step)
+
+The root `CMakeLists.txt` registers a `tactility_deauth_patch` custom target
+for `esp32c5` targets and makes `Tactility.elf` depend on it, so it runs **before
+the link** on every `idf.py build`. It invokes `patch_deauth_libnet.py`, which is
+idempotent (a no-op once the byte is already `0x0c`), so:
+
+- **Fresh IDF install** → the first build applies the byte change once, then links.
+- **Subsequent builds** → it prints `already patched` and links (fast).
+
+This means you just run `idf.py build` as usual; deauth-capable and
+beacon/probe-capable firmware comes out automatically.
+
+### 2. The patch script (`patch_deauth_libnet.py`)
+
+It backs up the stock lib to `libnet80211.a.orig` (once) and applies the clean
+one-byte change directly in `ieee80211_output.o`. It auto-locates the lib and the
+toolchain from `IDF_PATH`/`IDF_TARGET`/`IDF_TOOLS_PATH` (or PATH), so it works on
+any machine, not just this one:
 
 ```
-python patch_deauth_libnet.py [path-to-esp32c5/libnet80211.a]
+python patch_deauth_libnet.py                 # auto-locate from IDF env
+python patch_deauth_libnet.py --lib <path>    # explicit archive
+python patch_deauth_libnet.py --target esp32c5
 ```
 
-Default path: `C:/esp/v6.1/esp-idf/components/esp_wifi/lib/esp32c5/libnet80211.a`.
-Backup saved as `libnet80211.a.orig`. Rebuild the firmware after patching; expect
-`libnet80211.a` to be ~1.86 MB with the sanity check at `+0x128` showing
+Manual run (only needed if you build outside `idf.py`):
+```
+python patch_deauth_libnet.py
+```
+Expected result after patching: `libnet80211.a` sanity check at `+0x128` shows
 `li a3,192` (was `208`).
 
 ## Why this is needed
@@ -53,5 +77,9 @@ clean one-byte patch it transmits deauth **and** beacon/probe without crashing.
 The Wi-Fi Toolbox's Deauth (targeted + broadcast) feature and Beacon Spam /
 Probe Flood all run through `wifi_send_raw_frame → esp_wifi_80211_tx`.
 
-> Note: this is a machine-local IDF tweak — a fresh checkout won't carry it. To
-> make deauth work on a fresh build, re-run the patch before `idf.py build`.
+> Note: this is a machine-local IDF tweak, but the `CMakeLists.txt` hook already
+> re-applies it automatically via `patch_deauth_libnet.py` on every build, so a
+> fresh checkout/rebuild on the same IDF install carries deauth. You only need to
+> re-run `patch_deauth_libnet.py` manually if you build via a path that bypasses
+> this project's CMake (e.g., a different top-level `CMakeLists.txt`) or after an
+> IDF reinstall resets the archive.
