@@ -40,6 +40,11 @@
 			horizontal-resolution = <480>;
 			vertical-resolution = <320>;
 			swap-xy;
+			// This panel is wired BGR: LVGL renders RGB565, so without bgr-order the
+			// controller reads it with R and B swapped and the screen shows colors
+			// reversed (a blue primary renders as yellow-orange). bgr-order sets
+			// rgb_ele_order=BGR so the panel interprets the pixel channels correctly.
+			bgr-order;
 			pixel-clock-hz = <40000000>;
 			pin-dc = <&gpio0 0 GPIO_FLAG_NONE>;
 			pin-reset = <&gpio0 3 GPIO_FLAG_NONE>;
