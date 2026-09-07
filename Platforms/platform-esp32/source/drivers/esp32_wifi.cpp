@@ -68,6 +68,38 @@ struct Esp32WifiCtx {
 
 #define GET_CTX(device) (static_cast<Esp32WifiCtx*>(device_get_driver_data(device)))
 
+// Promiscuous-mode RX trampoline. ESP-IDF's esp_wifi_set_promiscuous_rx_cb() takes only a
+// function pointer (no user context), so a single file-scope channel carries the callback + context
+// that the app registered via api_set_promiscuous_callback(). There is exactly one WiFi device per
+// board, so a file-scope channel is unambiguous and keeps the RX path allocation-free.
+static WifiPromiscuousCallback g_promiscuousCallback = nullptr;
+static void* g_promiscuousContext = nullptr;
+
+// Called from ESP-IDF's Wi-Fi task. Must be short and non-blocking: copy nothing, just forward the
+// raw 802.11 frame (payload[0], sig_len in the rx_ctrl, FCS included) to the app's callback. The app
+// is responsible for any further filtering/copying.
+static void promiscuous_rx_cb(void* buffer, wifi_promiscuous_pkt_type_t type) {
+    if (g_promiscuousCallback == nullptr || buffer == nullptr) {
+        return;
+    }
+    auto* pkt = static_cast<wifi_promiscuous_pkt_t*>(buffer);
+
+    WifiPromiscuousPacketInfo info {};
+    info.rssi = static_cast<int8_t>(pkt->rx_ctrl.rssi);
+    info.channel = pkt->rx_ctrl.channel;
+    switch (type) {
+        case WIFI_PKT_MGMT: info.type = WIFI_PROMISCUOUS_PACKET_TYPE_MGMT; break;
+        case WIFI_PKT_CTRL: info.type = WIFI_PROMISCUOUS_PACKET_TYPE_CTRL; break;
+        case WIFI_PKT_DATA: info.type = WIFI_PROMISCUOUS_PACKET_TYPE_DATA; break;
+        default:           info.type = WIFI_PROMISCUOUS_PACKET_TYPE_MISC; break;
+    }
+
+    // sig_len is the reception MPDU length including the 4-byte 802.11 FCS; the payload buffer holds
+    // exactly that many bytes. Forwarding length=sig_len keeps the provider/consumer (e.g. PCAP
+    // writer with its radiotap "FCS at end" flag) consistent.
+    g_promiscuousCallback(g_promiscuousContext, pkt->payload, pkt->rx_ctrl.sig_len, info);
+}
+
 WifiAuthenticationType to_wifi_authentication_type(wifi_auth_mode_t mode) {
     switch (mode) {
         case WIFI_AUTH_OPEN: return WIFI_AUTHENTICATION_TYPE_OPEN;
@@ -504,6 +536,68 @@ error_t api_station_get_rssi(Device* device, int32_t* rssi) {
     return ERROR_NONE;
 }
 
+error_t api_set_promiscuous(Device* device, bool enable) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr) return ERROR_INVALID_STATE;
+
+    esp_err_t err = esp_wifi_set_promiscuous(enable);
+    if (err != ESP_OK) {
+        return esp_err_to_error(err);
+    }
+    if (enable) {
+        // Capture management + control + data + misc (not just MISC, the driver's default), so a
+        // monitor app sees beacons, deauth/assoc mgmt frames and EAPOL data frames. The app filters
+        // down to what it needs; dropping control frames here would hide e.g. the association sleep
+        // attack's ACK/RTS noise the app may want to observe.
+        wifi_promiscuous_filter_t filter { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
+        esp_wifi_set_promiscuous_filter(&filter);
+        esp_wifi_set_promiscuous_ctrl_filter(&filter);
+    }
+    return ERROR_NONE;
+}
+
+error_t api_get_promiscuous(Device* device, bool* enabled) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr || enabled == nullptr) return ERROR_INVALID_ARGUMENT;
+
+    esp_err_t err = esp_wifi_get_promiscuous(enabled);
+    return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
+}
+
+error_t api_set_promiscuous_callback(Device* device, WifiPromiscuousCallback callback, void* context) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr) return ERROR_INVALID_STATE;
+
+    // Route the caller's callback/context through the file-scope trampoline. Even when `callback`
+    // is null (unregister), keep the trampoline registered and let it no-op - avoiding any concern
+    // about whether esp_wifi accepts a null rx cb.
+    g_promiscuousCallback = callback;
+    g_promiscuousContext = context;
+
+    esp_err_t err = esp_wifi_set_promiscuous_rx_cb(promiscuous_rx_cb);
+    return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
+}
+
+error_t api_set_channel(Device* device, uint8_t channel) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr) return ERROR_INVALID_STATE;
+
+    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
+}
+
+error_t api_send_raw_frame(Device* device, const uint8_t* frame, size_t length) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr || frame == nullptr) return ERROR_INVALID_ARGUMENT;
+    if (length < 24 || length > 1500) return ERROR_INVALID_ARGUMENT;
+
+    // esp_wifi_80211_tx sends raw 802.11 frames (beacon/probe/deauth/action + non-QoS data). The
+    // en_sys_seq=true path is valid whether or not the STA is connected; it lets the driver assign
+    // its own sequence number instead of rejecting on a stale frame->seq mismatch.
+    esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame, static_cast<int>(length), true);
+    return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
+}
+
 error_t api_set_radio_on(Device* device) {
     auto* ctx = GET_CTX(device);
     if (ctx == nullptr) return ERROR_INVALID_STATE;
@@ -613,7 +707,12 @@ const WifiApi esp32_wifi_api = {
     .station_get_rssi = api_station_get_rssi,
     .event_subscribe = api_event_subscribe,
     .event_unsubscribe = api_event_unsubscribe,
-    .get_firmware_ops = api_get_firmware_ops
+    .get_firmware_ops = api_get_firmware_ops,
+    .set_promiscuous = api_set_promiscuous,
+    .get_promiscuous = api_get_promiscuous,
+    .set_promiscuous_callback = api_set_promiscuous_callback,
+    .set_channel = api_set_channel,
+    .send_raw_frame = api_send_raw_frame
 };
 
 error_t start_device(Device* device) {

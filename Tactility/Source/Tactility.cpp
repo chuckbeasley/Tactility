@@ -208,6 +208,7 @@ namespace app {
 #if defined(CONFIG_SOC_WIFI_SUPPORTED) || defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
     namespace chat { extern const ::AppManifest manifest; }
     namespace wifimonitor { extern const ::AppManifest manifest; }
+    namespace wifitoolbox { extern const ::AppManifest manifest; }
 #endif
 }
 
@@ -278,6 +279,7 @@ static void registerInternalApps() {
 #if defined(CONFIG_SOC_WIFI_SUPPORTED) || defined(CONFIG_SLAVE_SOC_WIFI_SUPPORTED)
     app_manager_add(&app::chat::manifest);
     app_manager_add(&app::wifimonitor::manifest);
+    app_manager_add(&app::wifitoolbox::manifest);
 #endif
 
     if (device_exists_of_type(&GROVE_TYPE)) {
