@@ -196,21 +196,30 @@ static void ensureBluetoothOn(Device* dev) {
 
 // ---- Event-driven list update (called from the app task, which owns LVGL) ----
 
-static void updatePeers(Peer* peer, std::vector<Peer>& peers) {
+// @return true if the peer list content changed (a new device was added, or a name/RSSI update
+// actually changed an existing entry). Callers only trigger a (LVGL-locked) list rebuild on real
+// changes, so a burst of same-device events doesn't hammer the widget tree.
+static bool updatePeers(Peer* peer, std::vector<Peer>& peers) {
     for (auto& existing : peers) {
         if (existing.addr == peer->addr) {
+            bool changed = existing.rssi != peer->rssi;
             existing.rssi = peer->rssi;
             existing.seenCount++;
             if (peer->name[0] != '\0') {
-                std::strncpy(existing.name, peer->name, BT_NAME_MAX);
-                existing.name[BT_NAME_MAX] = '\0';
+                if (std::strcmp(existing.name, peer->name) != 0) {
+                    std::strncpy(existing.name, peer->name, BT_NAME_MAX);
+                    existing.name[BT_NAME_MAX] = '\0';
+                    changed = true;
+                }
             }
-            return;
+            return changed;
         }
     }
     if (peers.size() < MAX_SCAN_RESULTS) {
         peers.push_back(*peer);
+        return true;
     }
+    return false;
 }
 
 static std::string peerLabel(const Peer& peer) {
@@ -267,14 +276,17 @@ static void onBtEvent(Context* ctx, const BtEvent& event) {
                 peer.name[BT_NAME_MAX] = '\0';
             }
             peer.seenCount = 1;
+            bool changed = false;
             if (ctx->airtagRunning || ctx->scanRunning) {
-                updatePeers(&peer, ctx->scanPeers);
+                if (updatePeers(&peer, ctx->scanPeers)) changed = true;
                 ctx->scanCount = static_cast<uint32_t>(ctx->scanPeers.size());
             }
             if (ctx->airtagRunning && isOfflineFinding(peer.manuf, peer.manuf_len)) {
-                updatePeers(&peer, ctx->airtagPeers);
+                if (updatePeers(&peer, ctx->airtagPeers)) changed = true;
             }
-            ctx->listDirty = true;
+            if (changed) {
+                ctx->listDirty = true;
+            }
             break;
         }
 
@@ -548,6 +560,10 @@ static void showAirtagScreen(Context* ctx) {
 // ---- Polling (timer task) ----
 
 static void onPollTick(Context* ctx) {
+    // Runs on the FreeRTOS timer daemon task, which is NOT the LVGL task. Mutating LVGL widgets
+    // here (labels) requires the LVGL lock — exactly as BtManage's requestViewUpdate() does.
+    // Without it the LVGL refresh task can race the invalidation and hang the app (task watchdog).
+    lvgl_lock();
     if (ctx->statusLabel != nullptr) {
         const char* text = ctx->spamRunning ? "Spamming"
             : (ctx->airtagRunning ? "Monitoring" : (ctx->scanRunning ? "Scanning" : "Stopped"));
@@ -571,6 +587,7 @@ static void onPollTick(Context* ctx) {
     if (ctx->screen == Screen::Spam && ctx->spamLabel != nullptr) {
         lv_label_set_text(ctx->spamLabel, kSpamPayloads[ctx->currentPayload].label);
     }
+    lvgl_unlock();
 }
 
 // ---- App entry ----
@@ -651,10 +668,15 @@ int32_t appMain(int argc, char* argv[]) {
         }
 #endif
 
-        // Rebuild the device list on the LVGL task after event-driven changes.
-        if (ctx.listDirty) {
+        // Rebuild the device list on the app task. This task is NOT the LVGL task, so the LVGL
+        // lock must be held around any widget mutation first — the exact bug BtManage documents.
+        // The peer-list rebuild creates/cleans many widgets, so it also needs the larger stack set
+        // in the manifest below.
+        if (ctx.listDirty && ctx.list != nullptr) {
             ctx.listDirty = false;
+            lvgl_lock();
             rebuildList(&ctx);
+            lvgl_unlock();
         }
     }
 
@@ -693,7 +715,11 @@ extern const ::AppManifest manifest = {
     .category = APP_CATEGORY_USER,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
     .flags = 0,
-    .stack = {}
+    // The scan/AirTag peer-list rebuild does heavy LVGL work (creating/cleaning many widgets,
+    // forcing layout, object-tree redraw recursion) on this app's own task. The default 8 KB
+    // stack overflows under that redraw recursion, so give the app more headroom (as BtManage
+    // does); the LVGL lock must also be held around those widget mutations.
+    .stack = { .depth = 4096 }, // 16 KB
 };
 
 } // namespace tt::app::bletoolbox
