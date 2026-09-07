@@ -591,9 +591,10 @@ error_t api_send_raw_frame(Device* device, const uint8_t* frame, size_t length) 
     if (ctx == nullptr || frame == nullptr) return ERROR_INVALID_ARGUMENT;
     if (length < 24 || length > 1500) return ERROR_INVALID_ARGUMENT;
 
-    // esp_wifi_80211_tx sends raw 802.11 frames (beacon/probe/deauth/action + non-QoS data). The
-    // en_sys_seq=true path is valid whether or not the STA is connected; it lets the driver assign
-    // its own sequence number instead of rejecting on a stale frame->seq mismatch.
+    // esp_wifi_80211_tx sends raw 802.11 frames (beacon/probe/action + non-QoS data). en_sys_seq=true
+    // works whether or not the STA is connected, so beacon/probe injection is unaffected by the
+    // radio's association state. (Deauth frames are rejected by the stock WiFi library's sanity
+    // check, so they silently don't transmit here - see the WifiToolbox notes.)
     esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame, static_cast<int>(length), true);
     return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
 }

