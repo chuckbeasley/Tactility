@@ -72,7 +72,37 @@ void app_manager_for_each_manifest(AppManifestVisitorFn visitor, void* context) 
     mutex_unlock(&ledger.mutex);
 }
 
+// Returns true when @a instance_id is a top-level USER app that should be auto-closed before
+// starting a fresh top-level app. The launcher, the boot bootstrap app, and settings apps are
+// SYSTEM/SETTINGS category and are deliberately left alone (the launcher must stay resident, and
+// stopping the boot app would corrupt the boot->launcher transition). The display-borrowing demos
+// (Mystify / Graphics) are USER apps, so they are the ones this catches.
+static bool is_closable_top_level_user_app(AppInstanceId instance_id) {
+    auto& ledger = app_ledger();
+    mutex_lock(&ledger.mutex);
+    auto iterator = ledger.instances.find(instance_id);
+    bool closable = iterator != ledger.instances.end() &&
+        iterator->second.manifest != nullptr &&
+        iterator->second.manifest->category == APP_CATEGORY_USER;
+    mutex_unlock(&ledger.mutex);
+    return closable;
+}
+
 error_t app_manager_start_internal(const AppManifest* manifest, AppLocation location, AppStackConfig stack, AppInstanceId parent_instance_id, int argc, const char* const argv_in[], const AppStreamBinding* bindings, size_t binding_count, AppInstanceId* out_app_instance_id) {
+    // A new top-level USER app is being launched (from the launcher or the web server). Close the
+    // previously-running top-level USER app first - in particular any display-borrowing app (e.g.
+    // Mystify / Graphics demo) that stopped the LVGL module, which otherwise leaves the app loader
+    // unable to resolve LVGL symbols (the loader only resolves symbols from modules that are
+    // currently started) so the next app fails to load with "Can't find symbol lvgl_*". The
+    // launcher and system/settings apps stay resident.
+    if (parent_instance_id == 0) {
+        AppInstanceId previous_id = 0;
+        if (app_manager_get_topmost_instance_id(&previous_id) == ERROR_NONE && previous_id != 0 && is_closable_top_level_user_app(previous_id)) {
+            LOG_I(TAG, "Stopping previous top-level user app instance %u before starting new one", previous_id);
+            app_manager_stop(previous_id);
+        }
+    }
+
     char** argv = app_arguments_copy(argc, argv_in);
     if (argc > 0 && argv == nullptr) {
         return ERROR_OUT_OF_MEMORY;
