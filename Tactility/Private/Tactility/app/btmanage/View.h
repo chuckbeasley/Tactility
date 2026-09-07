@@ -29,6 +29,7 @@ class View final {
     bool lastListScanning = false;
     size_t lastScanResultCount = 0;
     size_t lastPairedCount = 0;
+    size_t lastConnectedCount = 0;
     uint32_t lastListRenderTick = 0;
     bool listRebuildPending = false;
     lv_timer_t* rebuild_timer = nullptr;

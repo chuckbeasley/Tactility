@@ -109,12 +109,24 @@ static uint8_t mapRssiToPercentage(int8_t rssi) {
 
 void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired, size_t index) {
     const auto percentage = mapRssiToPercentage(record.rssi);
-    const auto label = record.name.empty()
-        ? std::format("Unknown ({:02x}{:02x}{:02x}{:02x}{:02x}{:02x}) {}%",
-            record.addr[0], record.addr[1], record.addr[2],
-            record.addr[3], record.addr[4], record.addr[5],
-            percentage)
-        : std::format("{} {}%", record.name, percentage);
+    // A connected HID host reports no RSSI (rssi=0 maps to "100%"), which is misleading. Render a
+    // clear connected marker instead of the percentage so the user can see the live link.
+    std::string label;
+    if (record.connected) {
+        const auto name = record.name.empty()
+            ? std::format("Unknown ({:02x}{:02x}{:02x}{:02x}{:02x}{:02x})",
+                record.addr[0], record.addr[1], record.addr[2],
+                record.addr[3], record.addr[4], record.addr[5])
+            : record.name;
+        label = std::format("{} {}Connected", name, LV_SYMBOL_OK);
+    } else {
+        label = record.name.empty()
+            ? std::format("Unknown ({:02x}{:02x}{:02x}{:02x}{:02x}{:02x}) {}%",
+                record.addr[0], record.addr[1], record.addr[2],
+                record.addr[3], record.addr[4], record.addr[5],
+                percentage)
+            : std::format("{} {}%", record.name, percentage);
+    }
 
     auto* button = lv_list_add_button(peers_list, nullptr, label.c_str());
 
@@ -330,12 +342,14 @@ void View::update() {
     const auto current_scanning = state->isScanning();
     const auto current_scan_count = state->getScanResultCount();
     const auto current_paired_count = state->getPairedPeerCount();
+    const auto current_connected_count = state->getConnectedPeerCount();
 
     const bool content_changed = !hasRenderedList ||
         current_radio != lastListRadioState ||
         current_scanning != lastListScanning ||
         current_scan_count != lastScanResultCount ||
-        current_paired_count != lastPairedCount;
+        current_paired_count != lastPairedCount ||
+        current_connected_count != lastConnectedCount;
 
     if (!content_changed && !listRebuildPending) {
         return;
@@ -363,6 +377,7 @@ void View::update() {
     lastListScanning = current_scanning;
     lastScanResultCount = current_scan_count;
     lastPairedCount = current_paired_count;
+    lastConnectedCount = current_connected_count;
 }
 
 } // namespace tt::app::btmanage

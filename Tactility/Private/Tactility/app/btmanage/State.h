@@ -50,6 +50,19 @@ public:
         lock.lock();
         return pairedPeers.size();
     }
+
+    // Cheap change-detection accessor (no string copies). Counts paired peers currently marked
+    // connected, so the view can rebuild when a keyboard connects/disconnects even when the
+    // total count is unchanged.
+    size_t getConnectedPeerCount() const {
+        auto lock = mutex.asScopedLock();
+        lock.lock();
+        size_t count = 0;
+        for (const auto& peer : pairedPeers) {
+            if (peer.connected) count++;
+        }
+        return count;
+    }
 };
 
 } // namespace tt::app::btmanage
