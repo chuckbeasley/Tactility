@@ -116,8 +116,11 @@ void View::onShowMoreClicked(lv_event_t* event) {
 }
 
 void View::createSsidListItem(const WifiApRecord& record, bool isConnecting, size_t index) {
+    // Compact rows so more networks fit on the small display (local style overrides the theme).
+    const lv_coord_t row_pad = lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 2 : 4;
     if (isConnecting) {
         auto* button = lv_list_add_button(networks_list, LV_SYMBOL_WIFI, record.ssid);
+        lv_obj_set_style_pad_ver(button, row_pad, LV_STATE_DEFAULT);
         lv_obj_add_event_cb(button, showDetails, LV_EVENT_SHORT_CLICKED, this);
     } else {
         const char* auth_info = (record.authentication_type == WIFI_AUTHENTICATION_TYPE_OPEN) ? "(open) " : "";
@@ -125,6 +128,7 @@ void View::createSsidListItem(const WifiApRecord& record, bool isConnecting, siz
         char label[96];
         std::snprintf(label, sizeof(label), "%s %s%u%%", record.ssid, auth_info, percentage);
         auto* button = lv_list_add_button(networks_list, nullptr, label);
+        lv_obj_set_style_pad_ver(button, row_pad, LV_STATE_DEFAULT);
         lv_obj_set_user_data(button, reinterpret_cast<void*>(index));
         // Avoid filesystem checks in the LVGL render path; onConnect handles known/unknown SSIDs.
         lv_obj_add_event_cb(button, connect, LV_EVENT_SHORT_CLICKED, this);

@@ -129,6 +129,10 @@ void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired
     }
 
     auto* button = lv_list_add_button(peers_list, nullptr, label.c_str());
+    // Compact rows so more peers fit on the small display (local style overrides the theme).
+    lv_obj_set_style_pad_ver(button,
+        lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 2 : 4,
+        LV_STATE_DEFAULT);
 
     auto* item_data = new PeerListItemData { context, state, bindings, index, isPaired };
     lv_obj_set_user_data(button, item_data);
