@@ -32,11 +32,10 @@ constexpr size_t APP_INSTANCE_ID_THREAD_SLOT_INDEX = 1;
 // Matches TactilityKernel's Thread wrapper's THREAD_PRIORITY_NORMAL.
 constexpr UBaseType_t APP_TASK_PRIORITY = 4;
 
-// Used when an app's manifest doesn't request a specific stack depth (0). 32768 bytes' worth.
-// Raised from 8192 for extra headroom. Note this MUST fit in internal RAM: FreeRTOS static task
-// stacks on this port reject external/PSRAM buffers (xPortcheckValidStackMem assert), so an
-// over-large default (e.g. 64KB) makes boot crash rather than help. 32768 boots reliably.
-constexpr size_t APP_DEFAULT_STACK_DEPTH = 32768 / sizeof(StackType_t);
+// Used when an app's manifest doesn't request a specific stack depth (0). 8192 bytes' worth.
+// Keep this modest so it fits in internal RAM: a larger default makes apps fail to launch with
+// "Failed to allocate app stack" once the LVGL render task has taken its own internal-RAM stack.
+constexpr size_t APP_DEFAULT_STACK_DEPTH = 8192 / sizeof(StackType_t);
 
 // Task control blocks must stay in internal RAM; only the stack itself may live in external memory.
 constexpr MemoryPolicy APP_TASK_TCB_POLICY = { MEMORY_CAPABILITY_INTERNAL, 0, 0 };
