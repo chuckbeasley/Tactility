@@ -72,28 +72,35 @@ static void onScanButtonClicked(lv_event_t* event) {
 
 // region Peer list callbacks
 
-struct PeerListItemData {
-    void* context;
-    State* state;
-    Bindings* bindings;
-    size_t index;
-    bool isPaired;
-};
+// Row metadata is packed into the button's user_data instead of heap-allocated per row. The old
+// pattern `new PeerListItemData` + delete on LV_EVENT_DELETE leaked when LVGL cleared the object's
+// user_data before firing DELETE (so the handler read nullptr and the row leaked ~10 KB/scan,
+// which over many scans/opens drained the heap toward an OOM crash). Packing the (index, isPaired)
+// pair into a single pointer keeps it allocation-free and leak-free.
 
 void View::onConnect(lv_event_t* event) {
-    auto* data = static_cast<PeerListItemData*>(lv_event_get_user_data(event));
+    // The View is found via the parent list's user_data, set once in init().
+    auto* button = static_cast<lv_obj_t*>(lv_event_get_current_target_obj(event));
+    auto* self = static_cast<View*>(lv_obj_get_user_data(lv_obj_get_parent(button))); // peers_list
+    if (self == nullptr) {
+        return;
+    }
 
-    if (data->isPaired) {
+    const uintptr_t packed = reinterpret_cast<uintptr_t>(lv_obj_get_user_data(button));
+    const bool isPaired = (packed & 1u) != 0;
+    const size_t index = static_cast<size_t>(packed >> 1);
+
+    if (isPaired) {
         // Open the per-device settings screen for paired devices
-        auto peers = data->state->getPairedPeers();
-        if (data->index < peers.size()) {
-            btpeersettings::start(bluetooth::settings::addrToHex(peers[data->index].addr));
+        auto peers = self->state->getPairedPeers();
+        if (index < peers.size()) {
+            btpeersettings::start(bluetooth::settings::addrToHex(peers[index].addr));
         }
     } else {
         // Unrecognised scan result — initiate pairing
-        auto peers = data->state->getScanResults();
-        if (data->index < peers.size()) {
-            data->bindings->onPairPeer(data->context, peers[data->index].addr);
+        auto peers = self->state->getScanResults();
+        if (index < peers.size()) {
+            self->bindings->onPairPeer(self->context, peers[index].addr);
         }
     }
 }
@@ -133,13 +140,10 @@ void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired
     lv_obj_set_style_pad_ver(button,
         lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 2 : 4,
         LV_STATE_DEFAULT);
-
-    auto* item_data = new PeerListItemData { context, state, bindings, index, isPaired };
-    lv_obj_set_user_data(button, item_data);
-    lv_obj_add_event_cb(button, onConnect, LV_EVENT_SHORT_CLICKED, item_data);
-    lv_obj_add_event_cb(button, [](lv_event_t* e) {
-        delete static_cast<PeerListItemData*>(lv_obj_get_user_data(lv_event_get_current_target_obj(e)));
-    }, LV_EVENT_DELETE, nullptr);
+    // Pack (index, isPaired) into the button's user_data so onConnect() can decode it without a
+    // per-row heap allocation (see onConnect()). See PeerListItemData removal note.
+    lv_obj_set_user_data(button, reinterpret_cast<void*>((index << 1) | (isPaired ? 1u : 0u)));
+    lv_obj_add_event_cb(button, onConnect, LV_EVENT_SHORT_CLICKED, nullptr);
 }
 
 // region Secondary updates
@@ -316,6 +320,9 @@ void View::init(void* newContext, lv_obj_t* parent) {
     peers_list = lv_list_create(parent);
     lv_obj_set_flex_grow(peers_list, 1);
     lv_obj_set_width(peers_list, LV_PCT(100));
+    // onConnect() recovers the View through the parent list's user_data (per-row metadata is now
+    // packed into each button's own user_data instead of being heap-allocated).
+    lv_obj_set_user_data(peers_list, this);
 
     // A rebuild deferred by the throttle (or by an in-progress touch) needs something to
     // flush it: the BT event that requested it may well have been the last one.
