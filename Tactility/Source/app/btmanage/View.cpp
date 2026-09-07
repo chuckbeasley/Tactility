@@ -202,6 +202,12 @@ void View::createEnableOnBootRow(lv_obj_t* parent) {
 void View::updatePeerList() {
     const int32_t scroll_y = lv_obj_get_scroll_y(peers_list);
 
+    // A busy RF environment can produce dozens of peers per scan. Rebuilding the LVGL list for
+    // every one of them creates a very deep widget tree on the app task (8 KB default stack),
+    // whose redraw recursion overflows the stack and crashes the device with a Stack protection
+    // fault. Cap how many peers we render so the widget tree stays bounded.
+    constexpr size_t MAX_VISIBLE_PEERS = 30;
+
     lv_obj_clean(peers_list);
 
     using enum bluetooth::RadioState;
@@ -210,7 +216,8 @@ void View::updatePeerList() {
         auto paired = state->getPairedPeers();
         if (!paired.empty()) {
             lv_list_add_text(peers_list, "Paired");
-            for (size_t i = 0; i < paired.size(); ++i) {
+            size_t count = std::min(paired.size(), MAX_VISIBLE_PEERS);
+            for (size_t i = 0; i < count; ++i) {
                 createPeerListItem(paired[i], true, i);
             }
         }
@@ -219,7 +226,8 @@ void View::updatePeerList() {
         auto scan_results = state->getScanResults();
         lv_list_add_text(peers_list, "Available");
         if (!scan_results.empty()) {
-            for (size_t i = 0; i < scan_results.size(); ++i) {
+            size_t count = std::min(scan_results.size(), MAX_VISIBLE_PEERS);
+            for (size_t i = 0; i < count; ++i) {
                 createPeerListItem(scan_results[i], false, i);
             }
         } else if (!state->isScanning()) {

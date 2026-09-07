@@ -245,7 +245,12 @@ extern const ::AppManifest manifest = {
     .id = "tactility.btmanage",
     .name = "Bluetooth",
     .category = APP_CATEGORY_SETTINGS,
-    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) }
+    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
+    // The peer-list rebuild does heavy LVGL work (creating/cleaning dozens of widgets, forcing
+    // layout, and the resulting object-tree redraw recursion) on this app's own task. The default
+    // 8 KB stack overflows under that redraw recursion (Stack protection fault), so give this
+    // app more headroom.
+    .stack = { .depth = 4096 }, // 16 KB
 };
 
 } // namespace tt::app::btmanage
