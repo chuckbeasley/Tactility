@@ -222,34 +222,33 @@ static bool updatePeers(Peer* peer, std::vector<Peer>& peers) {
     return false;
 }
 
-static std::string peerLabel(const Peer& peer) {
-    char addr[18];
-    formatAddr(peer.addr.data(), addr, sizeof(addr));
-    std::string label;
-    if (isOfflineFinding(peer.manuf, peer.manuf_len)) {
-        label = "AirTag ";
-    }
+static const char* deviceNameOrType(const Peer& peer) {
     if (peer.name[0] != '\0') {
-        label += peer.name;
-        label += " ";
-        label += addr;
-    } else {
-        label += addr;
+        return peer.name;
     }
-    label += "  ";
-    label += std::to_string(peer.rssi);
-    label += "dBm";
-    return label;
+    if (isOfflineFinding(peer.manuf, peer.manuf_len)) {
+        return "AirTag";
+    }
+    return "-";
 }
 
+// Three-column table of devices: Name | Address | RSSI.
 static void rebuildList(Context* ctx) {
     if (ctx->list == nullptr) return;
-    lv_obj_clean(ctx->list);
     const bool airtag = (ctx->screen == Screen::Airtag);
     const auto& peers = airtag ? ctx->airtagPeers : ctx->scanPeers;
-    for (const auto& peer : peers) {
-        auto* btn = lv_list_add_button(ctx->list, nullptr, peerLabel(peer).c_str());
-        lv_obj_set_width(btn, LV_PCT(100));
+    lv_table_set_row_count(ctx->list, (uint32_t)(peers.size() + 1)); // +1 for the header row
+    lv_table_set_cell_value(ctx->list, 0, 0, "Name");
+    lv_table_set_cell_value(ctx->list, 0, 1, "Address");
+    lv_table_set_cell_value(ctx->list, 0, 2, "RSSI");
+    char addr[18];
+    for (size_t i = 0; i < peers.size(); ++i) {
+        const uint32_t row = (uint32_t)(i + 1);
+        const Peer& peer = peers[i];
+        lv_table_set_cell_value(ctx->list, row, 0, deviceNameOrType(peer));
+        formatAddr(peer.addr.data(), addr, sizeof(addr));
+        lv_table_set_cell_value(ctx->list, row, 1, addr);
+        lv_table_set_cell_value(ctx->list, row, 2, std::to_string(peer.rssi).c_str());
     }
 }
 
@@ -436,7 +435,17 @@ static void showScanScreen(Context* ctx) {
     ctx->statusLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->statusLabel, "Stopped");
 
-    ctx->list = lv_list_create(ctx->body);
+    ctx->list = lv_table_create(ctx->body);
+    lv_table_set_column_count(ctx->list, 3);
+    lv_table_set_column_width(ctx->list, 0, 150);
+    lv_table_set_column_width(ctx->list, 1, 180);
+    lv_table_set_column_width(ctx->list, 2, 90);
+    // Compact rows: shrink vertical cell padding so more records fit on the small display.
+    lv_obj_set_style_pad_ver(ctx->list, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(ctx->list, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(ctx->list, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(ctx->list, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(ctx->list, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->list, LV_PCT(100));
     lv_obj_set_flex_grow(ctx->list, 1);
     lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
@@ -540,7 +549,17 @@ static void showAirtagScreen(Context* ctx) {
     ctx->statusLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->statusLabel, "Stopped");
 
-    ctx->list = lv_list_create(ctx->body);
+    ctx->list = lv_table_create(ctx->body);
+    lv_table_set_column_count(ctx->list, 3);
+    lv_table_set_column_width(ctx->list, 0, 150);
+    lv_table_set_column_width(ctx->list, 1, 180);
+    lv_table_set_column_width(ctx->list, 2, 90);
+    // Compact rows: shrink vertical cell padding so more records fit on the small display.
+    lv_obj_set_style_pad_ver(ctx->list, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(ctx->list, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(ctx->list, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(ctx->list, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(ctx->list, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->list, LV_PCT(100));
     lv_obj_set_flex_grow(ctx->list, 1);
     lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
