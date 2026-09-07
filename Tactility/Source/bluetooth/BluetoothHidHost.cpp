@@ -11,6 +11,9 @@
 #include <Tactility/Assets.h>
 #include <Tactility/Tactility.h>
 
+#include <tactility/device.h>
+#include <tactility/driver.h>
+#include <tactility/drivers/keyboard.h>
 #include <tactility/log.h>
 
 #include <host/ble_gap.h>
@@ -39,6 +42,9 @@ constexpr auto* TAG = "BtHidHost";
 // callbacks above it.
 static void fireHidHostFailure(const std::array<uint8_t, 6>& addr);
 
+// Initiates the actual ble_gap_connect() for the current ctx; schedules a retry on EALREADY.
+static void hidHostConnectInitiate();
+
 // ---- Report type ----
 
 enum class HidReportType : uint8_t { Unknown = 0, Keyboard, Mouse, Consumer };
@@ -65,7 +71,8 @@ struct HidHostCtx {
     bool securityInitiated     = false;
     bool typeResolutionDone    = false;
     bool readyBlockFired       = false;
-    lv_indev_t* kbIndev        = nullptr;
+    bool capsLock              = false;
+    bool numLock               = true;
     lv_indev_t* mouseIndev     = nullptr;
     lv_obj_t*   mouseCursor    = nullptr;
     std::array<uint8_t, 6> peerAddr = {};
@@ -78,13 +85,85 @@ static QueueHandle_t hid_host_key_queue = nullptr;
 static uint8_t hid_host_prev_keys[6] = {};
 static esp_timer_handle_t hid_enc_retry_timer = nullptr;
 
+// Retry state for ble_gap_connect() returning BLE_HS_EALREADY. The controller can only run one
+// connection at a time, so a tap or auto-connect that lands while name-resolution (or another
+// connect) is in progress gets EALREADY. Rather than failing silently (the "nothing happens" bug),
+// retry briefly until the controller is free.
+static esp_timer_handle_t hid_host_connect_retry_timer = nullptr;
+static bool hid_host_connect_retry_scheduled = false;
+
 static std::atomic<int32_t> hid_host_mouse_x{0};
 static std::atomic<int32_t> hid_host_mouse_y{0};
 static std::atomic<bool>    hid_host_mouse_btn{false};
 static std::atomic<bool>    hid_host_mouse_active{false};
 
 #define HID_HOST_KEY_QUEUE_SIZE 64
-struct HidHostKeyEvt { uint32_t key; bool pressed; };
+struct HidHostKeyEvt {
+    uint32_t key;
+    bool pressed;
+    bool ctrl;
+    bool alt;
+    uint8_t hid_keycode;
+    uint8_t hid_modifier;
+};
+
+// Standard USB HID keyboard usage codes (page 0x07) used by the key map below.
+constexpr uint8_t HID_KC_ENTER        = 0x28;
+constexpr uint8_t HID_KC_ESC          = 0x29;
+constexpr uint8_t HID_KC_BACKSPACE    = 0x2A;
+constexpr uint8_t HID_KC_TAB          = 0x2B;
+constexpr uint8_t HID_KC_SPACE        = 0x2C;
+constexpr uint8_t HID_KC_CAPS_LOCK    = 0x39;
+constexpr uint8_t HID_KC_PAGE_UP      = 0x4B;
+constexpr uint8_t HID_KC_DELETE       = 0x4C;
+constexpr uint8_t HID_KC_PAGE_DOWN    = 0x4E;
+constexpr uint8_t HID_KC_FN_RIGHT     = 0x4F; // Right Arrow
+constexpr uint8_t HID_KC_FN_LEFT      = 0x50; // Left Arrow
+constexpr uint8_t HID_KC_FN_DOWN      = 0x51; // Down Arrow
+constexpr uint8_t HID_KC_FN_UP        = 0x52; // Up Arrow
+constexpr uint8_t HID_KC_NUM_LOCK     = 0x53;
+constexpr uint8_t HID_KC_KP_DIV       = 0x54;
+constexpr uint8_t HID_KC_KP_MUL       = 0x55;
+constexpr uint8_t HID_KC_KP_SUB       = 0x56;
+constexpr uint8_t HID_KC_KP_ADD       = 0x57;
+constexpr uint8_t HID_KC_KP_ENTER     = 0x58;
+constexpr uint8_t HID_KC_KP_1         = 0x59; // ... 0x61 = 9
+constexpr uint8_t HID_KC_KP_0         = 0x62;
+constexpr uint8_t HID_KC_KP_DOT       = 0x63;
+
+// Modifier bitmask bits (report byte 0).
+constexpr uint8_t HID_MOD_LEFT_SHIFT  = 0x02;
+constexpr uint8_t HID_MOD_RIGHT_SHIFT = 0x20;
+constexpr uint8_t HID_MOD_LEFT_CTRL   = 0x01;
+constexpr uint8_t HID_MOD_RIGHT_CTRL  = 0x10;
+constexpr uint8_t HID_MOD_LEFT_ALT    = 0x04;
+constexpr uint8_t HID_MOD_RIGHT_ALT   = 0x40;
+
+// keycode2ascii[row][0]=unshifted, [1]=shifted. Index = HID usage 0x04..0x38. Mirrors the
+// complete table in Platforms/platform-esp32/source/drivers/usb/esp32_usbhost_hid.cpp so a BLE
+// HID keyboard types exactly like a USB HID keyboard.
+static const uint8_t hid_keycode2ascii[57][2] = {
+    {0, 0}, {0, 0}, {0, 0}, {0, 0},
+    {'a', 'A'}, {'b', 'B'}, {'c', 'C'}, {'d', 'D'}, {'e', 'E'},
+    {'f', 'F'}, {'g', 'G'}, {'h', 'H'}, {'i', 'I'}, {'j', 'J'},
+    {'k', 'K'}, {'l', 'L'}, {'m', 'M'}, {'n', 'N'}, {'o', 'O'},
+    {'p', 'P'}, {'q', 'Q'}, {'r', 'R'}, {'s', 'S'}, {'t', 'T'},
+    {'u', 'U'}, {'v', 'V'}, {'w', 'W'}, {'x', 'X'}, {'y', 'Y'},
+    {'z', 'Z'},
+    {'1', '!'}, {'2', '@'}, {'3', '#'}, {'4', '$'}, {'5', '%'},
+    {'6', '^'}, {'7', '&'}, {'8', '*'}, {'9', '('}, {'0', ')'},
+    {'\r', '\r'}, {0, 0}, {'\b', 0}, {'\t', '\t'}, {' ', ' '},
+    {'-', '_'}, {'=', '+'}, {'[', '{'}, {']', '}'},
+    {'\\', '|'}, {'\\', '|'}, {';', ':'}, {'\'', '"'},
+    {'`', '~'}, {',', '<'}, {'.', '>'}, {'/', '?'},
+};
+
+// Transient KEYBOARD_TYPE device that is constructed while a BLE HID keyboard is connected, so
+// lvgl_hardware_keyboard_is_available() returns true and the on-screen keyboard is suppressed.
+// Its KeyboardApi::read_key drains hid_host_key_queue, the same queue the HID reports feed.
+static Device g_bt_kb_device = {};
+static bool   g_bt_kb_active = false;
+static bool   g_bt_kb_driver_state_ready = false;
 
 // ---- Forward declarations ----
 
@@ -95,72 +174,98 @@ static uint16_t getDescEndHandle(const HidHostCtx& ctx, uint16_t valHandle);
 
 // ---- Keycode mapping ----
 
-static uint32_t hidHostMapKeycode(uint8_t mod, uint8_t kc) {
-    bool shift = (mod & 0x22) != 0;
+// Maps a HID keyboard usage + modifier to a Unicode codepoint (never an LVGL LV_KEY_* sentinel),
+// matching the KeyboardKeyData::key contract and the USB HID driver's behaviour. Returns 0 for
+// keys that produce no character/action for LVGL (F1-F12, lock toggles, etc.).
+static uint32_t hidHostMapKeycode(uint8_t mod, uint8_t kc, bool capsLock, bool numLock) {
+    bool shift = ((mod & HID_MOD_LEFT_SHIFT) || (mod & HID_MOD_RIGHT_SHIFT)) != 0;
+
     switch (kc) {
-        case 0x28: return LV_KEY_ENTER;
-        case 0x29: return LV_KEY_ESC;
-        case 0x2A: return LV_KEY_BACKSPACE;
-        case 0x4C: return LV_KEY_DEL;
-        case 0x2B: return shift ? (uint32_t)LV_KEY_PREV : (uint32_t)LV_KEY_NEXT;
-        case 0x52: return LV_KEY_UP;
-        case 0x51: return LV_KEY_DOWN;
-        case 0x50: return LV_KEY_LEFT;
-        case 0x4F: return LV_KEY_RIGHT;
-        case 0x4A: return LV_KEY_HOME;
-        case 0x4D: return LV_KEY_END;
+        case HID_KC_ENTER:     return CODEPOINT_ENTER;
+        case HID_KC_ESC:       return CODEPOINT_ESCAPE;
+        case HID_KC_DELETE:    return CODEPOINT_DELETE;
+        case HID_KC_BACKSPACE: return CODEPOINT_BACKSPACE;
+        case HID_KC_TAB:       return '\t';
+        case HID_KC_FN_UP:     return CODEPOINT_ARROW_UP;
+        case HID_KC_FN_DOWN:   return CODEPOINT_ARROW_DOWN;
+        case HID_KC_FN_LEFT:   return CODEPOINT_ARROW_LEFT;
+        case HID_KC_FN_RIGHT:  return CODEPOINT_ARROW_RIGHT;
+        case HID_KC_KP_ENTER:  return CODEPOINT_ENTER;
+        case HID_KC_KP_ADD:    return '+';
+        case HID_KC_KP_SUB:    return '-';
+        case HID_KC_KP_MUL:    return '*';
+        case HID_KC_KP_DIV:    return '/';
         default: break;
     }
-    if (kc >= 0x04 && kc <= 0x1D) {
-        uint32_t c = static_cast<uint32_t>('a' + (kc - 0x04));
-        return shift ? (c - 0x20) : c;
+
+    // Numpad. When Num Lock is off the navigation keys are instead mapped to caret/Home/End
+    // (matching the USB HID driver's num_lock handling).
+    if (kc >= HID_KC_KP_1 && kc <= HID_KC_KP_0) {
+        if (!numLock) return 0;
+        if (kc == HID_KC_KP_0) return '0';
+        return static_cast<uint32_t>('1' + (kc - HID_KC_KP_1));
     }
-    if (kc >= 0x1E && kc <= 0x27) {
-        static const char nums[]  = "1234567890";
-        static const char snums[] = "!@#$%^&*()";
-        int i = kc - 0x1E;
-        return shift ? static_cast<uint32_t>(snums[i]) : static_cast<uint32_t>(nums[i]);
+    if (kc == HID_KC_KP_DOT) return numLock ? (uint32_t)'.' : (uint32_t)CODEPOINT_DELETE;
+
+    // Letters, numbers, punctuation and the C0/whitespace keys via the table. The table is
+    // indexed directly by usage code (0x04..0x38), and row 0x28..0x2C (Enter/Unused/Backspace/
+    // Tab/Space) carries the ASCII equivalents that LVGL's codepoint_to_lv_key() leaves as-is.
+    if (kc >= 0x04 && kc < (sizeof(hid_keycode2ascii) / sizeof(hid_keycode2ascii[0]))) {
+        bool is_letter = (kc >= 0x04 && kc <= 0x1D);
+        bool effective_shift = is_letter ? (shift ^ capsLock) : shift;
+        uint8_t ch = hid_keycode2ascii[kc][effective_shift ? 1 : 0];
+        if (ch != 0) return static_cast<uint32_t>(ch);
     }
-    if (kc == 0x2C) return ' ';
     return 0;
 }
 
-static void hidHostKeyboardReadCb(lv_indev_t* /*indev*/, lv_indev_data_t* data) {
-    if (!hid_host_key_queue) { data->state = LV_INDEV_STATE_RELEASED; return; }
-    HidHostKeyEvt evt = {};
-    if (xQueueReceive(hid_host_key_queue, &evt, 0) == pdTRUE) {
-        data->key   = evt.key;
-        data->state = evt.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
-        data->continue_reading = (uxQueueMessagesWaiting(hid_host_key_queue) > 0);
-    } else {
-        data->state = LV_INDEV_STATE_RELEASED;
-    }
-}
-
-static void hidHostHandleKeyboardReport(const uint8_t* data, uint16_t len) {
+static void hidHostHandleKeyboardReport(HidHostCtx& ctx, const uint8_t* data, uint16_t len) {
     if (len < 3 || !hid_host_key_queue) return;
     uint8_t mod = data[0];
     const uint8_t* curr = &data[2];
     int nkeys = std::min((int)(len - 2), 6);
 
-    for (int i = 0; i < 6; i++) {
-        uint8_t kc = hid_host_prev_keys[i];
-        if (kc == 0) continue;
-        bool still = false;
-        for (int j = 0; j < nkeys; j++) { if (curr[j] == kc) { still = true; break; } }
-        if (!still) {
-            uint32_t lv = hidHostMapKeycode(0, kc);
-            if (lv) { HidHostKeyEvt e{lv, false}; xQueueSend(hid_host_key_queue, &e, 0); }
-        }
-    }
+    // Toggle lock state on a NEW press of the lock key, before mapping the other keys in the same
+    // report (USB driver behaviour). Lock keys produce no character of their own and are skipped by
+    // the press/release loops below.
     for (int i = 0; i < nkeys; i++) {
         uint8_t kc = curr[i];
-        if (kc == 0) continue;
+        if (kc != HID_KC_CAPS_LOCK && kc != HID_KC_NUM_LOCK) continue;
         bool had = false;
         for (int j = 0; j < 6; j++) { if (hid_host_prev_keys[j] == kc) { had = true; break; } }
         if (!had) {
-            uint32_t lv = hidHostMapKeycode(mod, kc);
-            if (lv) { HidHostKeyEvt e{lv, true}; xQueueSend(hid_host_key_queue, &e, 0); }
+            if (kc == HID_KC_CAPS_LOCK) ctx.capsLock = !ctx.capsLock;
+            else                        ctx.numLock  = !ctx.numLock;
+        }
+    }
+
+    // Releases.
+    for (int i = 0; i < 6; i++) {
+        uint8_t kc = hid_host_prev_keys[i];
+        if (kc == 0) continue;
+        if (kc == HID_KC_CAPS_LOCK || kc == HID_KC_NUM_LOCK) continue;
+        bool still = false;
+        for (int j = 0; j < nkeys; j++) { if (curr[j] == kc) { still = true; break; } }
+        if (!still) {
+            uint32_t key = hidHostMapKeycode(0, kc, ctx.capsLock, ctx.numLock);
+            if (key) { HidHostKeyEvt e{key, false, false, false, kc, 0}; xQueueSend(hid_host_key_queue, &e, 0); }
+        }
+    }
+    // Presses.
+    for (int i = 0; i < nkeys; i++) {
+        uint8_t kc = curr[i];
+        if (kc == 0) continue;
+        if (kc == HID_KC_CAPS_LOCK || kc == HID_KC_NUM_LOCK) continue;
+        bool had = false;
+        for (int j = 0; j < 6; j++) { if (hid_host_prev_keys[j] == kc) { had = true; break; } }
+        if (!had) {
+            uint32_t key = hidHostMapKeycode(mod, kc, ctx.capsLock, ctx.numLock);
+            if (key) {
+                bool ctrl = (mod & (HID_MOD_LEFT_CTRL | HID_MOD_RIGHT_CTRL)) != 0;
+                bool alt  = (mod & (HID_MOD_LEFT_ALT  | HID_MOD_RIGHT_ALT))  != 0;
+                HidHostKeyEvt e{key, true, ctrl, alt, kc, mod};
+                xQueueSend(hid_host_key_queue, &e, 0);
+            }
         }
     }
     std::memcpy(hid_host_prev_keys, curr, nkeys);
@@ -458,6 +563,131 @@ static int hidHostCccdWriteCb(uint16_t conn_handle, const struct ble_gatt_error*
     return 0;
 }
 
+// ---- Transient KEYBOARD_TYPE device ----
+// While a BLE HID keyboard is connected a KEYBOARD_TYPE device is constructed so the rest of the
+// system (lvgl_hardware_keyboard_is_available(), Tactility's KeyboardDeviceListener) sees a real
+// hardware keyboard through the same generic device model as any other keyboard, and the on-screen
+// keyboard is suppressed. Real key events flow through THIS device's read_key, which drains the
+// same hid_host_key_queue the HID report handler fills.
+
+static error_t btKbDeviceStart(Device* device) {
+    device_set_driver_data(device, hid_host_key_queue);
+    return ERROR_NONE;
+}
+
+static error_t btKbDeviceStop(Device* device) {
+    device_set_driver_data(device, nullptr);
+    return ERROR_NONE;
+}
+
+static error_t btKbDeviceReadKey(Device* device, KeyboardKeyData* data) {
+    auto* queue = static_cast<QueueHandle_t>(device_get_driver_data(device));
+    if (queue == nullptr || data == nullptr) {
+        if (data) *data = {};
+        return ERROR_NONE;
+    }
+    HidHostKeyEvt evt = {};
+    if (xQueueReceive(queue, &evt, 0) != pdTRUE) {
+        *data = {};
+        return ERROR_NONE;
+    }
+    data->key           = evt.key;
+    data->pressed       = evt.pressed;
+    data->ctrl          = evt.ctrl;
+    data->alt           = evt.alt;
+    data->hid_keycode   = evt.hid_keycode;
+    data->hid_modifier  = evt.hid_modifier;
+    data->continue_reading = (uxQueueMessagesWaiting(queue) > 0);
+    return ERROR_NONE;
+}
+
+static bool btKbDeviceIsPresent(Device* /*device*/) {
+    return true; // the device only exists while a keyboard is connected
+}
+
+static const KeyboardApi bt_kb_api = {
+    .read_key = btKbDeviceReadKey,
+    .get_backlight = nullptr,
+    .is_present = btKbDeviceIsPresent,
+};
+
+Driver bt_keyboard_driver = {
+    .name         = "bluetooth_keyboard",
+    .compatible   = nullptr,
+    .start_device = btKbDeviceStart,
+    .stop_device  = btKbDeviceStop,
+    .api          = &bt_kb_api,
+    .device_type  = &KEYBOARD_TYPE,
+    .owner        = nullptr,
+    .internal     = nullptr,
+};
+
+static void btHostKbDeviceConstruct() {
+    if (g_bt_kb_active) {
+        return;
+    }
+
+    // driver_bind() dereferences driver->internal (driver.cpp:127), which is only allocated by
+    // driver_construct(). The static initializer sets .internal = nullptr (matches the USB HID
+    // keyboard driver), so construct the driver's internal state once before any device_start();
+    // otherwise device_start → driver_bind crashes with a Load access fault.
+    if (!g_bt_kb_driver_state_ready) {
+        if (driver_construct(&bt_keyboard_driver) != ERROR_NONE) {
+            LOG_E(TAG, "failed to construct Bluetooth keyboard driver");
+            return;
+        }
+        g_bt_kb_driver_state_ready = true;
+    }
+
+    Device* parent = nullptr;
+    if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &parent) != ERROR_NONE) {
+        LOG_W(TAG, "No active BLE device — cannot attach keyboard device");
+        return;
+    }
+
+    g_bt_kb_device = Device {
+        .address  = 0,
+        .name     = "bluetooth_keyboard0",
+        .config   = nullptr,
+        .parent   = nullptr,
+        .internal = nullptr,
+    };
+    if (device_construct(&g_bt_kb_device) != ERROR_NONE) {
+        LOG_E(TAG, "failed to construct Bluetooth keyboard device");
+        device_put(parent);
+        return;
+    }
+    device_set_parent(&g_bt_kb_device, parent);
+    device_set_driver(&g_bt_kb_device, &bt_keyboard_driver);
+    if (device_add(&g_bt_kb_device) != ERROR_NONE) {
+        LOG_E(TAG, "failed to add Bluetooth keyboard device");
+        device_destruct(&g_bt_kb_device);
+        device_put(parent);
+        return;
+    }
+    if (device_start(&g_bt_kb_device) != ERROR_NONE) {
+        LOG_E(TAG, "failed to start Bluetooth keyboard device");
+        device_remove(&g_bt_kb_device);
+        device_destruct(&g_bt_kb_device);
+        device_put(parent);
+        return;
+    }
+    device_put(parent);
+    g_bt_kb_active = true;
+    LOG_I(TAG, "Keyboard device registered");
+}
+
+static void btHostKbDeviceDestruct() {
+    if (!g_bt_kb_active) {
+        return;
+    }
+    g_bt_kb_active = false;
+    device_stop(&g_bt_kb_device);
+    device_remove(&g_bt_kb_device);
+    device_destruct(&g_bt_kb_device);
+    LOG_I(TAG, "Keyboard device deregistered");
+}
+
 static void hidHostSubscribeNext(HidHostCtx& ctx) {
     if (ctx.subscribeIdx >= (int)ctx.inputRpts.size()) {
         if (ctx.readyBlockFired) {
@@ -472,16 +702,12 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
             hid_host_key_queue = xQueueCreate(HID_HOST_KEY_QUEUE_SIZE, sizeof(HidHostKeyEvt));
         }
         getMainDispatcher().dispatch([] {
-            if (!hid_host_ctx || hid_host_ctx->kbIndev != nullptr) return;
-            if (!lvgl_try_lock(1000)) { LOG_W(TAG, "LVGL lock failed for kb indev"); return; }
-
-            auto* kb = lv_indev_create();
-            lv_indev_set_type(kb, LV_INDEV_TYPE_KEYPAD);
-            lv_indev_set_read_cb(kb, hidHostKeyboardReadCb);
-            hid_host_ctx->kbIndev = kb;
-            lvgl_hardware_keyboard_add_custom(kb);
-            lvgl_unlock();
-            LOG_I(TAG, "Keyboard indev registered");
+            // Constructing the device fires DEVICE_EVENT_STARTED, which the KeyboardDeviceListener
+            // handles by binding it to an lv_indev_t via lvgl_keyboard_add() (under the LVGL lock).
+            // Registering a ready+present KEYBOARD_TYPE device is also what makes
+            // lvgl_hardware_keyboard_is_available() return true, suppressing the on-screen keyboard.
+            if (!hid_host_ctx) return;
+            btHostKbDeviceConstruct();
         });
 
         auto peer_addr = ctx.peerAddr;
@@ -660,6 +886,11 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
             if (event->connect.status == 0) {
                 ctx.connHandle = event->connect.conn_handle;
                 LOG_I(TAG, "Connected (handle=%d)", ctx.connHandle);
+                // A connect established — cancel any pending EALREADY retry.
+                if (hid_host_connect_retry_timer != nullptr) {
+                    esp_timer_stop(hid_host_connect_retry_timer);
+                }
+                hid_host_connect_retry_scheduled = false;
                 int rc = ble_gattc_disc_all_svcs(ctx.connHandle, hidHostSvcDiscCb, nullptr);
                 if (rc != 0) {
                     LOG_W(TAG, "disc_all_svcs failed rc=%d", rc);
@@ -683,7 +914,6 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
 
         case BLE_GAP_EVENT_DISCONNECT: {
             LOG_I(TAG, "Disconnected reason=%d", event->disconnect.reason);
-            lv_indev_t* saved_kb     = hid_host_ctx ? hid_host_ctx->kbIndev     : nullptr;
             lv_indev_t* saved_mouse  = hid_host_ctx ? hid_host_ctx->mouseIndev  : nullptr;
             lv_obj_t*   saved_cursor = hid_host_ctx ? hid_host_ctx->mouseCursor : nullptr;
             QueueHandle_t saved_queue = hid_host_key_queue;
@@ -694,6 +924,10 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
             hid_host_mouse_y.store(0);
             hid_host_mouse_btn.store(false);
             hid_host_mouse_active.store(false);
+            if (hid_host_connect_retry_timer != nullptr) {
+                esp_timer_stop(hid_host_connect_retry_timer);
+            }
+            hid_host_connect_retry_scheduled = false;
 
             Device* dev;
             if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
@@ -706,15 +940,17 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
                 device_put(dev);
             }
 
-            getMainDispatcher().dispatch([saved_kb, saved_mouse, saved_cursor, saved_queue] {
+            getMainDispatcher().dispatch([saved_mouse, saved_cursor, saved_queue] {
+                // Detach the keyboard indev / unregister the KEYBOARD_TYPE device BEFORE freeing
+                // the queue that its read_key drains. device_stop() fires DEVICE_EVENT_STOPPING,
+                // which the KeyboardDeviceListener handles by removing the LVGL indev (taking the
+                // LVGL lock itself), so this must run before we take the lock below.
+                btHostKbDeviceDestruct();
+
                 if (!lvgl_try_lock(1000)) {
                     LOG_W(TAG, "Failed to acquire LVGL lock for indev cleanup");
                     if (saved_queue) vQueueDelete(saved_queue);
                     return;
-                }
-                if (saved_kb) {
-                    lvgl_hardware_keyboard_remove_custom(saved_kb);
-                    lv_indev_delete(saved_kb);
                 }
                 if (saved_mouse)  lv_indev_delete(saved_mouse);
                 if (saved_cursor) lv_obj_delete(saved_cursor);
@@ -750,13 +986,13 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
                     for (const auto& rpt : ctx.inputRpts) {
                         if (rpt.valHandle != event->notify_rx.attr_handle) continue;
                         switch (rpt.type) {
-                            case HidReportType::Keyboard:  hidHostHandleKeyboardReport(buf, len); break;
+                            case HidReportType::Keyboard:  hidHostHandleKeyboardReport(ctx, buf, len); break;
                             case HidReportType::Mouse:     hidHostHandleMouseReport(buf, len); break;
                             case HidReportType::Consumer:
                                 LOG_I(TAG, "Consumer report len=%d", len);
                                 break;
                             case HidReportType::Unknown:
-                                if      (len >= 6) hidHostHandleKeyboardReport(buf, len);
+                                if      (len >= 6) hidHostHandleKeyboardReport(ctx, buf, len);
                                 else if (len >= 3) hidHostHandleMouseReport(buf, len);
                                 break;
                         }
@@ -831,12 +1067,43 @@ void hidHostConnect(const std::array<uint8_t, 6>& addr) {
         }
     }
 
+    hidHostConnectInitiate();
+}
+
+// Retry callback: the controller was busy (name-resolution or a prior connect), so re-attempt the
+// connect now that it may have freed up.
+static void hidHostConnectRetryCb(void* /*arg*/) {
+    hid_host_connect_retry_scheduled = false;
+    if (hid_host_ctx) {
+        LOG_I(TAG, "Retrying HID host connect");
+        hidHostConnectInitiate();
+    }
+}
+
+static void hidHostConnectInitiate() {
+    if (hid_host_ctx == nullptr) {
+        return;
+    }
+
+    // Stop any running scan before initiating a central connection. The BLE controller cannot scan
+    // and connect simultaneously, so cancel discovery first to free the controller.
+    {
+        Device* scan_dev = nullptr;
+        if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &scan_dev) == ERROR_NONE) {
+            if (bluetooth_is_scanning(scan_dev)) {
+                LOG_I(TAG, "Stopping active scan before HID host connect");
+                bluetooth_scan_stop(scan_dev);
+            }
+            device_put(scan_dev);
+        }
+    }
+
     // Look up the addr_type from the cached scan results.
     ble_addr_t ble_addr = {};
     ble_addr.type = BLE_ADDR_PUBLIC;
-    std::memcpy(ble_addr.val, addr.data(), 6);
+    std::memcpy(ble_addr.val, hid_host_ctx->peerAddr.data(), 6);
     uint8_t addr_type = 0;
-    if (getCachedScanAddrType(addr.data(), &addr_type)) {
+    if (getCachedScanAddrType(hid_host_ctx->peerAddr.data(), &addr_type)) {
         ble_addr.type = addr_type;
     }
 
@@ -845,10 +1112,33 @@ void hidHostConnect(const std::array<uint8_t, 6>& addr) {
         own_addr_type = BLE_OWN_ADDR_PUBLIC;
     }
 
+    // Create the EALREADY retry timer lazily.
+    if (hid_host_connect_retry_timer == nullptr) {
+        esp_timer_create_args_t retry_args = {};
+        retry_args.callback        = hidHostConnectRetryCb;
+        retry_args.dispatch_method = ESP_TIMER_TASK;
+        retry_args.name            = "hid_connect_retry";
+        if (esp_timer_create(&retry_args, &hid_host_connect_retry_timer) != ESP_OK) {
+            LOG_W(TAG, "Failed to create connect retry timer");
+            hid_host_connect_retry_timer = nullptr;
+        }
+    }
+
     int rc = ble_gap_connect(own_addr_type, &ble_addr, 5000, nullptr, hidHostGapCb, nullptr);
     if (rc != 0) {
+        if (rc == BLE_HS_EALREADY) {
+            // Controller already connecting (name-resolution or a concurrent attempt). Retry
+            // shortly instead of failing silently — this is what made a tap appear to do nothing.
+            LOG_W(TAG, "Connect busy (EALREADY) — retrying in 500ms");
+            if (hid_host_connect_retry_timer != nullptr && !hid_host_connect_retry_scheduled) {
+                hid_host_connect_retry_scheduled = true;
+                esp_timer_stop(hid_host_connect_retry_timer);
+                esp_timer_start_once(hid_host_connect_retry_timer, 500 * 1000);
+            }
+            return;
+        }
         LOG_W(TAG, "ble_gap_connect failed rc=%d", rc);
-        fireHidHostFailure(addr);
+        fireHidHostFailure(hid_host_ctx->peerAddr);
         hid_host_ctx.reset();
         Device* dev;
         if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
@@ -862,6 +1152,10 @@ void hidHostConnect(const std::array<uint8_t, 6>& addr) {
             device_put(dev);
         }
     } else {
+        if (hid_host_connect_retry_timer != nullptr) {
+            esp_timer_stop(hid_host_connect_retry_timer);
+        }
+        hid_host_connect_retry_scheduled = false;
         LOG_I(TAG, "Connecting...");
     }
 }
