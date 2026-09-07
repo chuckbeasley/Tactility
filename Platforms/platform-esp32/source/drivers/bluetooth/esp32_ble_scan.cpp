@@ -21,6 +21,61 @@ constexpr auto* TAG = "esp32_ble_scan";
 // Using BleCtx* (not Device*) so we avoid keeping a static Device reference.
 static BleCtx* s_scan_ctx = nullptr;
 
+// Cap how many unnamed peers we connect to in a single name-resolution chain. A pathological,
+// extremely dense RF environment (many dozens of BLE devices) would otherwise connect to every one
+// of them one at a time, keeping the radio/CPU saturated and churning GATT buffers for a long
+// time — which on a memory-tight device can drive it toward an OOM/assert crash. Bounding the
+// chain keeps the scan responsive and the peak allocation bounded while still resolving names for
+// every realistic environment (the driver's own scan_results[] is capped at 64, so 60 lets a full
+// scan resolve names for essentially every device; only >60 unnameable devices trip the bound).
+static constexpr size_t BLE_NAME_RESOLVE_MAX = 60;
+static size_t s_name_resolve_count = 0;
+
+// ---- Persistent device-name cache ----
+// Once a peer's name is resolved via GATT, remember it here so later scans can fill it in from the
+// cached copy instead of reconnecting to the device each time. This avoids re-spending the connect
+// + read-by-uuid + terminate cycle (and its transient GATT/connection buffers) for devices whose
+// name we already know, which keeps repeated scans fast and the peak memory bounded. The cache is
+// small and fixed-size; it persists across scans and app launches.
+static constexpr size_t NAME_CACHE_MAX = 64;
+static constexpr size_t CACHE_NAME_MAX = 64; // most BLE names fit well under this; keeps the table small
+struct CachedName {
+    ble_addr_t addr;
+    char name[CACHE_NAME_MAX + 1];
+};
+static CachedName s_name_cache[NAME_CACHE_MAX];
+static size_t s_name_cache_count = 0;
+
+static const char* cache_lookup_name(const ble_addr_t* addr) {
+    for (size_t i = 0; i < s_name_cache_count; ++i) {
+        if (s_name_cache[i].addr.type == addr->type &&
+            memcmp(s_name_cache[i].addr.val, addr->val, 6) == 0) {
+            return s_name_cache[i].name;
+        }
+    }
+    return nullptr;
+}
+
+static void cache_store_name(const ble_addr_t* addr, const char* name) {
+    if (name == nullptr || name[0] == '\0') {
+        return;
+    }
+    for (size_t i = 0; i < s_name_cache_count; ++i) {
+        if (s_name_cache[i].addr.type == addr->type &&
+            memcmp(s_name_cache[i].addr.val, addr->val, 6) == 0) {
+            strncpy(s_name_cache[i].name, name, CACHE_NAME_MAX);
+            s_name_cache[i].name[CACHE_NAME_MAX] = '\0';
+            return;
+        }
+    }
+    if (s_name_cache_count < NAME_CACHE_MAX) {
+        s_name_cache[s_name_cache_count].addr = *addr;
+        strncpy(s_name_cache[s_name_cache_count].name, name, CACHE_NAME_MAX);
+        s_name_cache[s_name_cache_count].name[CACHE_NAME_MAX] = '\0';
+        s_name_cache_count++;
+    }
+}
+
 // ---- Scan data helpers ----
 
 void ble_scan_clear_results(struct Device* device) {
@@ -53,6 +108,12 @@ int ble_gap_disc_event_handler(struct ble_gap_event* event, void* arg) {
                 if (fields.name != nullptr && fields.name_len > 0) {
                     size_t copy_len = std::min<size_t>(fields.name_len, BT_NAME_MAX);
                     memcpy(record.name, fields.name, copy_len);
+                    record.name[copy_len] = '\0';
+                } else if (const char* cached = cache_lookup_name(&disc.addr)) {
+                    // Already resolved in a prior scan — use the cached name so name-resolution
+                    // skips this peer and we avoid reconnecting to it.
+                    size_t copy_len = std::min<size_t>(strlen(cached), BT_NAME_MAX);
+                    memcpy(record.name, cached, copy_len);
                     record.name[copy_len] = '\0';
                 }
                 // Capture manufacturer-specific data (company ID + payload) so consumers such as
@@ -133,6 +194,10 @@ static int name_read_callback(uint16_t conn_handle, const struct ble_gatt_error*
                     ctx->scan_results[idx].name[len] = '\0';
                     LOG_I(TAG, "Name resolved (idx=%u): %s", (unsigned)idx, name_buf);
                 }
+                // Remember it so a later scan fills the name from the cache instead of reconnecting.
+                if (idx < ctx->scan_count) {
+                    cache_store_name(&ctx->scan_addrs[idx], name_buf);
+                }
                 BtPeerRecord record = (idx < ctx->scan_count) ? ctx->scan_results[idx] : BtPeerRecord{};
                 xSemaphoreGive(ctx->scan_mutex);
 
@@ -188,6 +253,12 @@ void ble_resolve_next_unnamed_peer(struct Device* device, size_t start_idx) {
     BleCtx* ctx = ble_get_ctx(device);
     s_scan_ctx = ctx;
 
+    // Fresh chain (called with 0 at scan completion): reset the cap counter. Re-entrant calls
+    // (on disconnect / connect-fail) pass the next index, which is always > 0.
+    if (start_idx == 0) {
+        s_name_resolve_count = 0;
+    }
+
     // Skip if a profile server or HID host connection attempt is active —
     // initiating a central connection simultaneously would fail (BLE_HS_EALREADY).
     if (ble_midi_get_active(device) || ble_spp_get_active(device) ||
@@ -236,6 +307,17 @@ void ble_resolve_next_unnamed_peer(struct Device* device, size_t start_idx) {
         }
         xSemaphoreGive(ctx->scan_mutex);
 
+        // Stop the chain once the cap is reached (checked after releasing the mutex so we never
+        // return while holding it). Devices past the cap keep their address-only row.
+        if (found && s_name_resolve_count >= BLE_NAME_RESOLVE_MAX) {
+            LOG_I(TAG, "Name resolution: capped at %u devices", (unsigned)BLE_NAME_RESOLVE_MAX);
+            ble_set_scan_active(device, false);
+            struct BtEvent e = {};
+            e.type = BT_EVENT_SCAN_FINISHED;
+            ble_publish_event(device, e);
+            return;
+        }
+
         if (!radio_on) {
             LOG_I(TAG, "Name resolution: aborting (radio not on)");
             ble_set_scan_active(device, false);
@@ -255,6 +337,7 @@ void ble_resolve_next_unnamed_peer(struct Device* device, size_t start_idx) {
         }
 
         if (rc == 0) {
+            s_name_resolve_count++;
             return; // name_res_gap_callback continues the chain
         }
 
