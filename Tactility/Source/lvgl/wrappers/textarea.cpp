@@ -12,6 +12,12 @@ lv_obj_t* __wrap_lv_textarea_create(lv_obj_t* parent) {
 
     if (lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT) {
         lv_obj_set_style_pad_all(textarea, 2, LV_STATE_DEFAULT);
+        lv_obj_set_height(textarea, 18);
+    } else {
+        // Uniform height for single-line inputs so they match the settings buttons/switches.
+        // Multi-line editors (e.g. Notes) set their own height and override this.
+        lv_obj_set_style_pad_ver(textarea, 4, LV_STATE_DEFAULT);
+        lv_obj_set_height(textarea, 28);
     }
 
     auto* software_keyboard = lvgl_software_keyboard_get_last();

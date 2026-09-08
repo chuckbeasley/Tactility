@@ -13,6 +13,11 @@ lv_obj_t* __wrap_lv_dropdown_create(lv_obj_t* parent) {
 
     if (lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT) {
         lv_obj_set_style_pad_all(dropdown, 2, LV_STATE_DEFAULT);
+        lv_obj_set_height(dropdown, 18);
+    } else {
+        // Uniform height so dropdowns match the settings buttons/switches.
+        lv_obj_set_style_pad_ver(dropdown, 4, LV_STATE_DEFAULT);
+        lv_obj_set_height(dropdown, 28);
     }
 
     lv_obj_set_style_border_width(dropdown, 1, LV_PART_MAIN);
