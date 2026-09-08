@@ -304,7 +304,7 @@ static void rebuildObserverLog(Context* ctx) {
         text += hexBytes(e.adv_data, e.adv_len);
         text += "\n";
     }
-    lv_label_set_text(ctx->obsLogLabel, text.c_str());
+    lv_textarea_set_text(ctx->obsLogLabel, text.c_str());
 }
 
 // Scan parameters for the observer: raw (no duplicate filter), optionally passive, and no GATT
@@ -802,11 +802,6 @@ static void onClearObserver(lv_event_t* event) {
 }
 
 static void showObserverScreen(Context* ctx) {
-    // Bounded layout: the body is NOT scrollable here, so the log container's flex_grow gets a real
-    // (bounded) height and scrolls internally. This keeps the Start/Stop control always reachable
-    // instead of the log pushing it off-screen.
-    lv_obj_set_scroll_dir(ctx->body, LV_DIR_NONE);
-
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, "Sniffs BLE advertisements.");
     lv_obj_set_width(label, LV_PCT(100));
@@ -814,23 +809,24 @@ static void showObserverScreen(Context* ctx) {
     ctx->statusLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->statusLabel, "Stopped");
 
-    // The frame log scrolls inside a flex_grow container that fills the space between the status
-    // line and the (pinned, bottom) controls. Newest-first (see rebuildObserverLog), so the latest
-    // capture sits at the top of the log.
-    auto* logScroll = lv_obj_create(ctx->body);
-    lv_obj_set_width(logScroll, LV_PCT(100));
-    lv_obj_set_flex_grow(logScroll, 1);
-    lv_obj_set_scroll_dir(logScroll, LV_DIR_VER);
-    lv_obj_set_style_pad_all(logScroll, 0, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(logScroll, LV_OPA_TRANSP, LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(logScroll, 0, LV_STATE_DEFAULT);
+    // The frame log is a read-only lv_textarea: a self-contained scrolling text widget (same
+    // bounded-flex behaviour as the lv_table used by the Scan screen), so it fills the space
+    // between the status line and the controls and scrolls internally instead of growing unbounded
+    // and pushing the Start/Stop button off-screen. Newest-first (see rebuildObserverLog).
+    auto* logText = lv_textarea_create(ctx->body);
+    lv_obj_set_width(logText, LV_PCT(100));
+    lv_obj_set_flex_grow(logText, 1);
+    lv_obj_set_style_pad_all(logText, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(logText, LV_OPA_TRANSP, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(logText, 0, LV_STATE_DEFAULT);
+    lv_textarea_set_text(logText, "No frames yet.");
+    lv_textarea_set_one_line(logText, false);
+    // Read-only log: don't let it grab touch focus (avoids a visible caret / keypad).
+    lv_obj_remove_flag(logText, LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_textarea_set_cursor_click_pos(logText, false);
+    ctx->obsLogLabel = logText; // stored so rebuildObserverLog() can set the text
 
-    ctx->obsLogLabel = lv_label_create(logScroll);
-    lv_label_set_long_mode(ctx->obsLogLabel, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
-    lv_label_set_text(ctx->obsLogLabel, "No frames yet.");
-
-    // Mode row: passive/active toggle (left) + clear (right). Pinned at the bottom.
+    // Mode row: passive/active toggle (left) + clear (right).
     auto* modeRow = lv_obj_create(ctx->body);
     lv_obj_set_width(modeRow, LV_PCT(100));
     lv_obj_set_flex_flow(modeRow, LV_FLEX_FLOW_ROW);
