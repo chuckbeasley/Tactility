@@ -434,8 +434,6 @@ static void onRandomizeSwitch(lv_event_t* event) {
 static void showSpamScreen(Context* ctx) {
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, "Spoofs BLE advertisements.");
-    ctx->spamLabel = lv_label_create(ctx->body);
-    lv_label_set_text(ctx->spamLabel, kPayloads[ctx->currentPayload].label);
 
     // Per-family enable toggles (Apple / Android / Windows / Samsung).
     for (size_t i = 0; i < kFamilyCount; i++) {
@@ -473,8 +471,22 @@ static void showSpamScreen(Context* ctx) {
     lv_obj_center(ctx->startButtonLabel);
     lv_obj_add_event_cb(button, onSpamStartStop, LV_EVENT_SHORT_CLICKED, ctx);
 
-    ctx->statusLabel = lv_label_create(ctx->body);
+    // Status line: the run state on the left, the live spoof name beside it. The payload label is
+    // only populated while running (see onPollTick) so the screen doesn't advertise a device that
+    // isn't being broadcast.
+    auto* statusRow = lv_obj_create(ctx->body);
+    lv_obj_set_width(statusRow, LV_PCT(100));
+    lv_obj_set_flex_flow(statusRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(statusRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(statusRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_scroll_dir(statusRow, LV_DIR_NONE);
+
+    ctx->statusLabel = lv_label_create(statusRow);
     lv_label_set_text(ctx->statusLabel, "Stopped");
+
+    ctx->spamLabel = lv_label_create(statusRow);
+    lv_label_set_text(ctx->spamLabel, "");
+    lv_obj_set_style_pad_left(ctx->spamLabel, 20, LV_STATE_DEFAULT);
 }
 
 // ---- AirTag monitor ----
@@ -576,7 +588,8 @@ static void onPollTick(Context* ctx) {
         lv_label_set_text(ctx->countLabel, std::format("{} devices", (unsigned)ctx->scanPeers.size()).c_str());
     }
     if (ctx->screen == Screen::Spam && ctx->spamLabel != nullptr) {
-        lv_label_set_text(ctx->spamLabel, kPayloads[ctx->currentPayload].label);
+        // Show the live spoof name only while actively broadcasting; keep it blank when stopped.
+        lv_label_set_text(ctx->spamLabel, ctx->spamRunning ? kPayloads[ctx->currentPayload].label : "");
     }
     lvgl_unlock();
 }
