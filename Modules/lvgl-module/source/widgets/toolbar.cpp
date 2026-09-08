@@ -194,6 +194,14 @@ void lvgl_toolbar_set_title(lv_obj_t* obj, const char* title) {
 
 void lvgl_toolbar_set_nav_action(lv_obj_t* obj, const char* icon, lv_event_cb_t callback, void* user_data) {
     auto* toolbar = reinterpret_cast<Toolbar*>(obj);
+    // The default nav action (the app-agnostic "stop app" fallback) is registered on the close
+    // button at creation. If the app supplies its own nav action it must fully replace that
+    // fallback - otherwise the button fires BOTH the app's handler (e.g. go back one level) and
+    // the default app-close, which sends multi-screen apps straight to the launcher whenever the
+    // user presses back from a sub-screen.
+    if (callback != &default_nav_action) {
+        lv_obj_remove_event_cb(toolbar->close_button, &default_nav_action);
+    }
     lv_obj_add_event_cb(toolbar->close_button, callback, LV_EVENT_SHORT_CLICKED, user_data);
     lv_image_set_src(toolbar->close_button_image, icon); // e.g. LV_SYMBOL_CLOSE
 }
