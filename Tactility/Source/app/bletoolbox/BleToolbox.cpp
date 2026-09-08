@@ -797,10 +797,10 @@ static void showObserverScreen(Context* ctx) {
     // bounded, self-scrolling widget the Scan screen uses.
     ctx->obsLogLabel = lv_table_create(ctx->body);
     lv_table_set_column_count(ctx->obsLogLabel, 4);
-    lv_table_set_column_width(ctx->obsLogLabel, 0, 58);
-    lv_table_set_column_width(ctx->obsLogLabel, 1, 48);
-    lv_table_set_column_width(ctx->obsLogLabel, 2, 122);
-    lv_table_set_column_width(ctx->obsLogLabel, 3, 220);
+    lv_table_set_column_width(ctx->obsLogLabel, 0, 72);
+    lv_table_set_column_width(ctx->obsLogLabel, 1, 40);
+    lv_table_set_column_width(ctx->obsLogLabel, 2, 144);
+    lv_table_set_column_width(ctx->obsLogLabel, 3, 208);
     // Compact rows: shrink vertical cell padding so more records fit on the small display.
     lv_obj_set_style_pad_ver(ctx->obsLogLabel, 2, LV_PART_ITEMS);
     lv_obj_set_style_pad_left(ctx->obsLogLabel, 4, LV_PART_ITEMS);
@@ -808,7 +808,9 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_pad_top(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
-    lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
+    // Explicit height that fills the space above the buttons/footer. flex_grow proved unreliable for
+    // making the table expand here, so the height is fixed to fill the 480x320 body.
+    lv_obj_set_height(ctx->obsLogLabel, 164);
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_table_set_row_count(ctx->obsLogLabel, 1);
@@ -828,19 +830,19 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_scroll_dir(bottomRow, LV_DIR_NONE);
 
     auto* startBtn = lv_button_create(bottomRow);
-    lv_obj_set_width(startBtn, LV_PCT(50));
+    lv_obj_set_width(startBtn, LV_PCT(48));
     lv_obj_set_height(startBtn, 32);
     lv_obj_set_style_pad_all(startBtn, 0, LV_STATE_DEFAULT);
     ctx->startButtonLabel = lv_label_create(startBtn);
     lv_label_set_text(ctx->startButtonLabel, "Start Observing");
     lv_obj_center(ctx->startButtonLabel);
+    lv_obj_set_style_text_letter_space(ctx->startButtonLabel, 0, LV_STATE_DEFAULT);
     lv_obj_add_event_cb(startBtn, onStartObserver, LV_EVENT_SHORT_CLICKED, ctx);
 
     auto* clearBtn = lv_button_create(bottomRow);
-    lv_obj_set_width(clearBtn, LV_PCT(50));
+    lv_obj_set_width(clearBtn, LV_PCT(48));
     lv_obj_set_height(clearBtn, 32);
     lv_obj_set_style_pad_all(clearBtn, 0, LV_STATE_DEFAULT);
-    lv_obj_set_style_pad_left(clearBtn, 8, LV_STATE_DEFAULT);
     auto* clearLabel = lv_label_create(clearBtn);
     lv_label_set_text(clearLabel, "Clear");
     lv_obj_center(clearLabel);
