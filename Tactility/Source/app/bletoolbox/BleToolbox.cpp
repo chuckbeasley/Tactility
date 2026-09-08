@@ -784,6 +784,10 @@ static void onClearObserver(lv_event_t* event) {
     if (ctx->dev != nullptr && bluetooth_is_scanning(ctx->dev)) {
         bluetooth_scan_stop(ctx->dev);
     }
+    // Rebuild the table immediately. This callback runs on the LVGL task (so it's safe to touch the
+    // widgets here); clearing obsEntries would otherwise only be picked up by the app main loop the
+    // next time it wakes, which won't happen once scanning stops.
+    rebuildObserverLog(ctx);
     ctx->uiDirty = true;
 }
 
