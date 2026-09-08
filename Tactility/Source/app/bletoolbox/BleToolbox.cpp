@@ -382,7 +382,6 @@ static void onBackPressed(lv_event_t* event) {
 static void addMenuButton(Context* ctx, const char* text, void (*cb)(lv_event_t*)) {
     auto* btn = lv_button_create(ctx->body);
     lv_obj_set_width(btn, LV_PCT(100));
-    lv_obj_set_height(btn, 44);
     auto* label = lv_label_create(btn);
     lv_label_set_text(label, text);
     lv_obj_center(label);
@@ -494,11 +493,11 @@ static void showSpamScreen(Context* ctx) {
     // Randomize address toggle.
     auto* btn = lv_button_create(ctx->body);
     lv_obj_set_width(btn, LV_PCT(100));
-    lv_obj_set_height(btn, 40);
     auto* btnLabel = lv_label_create(btn);
     lv_label_set_text(btnLabel, "Randomize address");
     lv_obj_center(btnLabel);
     auto* sw = lv_switch_create(btn);
+    lv_obj_set_size(sw, 40, 22);
     lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -8, 0);
     if (ctx->randomizeAddress) {
         lv_obj_add_state(sw, LV_STATE_CHECKED);

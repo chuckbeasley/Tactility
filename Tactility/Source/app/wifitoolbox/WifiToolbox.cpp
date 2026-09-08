@@ -729,7 +729,6 @@ static void onBackPressed(lv_event_t* event) {
 static void addMenuButton(Context* ctx, const char* text, void (*cb)(lv_event_t*)) {
     auto* btn = lv_button_create(ctx->body);
     lv_obj_set_width(btn, LV_PCT(100));
-    lv_obj_set_height(btn, 44);
     auto* label = lv_label_create(btn);
     lv_label_set_text(label, text);
     lv_obj_center(label);

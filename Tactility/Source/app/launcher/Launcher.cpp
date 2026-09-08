@@ -64,6 +64,9 @@ lv_obj_t* createAppButton(lv_obj_t* parent, UiDensity uiDensity, const char* ima
     const auto button_size = lvgl_get_launcher_icon_font_height();
     const auto button_padding = getButtonPadding(uiDensity, button_size);
     auto* apps_button = lv_button_create(parent);
+    // The launcher buttons are transparent icon buttons sized by their icon; opt out of the
+    // global uniform button height so the icon isn't clipped.
+    lv_obj_set_height(apps_button, LV_SIZE_CONTENT);
     lv_obj_set_ext_click_area(apps_button, ICON_BUTTON_HIT_SLOP);
 
     lv_obj_set_style_pad_all(apps_button, static_cast<int32_t>(button_padding), LV_STATE_DEFAULT);
@@ -196,6 +199,7 @@ void createWidgets(lv_obj_t* parent, void*) {
     // button stays in the launcher; the confirmation flow lives in the PowerOff app.
     if (shouldShowPowerButton()) {
         auto* power_button = lv_button_create(parent);
+        lv_obj_set_height(power_button, LV_SIZE_CONTENT);
         lv_obj_set_ext_click_area(power_button, ICON_BUTTON_HIT_SLOP);
         lv_obj_set_style_pad_all(power_button, 8, 0);
         lv_obj_align(power_button, LV_ALIGN_BOTTOM_MID, 0, -10);
