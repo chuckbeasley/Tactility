@@ -497,8 +497,7 @@ static void showSpamScreen(Context* ctx) {
     lv_label_set_text(btnLabel, "Randomize address");
     lv_obj_center(btnLabel);
     auto* sw = lv_switch_create(btn);
-    lv_obj_set_size(sw, 40, 22);
-    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -8, 0);
+        lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -8, 0);
     if (ctx->randomizeAddress) {
         lv_obj_add_state(sw, LV_STATE_CHECKED);
     }
