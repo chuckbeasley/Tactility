@@ -94,9 +94,15 @@ bool initPartitionsEsp() {
     ESP_ERROR_CHECK(initNvsFlashSafely());
 
     const esp_vfs_fat_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
+        .format_if_mount_failed = true,
         .max_files = 4,
-        .allocation_unit_size = getSectorSize(),
+        // The data partition is FatFS over a wear-levelling block device whose internal block size
+        // is a full flash erase sector (4 KiB). 512-byte clusters leave FAT-chain updates not
+        // aligned across flash sectors, which corrupted every file larger than a single 512-byte
+        // sector (external-app ELFs truncated to 512 readable bytes). Align clusters to the
+        // 4 KiB block so chain updates land whole on flash sectors, and reformat on mount when the
+        // on-disk FAT is bad/blank so a clean, correctly-shaped volume is created.
+        .allocation_unit_size = 4096,
         .disk_status_check_enable = false,
         .use_one_fat = true,
     };
