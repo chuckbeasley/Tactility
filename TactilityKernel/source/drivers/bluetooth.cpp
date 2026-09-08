@@ -34,6 +34,10 @@ error_t bluetooth_scan_start(struct Device* device) {
     return BT_API(device)->scan_start(device);
 }
 
+error_t bluetooth_scan_start_params(struct Device* device, const struct BtScanParams* params) {
+    return BT_API(device)->scan_start_params(device, params);
+}
+
 error_t bluetooth_scan_stop(struct Device* device) {
     return BT_API(device)->scan_stop(device);
 }

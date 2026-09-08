@@ -44,6 +44,9 @@ struct BleCtx {
     // Radio / scan state (atomic — read from multiple tasks)
     std::atomic<BtRadioState> radio_state;
     std::atomic<bool>         scan_active;
+    // Set when the active scan should skip post-scan GATT name resolution (e.g. a passive
+    // observer/sniffer must stay non-intrusive and must not initiate central connections).
+    std::atomic<bool>         scan_resolve_names;
     // Set by Tactility HID host to prevent simultaneous central connection during name resolution
     std::atomic<bool>         hid_host_active;
 

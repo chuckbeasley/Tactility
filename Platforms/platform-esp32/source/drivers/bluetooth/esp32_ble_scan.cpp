@@ -103,6 +103,17 @@ int ble_gap_disc_event_handler(struct ble_gap_event* event, void* arg) {
             record.paired    = false;
             record.connected = false;
 
+            // Advertising PDU type / connectability (raw HCI -> normalized BtAdvType).
+            switch (disc.event_type) {
+                case BLE_HCI_ADV_RPT_EVTYPE_ADV_IND:     record.adv_type = BT_ADV_TYPE_IND;      break;
+                case BLE_HCI_ADV_RPT_EVTYPE_DIR_IND:     record.adv_type = BT_ADV_TYPE_DIRECT;    break;
+                case BLE_HCI_ADV_RPT_EVTYPE_SCAN_IND:    record.adv_type = BT_ADV_TYPE_SCAN_IND;  break;
+                case BLE_HCI_ADV_RPT_EVTYPE_NONCONN_IND: record.adv_type = BT_ADV_TYPE_NONCONN;   break;
+                case BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP:    record.adv_type = BT_ADV_TYPE_SCAN_RSP;  break;
+                default:                                  record.adv_type = BT_ADV_TYPE_UNKNOWN;   break;
+            }
+            record.tx_power = 0x7F; // "not present" sentinel
+
             struct ble_hs_adv_fields fields;
             if (ble_hs_adv_parse_fields(&fields, disc.data, disc.length_data) == 0) {
                 if (fields.name != nullptr && fields.name_len > 0) {
@@ -116,6 +127,11 @@ int ble_gap_disc_event_handler(struct ble_gap_event* event, void* arg) {
                     memcpy(record.name, cached, copy_len);
                     record.name[copy_len] = '\0';
                 }
+                // Advertising flags (flags field is always present in the struct; 0 if absent).
+                record.adv_flags = fields.flags;
+                if (fields.tx_pwr_lvl_is_present) {
+                    record.tx_power = fields.tx_pwr_lvl;
+                }
                 // Capture manufacturer-specific data (company ID + payload) so consumers such as
                 // the BLE Toolbox AirTag monitor can classify Apple 0x004C devices by their
                 // 0x12 offline-finding ("Nearby Info") advertisement type.
@@ -124,6 +140,23 @@ int ble_gap_disc_event_handler(struct ble_gap_event* event, void* arg) {
                     memcpy(record.manuf_data, fields.mfg_data, mlen);
                     record.manuf_len = static_cast<uint8_t>(mlen);
                 }
+                // 16-bit Service Data AD (type 0x16) — Eddystone (0xFEAA) and other service-data
+                // beacons/telemetry. The field carries [2-byte UUID LE][payload].
+                if (fields.svc_data_uuid16 != nullptr && fields.svc_data_uuid16_len >= 2) {
+                    record.svc_uuid16 = static_cast<uint16_t>(fields.svc_data_uuid16[0] |
+                                                              (fields.svc_data_uuid16[1] << 8));
+                    uint8_t payload_len = static_cast<uint8_t>(fields.svc_data_uuid16_len - 2);
+                    size_t copy_len = std::min<size_t>(payload_len, sizeof(record.svc_data));
+                    memcpy(record.svc_data, fields.svc_data_uuid16 + 2, copy_len);
+                    record.svc_data_len = static_cast<uint8_t>(copy_len);
+                }
+            }
+
+            // Keep the raw advertising payload so a sniffer/observer can render hex and decode
+            // fields that aren't surfaced as named members above.
+            record.adv_len = std::min<uint8_t>(disc.length_data, sizeof(record.adv_data));
+            if (record.adv_len > 0) {
+                memcpy(record.adv_data, disc.data, record.adv_len);
             }
 
             {
@@ -157,9 +190,17 @@ int ble_gap_disc_event_handler(struct ble_gap_event* event, void* arg) {
 
         case BLE_GAP_EVENT_DISC_COMPLETE:
             LOG_I(TAG, "Scan complete (reason=%d)", event->disc_complete.reason);
-            // Keep scan_active=true; resolveNextUnnamedPeer clears it and fires ScanFinished
-            // once name resolution finishes, so the UI spinner stays active throughout.
-            ble_resolve_next_unnamed_peer(device, 0);
+            if (ctx->scan_resolve_names.load()) {
+                // Keep scan_active=true; resolveNextUnnamedPeer clears it and fires ScanFinished
+                // once name resolution finishes, so the UI spinner stays active throughout.
+                ble_resolve_next_unnamed_peer(device, 0);
+            } else {
+                // Observer/sniffer mode: stay non-intrusive, finish immediately without connecting.
+                ble_set_scan_active(device, false);
+                struct BtEvent e = {};
+                e.type = BT_EVENT_SCAN_FINISHED;
+                ble_publish_event(device, e);
+            }
             break;
 
         default:

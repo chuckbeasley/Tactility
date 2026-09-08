@@ -904,7 +904,7 @@ static error_t api_set_radio_enabled(struct Device* device, bool enabled) {
     return ERROR_NONE;
 }
 
-static error_t api_scan_start(struct Device* device) {
+static error_t api_scan_start_params(struct Device* device, const struct BtScanParams* params) {
     BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
     if (!ctx) return ERROR_INVALID_STATE;
 
@@ -920,8 +920,18 @@ static error_t api_scan_start(struct Device* device) {
     ble_scan_clear_results(device);
 
     struct ble_gap_disc_params disc_params = {};
-    disc_params.passive         = 0;
-    disc_params.filter_duplicates = 1;
+    if (params) {
+        disc_params.passive            = params->passive ? 1 : 0;
+        disc_params.filter_duplicates  = params->filter_duplicates ? 1 : 0;
+        disc_params.itvl               = params->itvl;
+        disc_params.window             = params->window;
+        // A passive observer must stay non-intrusive: no central connections to resolve names.
+        ctx->scan_resolve_names.store(params->resolve_names);
+    } else {
+        disc_params.passive           = 0;
+        disc_params.filter_duplicates = 1;
+        ctx->scan_resolve_names.store(true);
+    }
 
     uint8_t own_addr_type;
     ble_hs_id_infer_auto(0, &own_addr_type);
@@ -939,6 +949,10 @@ static error_t api_scan_start(struct Device* device) {
         ble_publish_event(device, e);
     }
     return ERROR_NONE;
+}
+
+static error_t api_scan_start(struct Device* device) {
+    return api_scan_start_params(device, nullptr);
 }
 
 static error_t api_scan_stop(struct Device* device) {
@@ -1169,6 +1183,7 @@ const BluetoothApi nimble_bluetooth_api = {
     .get_radio_state        = api_get_radio_state,
     .set_radio_enabled      = api_set_radio_enabled,
     .scan_start             = api_scan_start,
+    .scan_start_params      = api_scan_start_params,
     .scan_stop              = api_scan_stop,
     .is_scanning            = api_is_scanning,
     .pair                   = api_pair,
@@ -1220,6 +1235,7 @@ static error_t esp32_ble_start_device(struct Device* device) {
     ctx->subscriptions = nullptr;
     ctx->radio_state.store(BT_RADIO_STATE_OFF);
     ctx->scan_active.store(false);
+    ctx->scan_resolve_names.store(true);
     ctx->hid_host_active.store(false);
     ctx->spp_conn_handle.store(BLE_HS_CONN_HANDLE_NONE);
     ctx->spp_active.store(false);

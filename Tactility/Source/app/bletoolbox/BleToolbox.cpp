@@ -24,6 +24,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <format>
 #include <memory>
 #include <string>
@@ -39,7 +40,7 @@ extern const ::AppManifest manifest;
 
 namespace {
 
-enum class Screen { Main, Scan, Spam, Airtag };
+enum class Screen { Main, Scan, Spam, Airtag, Observer };
 
 // AirTag / Apple "Find My" device advertisement signature (from the offline-finding protocol,
 // see "Who Can Find My Devices?", PETS 2021): manufacturer data with Apple company ID 0x004C,
@@ -52,15 +53,44 @@ constexpr uint32_t POLL_INTERVAL_MS = 300;
 constexpr uint32_t SPAM_INTERVAL_MS = 200;
 constexpr size_t MAX_SCAN_RESULTS = 64;
 
+// BLE Observer: a passive/active advertising sniffer. `filter_duplicates = 0` means the radio
+// reports every advertising packet (not just one per address), so a beacon whose telemetry changes
+// between broadcasts (e.g. an Eddystone TLM battery/temperature frame) is captured on every
+// report. We cap the in-memory log so a dense RF environment can't exhaust the heap.
+constexpr size_t OBS_LOG_MAX = 200;
+// Aggressive-but-sane scan window so the observer catches most broadcasts without saturating the
+// controller. Units are NimBLE scan intervals (0.625 ms): 0x0040 => 40 ms.
+constexpr uint16_t OBS_SCAN_ITVL = 0x0040;
+constexpr uint16_t OBS_SCAN_WINDOW = 0x0030;
+
 // A device discovered during scan/monitor. `manuf` carries the advertisement manufacturer bytes.
 struct Peer {
     std::array<uint8_t, 6> addr;
     char name[BT_NAME_MAX + 1];
     int8_t rssi;
     uint8_t addr_type;
-    uint8_t manuf[24];
+    uint8_t manuf[32];
     uint8_t manuf_len;
     uint32_t seenCount;
+};
+
+// One raw advertising report captured by the BLE Observer (a "sniffer" frame). Unlike the scan
+// tables, these are NOT de-duplicated by address, so a busy beacon fills the log with every packet.
+struct ObsEntry {
+    std::array<uint8_t, 6> addr;
+    uint8_t addr_type;
+    int8_t rssi;
+    uint8_t adv_type;
+    uint8_t manuf[32];
+    uint8_t manuf_len;
+    uint16_t svc_uuid16;
+    uint8_t svc_data[24];
+    uint8_t svc_data_len;
+    uint8_t adv_data[31];
+    uint8_t adv_len;
+    char name[BT_NAME_MAX + 1];
+    // Milliseconds since the observer started (for a per-frame timestamp).
+    uint32_t uptimeMs;
 };
 
 struct Context {
@@ -74,6 +104,11 @@ struct Context {
     bool scanRunning = false;
     bool airtagRunning = false;
     bool spamRunning = false;
+    // BLE Observer (advertising sniffer). Uses the same scan subscription but with a raw,
+    // non-de-duplicated, optionally passive scan, and does NOT do GATT name resolution.
+    bool obsRunning = false;
+    bool obsPassive = false;
+    uint32_t obsStartMs = 0;
     size_t currentPayload = 0;
     bool randomizeAddress = true;
     // Which spoof families are on (Apple, Android, Windows, Samsung). All on by default. Written
@@ -83,6 +118,8 @@ struct Context {
     std::vector<Peer> scanPeers;
     std::vector<Peer> airtagPeers;
     uint32_t scanCount = 0;
+
+    std::deque<ObsEntry> obsEntries;
 
     std::unique_ptr<Timer> pollTimer;
     std::unique_ptr<Timer> spamTimer;
@@ -94,9 +131,13 @@ struct Context {
     lv_obj_t* list = nullptr;
     lv_obj_t* startButtonLabel = nullptr;
     lv_obj_t* spamLabel = nullptr;
+    lv_obj_t* obsLogLabel = nullptr;
+    lv_obj_t* obsModeLabel = nullptr;
+    lv_obj_t* obsScroll = nullptr;
 
     bool uiDirty = false;
     bool listDirty = false;
+    bool obsDirty = false;
 };
 
 // ---- Helpers ----
@@ -163,6 +204,129 @@ static const char* deviceNameOrType(const Peer& peer) {
     return "-";
 }
 
+// ---- BLE Observer (advertising sniffer) helpers ----
+
+static const char* advTypeToString(uint8_t type) {
+    switch (type) {
+        case BT_ADV_TYPE_IND:      return "CONN ";   // connectable undirected
+        case BT_ADV_TYPE_SCAN_IND: return "SCANN";   // scannable undirected
+        case BT_ADV_TYPE_NONCONN:  return "NCONN";   // non-connectable beacon
+        case BT_ADV_TYPE_DIRECT:   return "DIR  ";   // connectable directed
+        case BT_ADV_TYPE_SCAN_RSP: return "RSP  ";   // scan response
+        default:                   return "?    ";
+    }
+}
+
+static std::string hexBytes(const uint8_t* data, uint8_t len) {
+    std::string out;
+    out.reserve(static_cast<size_t>(len) * 3);
+    for (uint8_t i = 0; i < len; ++i) {
+        char b[4];
+        std::snprintf(b, sizeof(b), "%02x ", data[i]);
+        out += b;
+    }
+    return out;
+}
+
+// Human-readable classification of an advertising frame, from the fields the driver captured.
+static std::string decodeObserverDesc(const ObsEntry& e) {
+    if (e.adv_type == BT_ADV_TYPE_DIRECT) {
+        return "directed";
+    }
+
+    // Apple iBeacon: manufacturer data 0x004C, beacon type 0x02. Layout inside manuf_data:
+    // [0..1] company ID, [2] type, [3..18] proximity UUID, [19..20] major, [21..22] minor,
+    // [23] measured tx power.
+    if (e.manuf_len >= 24 &&
+        e.manuf[0] == APPLE_COMPANY_LO && e.manuf[1] == APPLE_COMPANY_HI &&
+        e.manuf[2] == 0x02) {
+        char uuid[37];
+        int p = 0;
+        for (uint8_t i = 0; i < 16; ++i) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) uuid[p++] = '-';
+            p += std::snprintf(uuid + p, sizeof(uuid) - static_cast<size_t>(p), "%02x", e.manuf[3 + i]);
+        }
+        uuid[p] = '\0';
+        uint16_t major = static_cast<uint16_t>((e.manuf[19] << 8) | e.manuf[20]);
+        uint16_t minor = static_cast<uint16_t>((e.manuf[21] << 8) | e.manuf[22]);
+        return std::format("iBeacon U={} Maj={} Min={} ", uuid, major, minor);
+    }
+
+    // Apple offline-finding (AirTag / Find My): 0x004C + type 0x12.
+    if (isOfflineFinding(e.manuf, e.manuf_len)) {
+        return "Apple FindMy";
+    }
+
+    // Eddystone (service-data UUID 0xFEAA).
+    if (e.svc_uuid16 == 0xFEAA && e.svc_data_len >= 1) {
+        uint8_t frame = e.svc_data[0];
+        if (frame == 0x00 && e.svc_data_len >= 17) {
+            // UID: 16-byte beacon id (10-byte namespace + 6-byte instance), bytes [1..16].
+            return "Eddystone UID " + hexBytes(e.svc_data + 1, 16);
+        } else if (frame == 0x10) {
+            return "Eddystone URL";
+        } else if (frame == 0x20 && e.svc_data_len >= 12) {
+            // TLM: version [1], battery mV [2..3], temperature [4..5] (0.0625 C / unit),
+            // adv-count [6..9], time [10..13].
+            uint16_t batt = static_cast<uint16_t>((e.svc_data[2] << 8) | e.svc_data[3]);
+            int16_t tempRaw = static_cast<int16_t>((e.svc_data[4] << 8) | e.svc_data[5]);
+            char tstr[16];
+            std::snprintf(tstr, sizeof(tstr), "%.1f", tempRaw * 0.0625f);
+            return std::format("Eddystone TLM batt={}mV temp={}C ", batt, tstr);
+        }
+        return "Eddystone";
+    }
+
+    if (e.name[0] != '\0') {
+        return std::format("Name={}", e.name);
+    }
+    return "advert";
+}
+
+// Serialize the observer log as a single wrapped string. Built newest-first so the most recent
+// captures sit at the top of the scroll container and stay visible as the log grows.
+static void rebuildObserverLog(Context* ctx) {
+    if (ctx->obsLogLabel == nullptr) return;
+    std::string text;
+    text.reserve(OBS_LOG_MAX * 96);
+    size_t count = 0;
+    for (auto it = ctx->obsEntries.rbegin(); it != ctx->obsEntries.rend() && count < OBS_LOG_MAX; ++it, ++count) {
+        const ObsEntry& e = *it;
+        char addr[18];
+        formatAddr(e.addr.data(), addr, sizeof(addr));
+        text += std::format("#{:04d} {:6d}ms {} {:4d}dBm {} ",
+            static_cast<unsigned>(count),
+            static_cast<unsigned>(e.uptimeMs),
+            advTypeToString(e.adv_type),
+            static_cast<int>(e.rssi),
+            addr);
+        text += decodeObserverDesc(e);
+        text += "\n   PDU:";
+        text += hexBytes(e.adv_data, e.adv_len);
+        text += "\n";
+    }
+    lv_label_set_text(ctx->obsLogLabel, text.c_str());
+}
+
+// Scan parameters for the observer: raw (no duplicate filter), optionally passive, and no GATT
+// name resolution (a sniffer must stay non-intrusive and not initiate central connections).
+static BtScanParams observerScanParams(const Context* ctx) {
+    BtScanParams p = {};
+    p.passive = ctx->obsPassive;
+    p.filter_duplicates = false;
+    p.resolve_names = false;
+    p.itvl = OBS_SCAN_ITVL;
+    p.window = OBS_SCAN_WINDOW;
+    return p;
+}
+
+// Start an observer scan with the configured params. observerScanParams() returns by value, so we
+// bind it to a named local before taking its address (taking the address of an rvalue is ill-formed).
+static void observerStartScan(Device* dev, const Context* ctx) {
+    BtScanParams params = observerScanParams(ctx);
+    bluetooth_scan_start_params(dev, &params);
+}
+
 // Three-column table of devices: Name | Address | RSSI.
 static void rebuildList(Context* ctx) {
     if (ctx->list == nullptr) return;
@@ -217,6 +381,33 @@ static void onBtEvent(Context* ctx, const BtEvent& event) {
             if (changed) {
                 ctx->listDirty = true;
             }
+
+            // BLE Observer: capture every advertising frame (NOT de-duplicated by address) so a
+            // beacon whose telemetry changes between reports is logged on each report.
+            if (ctx->obsRunning) {
+                ObsEntry obs {};
+                obs.uptimeMs = get_millis() - ctx->obsStartMs;
+                memcpy(obs.addr.data(), event.peer.addr, 6);
+                obs.addr_type = event.peer.addr_type;
+                obs.rssi = event.peer.rssi;
+                obs.adv_type = event.peer.adv_type;
+                obs.manuf_len = event.peer.manuf_len;
+                if (obs.manuf_len > 0) memcpy(obs.manuf, event.peer.manuf_data, obs.manuf_len);
+                obs.svc_uuid16 = event.peer.svc_uuid16;
+                obs.svc_data_len = event.peer.svc_data_len;
+                if (obs.svc_data_len > 0) memcpy(obs.svc_data, event.peer.svc_data, obs.svc_data_len);
+                obs.adv_len = event.peer.adv_len;
+                if (obs.adv_len > 0) memcpy(obs.adv_data, event.peer.adv_data, obs.adv_len);
+                if (event.peer.name[0] != '\0') {
+                    std::strncpy(obs.name, event.peer.name, BT_NAME_MAX);
+                    obs.name[BT_NAME_MAX] = '\0';
+                }
+                if (ctx->obsEntries.size() >= OBS_LOG_MAX) {
+                    ctx->obsEntries.pop_front();
+                }
+                ctx->obsEntries.push_back(std::move(obs));
+                ctx->obsDirty = true;
+            }
             break;
         }
 
@@ -224,18 +415,29 @@ static void onBtEvent(Context* ctx, const BtEvent& event) {
             // Scan can only start once the radio is actually on. If a scan/monitor was requested
             // while the radio was still turning on, kick it off now instead of firing a
             // scan_start() too early (which the driver would drop).
-            if (event.radio_state == BT_RADIO_STATE_ON && (ctx->scanRunning || ctx->airtagRunning) &&
+            if (event.radio_state == BT_RADIO_STATE_ON &&
+                (ctx->scanRunning || ctx->airtagRunning || ctx->obsRunning) &&
                 ctx->dev != nullptr && !bluetooth_is_scanning(ctx->dev)) {
-                bluetooth_scan_start(ctx->dev);
+                if (ctx->obsRunning) {
+                    observerStartScan(ctx->dev, ctx);
+                } else {
+                    bluetooth_scan_start(ctx->dev);
+                }
             }
             break;
 
         case BT_EVENT_SCAN_FINISHED:
-            // For a continuous monitor, immediately restart the next scan cycle.
+            // For a continuous monitor/observer, immediately restart the next scan cycle.
             if (ctx->airtagRunning) {
                 Device* dev = ctx->dev;
                 if (dev != nullptr && !bluetooth_is_scanning(dev)) {
                     bluetooth_scan_start(dev);
+                }
+            }
+            if (ctx->obsRunning) {
+                Device* dev = ctx->dev;
+                if (dev != nullptr && !bluetooth_is_scanning(dev)) {
+                    observerStartScan(dev, ctx);
                 }
             }
             ctx->uiDirty = true;
@@ -280,6 +482,7 @@ static void showMainScreen(Context* ctx);
 static void showScanScreen(Context* ctx);
 static void showSpamScreen(Context* ctx);
 static void showAirtagScreen(Context* ctx);
+static void showObserverScreen(Context* ctx);
 
 static void ShowScreen(Context* ctx, Screen screen) {
     ctx->screen = screen;
@@ -291,12 +494,16 @@ static void ShowScreen(Context* ctx, Screen screen) {
     ctx->list = nullptr;
     ctx->startButtonLabel = nullptr;
     ctx->spamLabel = nullptr;
+    ctx->obsLogLabel = nullptr;
+    ctx->obsModeLabel = nullptr;
+    ctx->obsScroll = nullptr;
 
     switch (screen) {
         case Screen::Main: showMainScreen(ctx); break;
         case Screen::Scan: showScanScreen(ctx); break;
         case Screen::Spam: showSpamScreen(ctx); break;
         case Screen::Airtag: showAirtagScreen(ctx); break;
+        case Screen::Observer: showObserverScreen(ctx); break;
     }
     ctx->uiDirty = true;
     ctx->listDirty = true;
@@ -309,6 +516,7 @@ static void stopAllActive(Context* ctx) {
     bluetooth::stopAdvertising();
     ctx->scanRunning = false;
     ctx->airtagRunning = false;
+    ctx->obsRunning = false;
     if (ctx->dev != nullptr && bluetooth_is_scanning(ctx->dev)) {
         bluetooth_scan_stop(ctx->dev);
     }
@@ -338,11 +546,13 @@ static void addMenuButton(Context* ctx, const char* text, void (*cb)(lv_event_t*
 static void onGoScan(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Scan); }
 static void onGoSpam(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Spam); }
 static void onGoAirtag(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Airtag); }
+static void onGoObserver(lv_event_t* e) { ShowScreen(static_cast<Context*>(lv_event_get_user_data(e)), Screen::Observer); }
 
 // ---- Main ----
 
 static void showMainScreen(Context* ctx) {
     addMenuButton(ctx, "BLE Scan", onGoScan);
+    addMenuButton(ctx, "BLE Observer", onGoObserver);
     addMenuButton(ctx, "BLE Spam", onGoSpam);
     addMenuButton(ctx, "AirTag Monitor", onGoAirtag);
 }
@@ -549,6 +759,110 @@ static void showAirtagScreen(Context* ctx) {
     lv_label_set_text(ctx->countLabel, "0 AirTag(s)");
 }
 
+// ---- BLE Observer ----
+
+static void onStartObserver(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+#if defined(CONFIG_BT_NIMBLE_ENABLED)
+    if (ctx->obsRunning) {
+        ctx->obsRunning = false;
+        Device* dev = ctx->dev;
+        if (dev != nullptr && bluetooth_is_scanning(dev)) {
+            bluetooth_scan_stop(dev);
+        }
+        ctx->uiDirty = true;
+        return;
+    }
+    if (ctx->dev != nullptr) {
+        ensureBluetoothOn(ctx->dev);
+        ctx->obsRunning = true;
+        ctx->obsStartMs = get_millis();
+        ctx->obsEntries.clear();
+        ctx->obsDirty = true;
+        ctx->uiDirty = true;
+        if (bluetooth::getRadioState() == bluetooth::RadioState::On && !bluetooth_is_scanning(ctx->dev)) {
+            observerStartScan(ctx->dev, ctx);
+        }
+    }
+#endif
+}
+
+static void onToggleObserverMode(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    ctx->obsPassive = !ctx->obsPassive;
+    ctx->uiDirty = true;
+}
+
+static void onClearObserver(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    ctx->obsEntries.clear();
+    ctx->obsDirty = true;
+}
+
+static void showObserverScreen(Context* ctx) {
+    auto* label = lv_label_create(ctx->body);
+    lv_label_set_text(label, "Sniffs BLE advertisements.");
+    lv_obj_set_width(label, LV_PCT(100));
+
+    ctx->statusLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->statusLabel, "Stopped");
+
+    // Mode row: passive/active toggle (left) + clear (right).
+    auto* modeRow = lv_obj_create(ctx->body);
+    lv_obj_set_width(modeRow, LV_PCT(100));
+    lv_obj_set_flex_flow(modeRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(modeRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(modeRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(modeRow, LV_OPA_TRANSP, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(modeRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_scroll_dir(modeRow, LV_DIR_NONE);
+
+    auto* modeBtn = lv_button_create(modeRow);
+    lv_obj_set_width(modeBtn, LV_PCT(50));
+    lv_obj_set_height(modeBtn, 32);
+    lv_obj_set_style_pad_all(modeBtn, 0, LV_STATE_DEFAULT);
+    ctx->obsModeLabel = lv_label_create(modeBtn);
+    lv_label_set_text(ctx->obsModeLabel, ctx->obsPassive ? "Mode: Passive" : "Mode: Active");
+    lv_obj_center(ctx->obsModeLabel);
+    lv_obj_add_event_cb(modeBtn, onToggleObserverMode, LV_EVENT_SHORT_CLICKED, ctx);
+
+    auto* clearBtn = lv_button_create(modeRow);
+    lv_obj_set_width(clearBtn, LV_PCT(50));
+    lv_obj_set_height(clearBtn, 32);
+    lv_obj_set_style_pad_all(clearBtn, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_left(clearBtn, 8, LV_STATE_DEFAULT);
+    auto* clearLabel = lv_label_create(clearBtn);
+    lv_label_set_text(clearLabel, "Clear");
+    lv_obj_center(clearLabel);
+    lv_obj_add_event_cb(clearBtn, onClearObserver, LV_EVENT_SHORT_CLICKED, ctx);
+
+    auto* button = lv_button_create(ctx->body);
+    lv_obj_set_width(button, LV_PCT(100));
+    ctx->startButtonLabel = lv_label_create(button);
+    lv_label_set_text(ctx->startButtonLabel, "Start Observing");
+    lv_obj_center(ctx->startButtonLabel);
+    lv_obj_add_event_cb(button, onStartObserver, LV_EVENT_SHORT_CLICKED, ctx);
+
+    ctx->countLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->countLabel, "0 frames");
+
+    // The log: a scrollable, transparent container holding one wrapped label. Built newest-first
+    // (see rebuildObserverLog) so the latest captures stay at the top and remain visible as the
+    // log grows.
+    auto* scroll = lv_obj_create(ctx->body);
+    lv_obj_set_width(scroll, LV_PCT(100));
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_scroll_dir(scroll, LV_DIR_VER);
+    lv_obj_set_style_pad_all(scroll, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(scroll, LV_OPA_TRANSP, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(scroll, 0, LV_STATE_DEFAULT);
+    ctx->obsScroll = scroll;
+    ctx->obsLogLabel = lv_label_create(scroll);
+    lv_label_set_long_mode(ctx->obsLogLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
+    lv_label_set_text(ctx->obsLogLabel, "No frames yet.");
+}
+
 // ---- Polling (timer task) ----
 
 static void onPollTick(Context* ctx) {
@@ -567,6 +881,8 @@ static void onPollTick(Context* ctx) {
             text = "Monitoring";
         } else if (ctx->scanRunning) {
             text = "Scanning";
+        } else if (ctx->obsRunning) {
+            text = "Observing";
         } else {
             text = "Stopped";
         }
@@ -578,6 +894,8 @@ static void onPollTick(Context* ctx) {
             text = ctx->spamRunning ? "Stop Spam" : "Start Spam";
         } else if (ctx->screen == Screen::Airtag) {
             text = ctx->airtagRunning ? "Stop Monitor" : "Start Monitor";
+        } else if (ctx->screen == Screen::Observer) {
+            text = ctx->obsRunning ? "Stop Observing" : "Start Observing";
         }
         lv_label_set_text(ctx->startButtonLabel, text);
     }
@@ -586,6 +904,14 @@ static void onPollTick(Context* ctx) {
     }
     if (ctx->screen == Screen::Scan && ctx->countLabel != nullptr) {
         lv_label_set_text(ctx->countLabel, std::format("{} devices", (unsigned)ctx->scanPeers.size()).c_str());
+    }
+    if (ctx->screen == Screen::Observer) {
+        if (ctx->countLabel != nullptr) {
+            lv_label_set_text(ctx->countLabel, std::format("{} frames", (unsigned)ctx->obsEntries.size()).c_str());
+        }
+        if (ctx->obsModeLabel != nullptr) {
+            lv_label_set_text(ctx->obsModeLabel, ctx->obsPassive ? "Mode: Passive" : "Mode: Active");
+        }
     }
     if (ctx->screen == Screen::Spam && ctx->spamLabel != nullptr) {
         // Show the live spoof name only while actively broadcasting; keep it blank when stopped.
@@ -688,6 +1014,15 @@ int32_t appMain(int argc, char* argv[]) {
             rebuildList(&ctx);
             lvgl_unlock();
         }
+
+        // The observer log is a single (potentially long) wrapped label; rebuild it the same way,
+        // under the LVGL lock, and only when a new frame was captured.
+        if (ctx.obsDirty && ctx.obsLogLabel != nullptr) {
+            ctx.obsDirty = false;
+            lvgl_lock();
+            rebuildObserverLog(&ctx);
+            lvgl_unlock();
+        }
     }
 
     stopAllActive(&ctx);
@@ -726,10 +1061,11 @@ extern const ::AppManifest manifest = {
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
     .flags = 0,
     // The scan/AirTag peer-list rebuild does heavy LVGL work (creating/cleaning many widgets,
-    // forcing layout, object-tree redraw recursion) on this app's own task. The default 8 KB
-    // stack overflows under that redraw recursion, so give the app more headroom (as BtManage
-    // does); the LVGL lock must also be held around those widget mutations.
-    .stack = { .depth = 4096 }, // 16 KB
+    // forcing layout, object-tree redraw recursion) on this app's own task, and the BLE Observer
+    // builds a large log string. The default 8 KB stack overflows under that redraw recursion, so
+    // give the app more headroom (as BtManage does); the LVGL lock must also be held around those
+    // widget mutations. A ~24 KB internal stack is well under APP_STACK_SIZE_MAX (64 KB).
+    .stack = { .depth = 6144 }, // 24 KB
 };
 
 } // namespace tt::app::bletoolbox

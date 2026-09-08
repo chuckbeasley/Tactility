@@ -30,6 +30,24 @@ struct DeviceType;
 
 typedef uint8_t BtAddr[BT_ADDR_LEN];
 
+// ---- Advertising type / connectability ----
+// Normalized view of the raw HCI LE advertising report type (BLE_HCI_ADV_RPT_EVTYPE_*), so
+// consumers don't have to pull in HCI constants. Non-connectable beacons show up as NONCONN.
+
+enum BtAdvType {
+    BT_ADV_TYPE_UNKNOWN   = 0,
+    /** Connectable, undirected (ADV_IND) */
+    BT_ADV_TYPE_IND,
+    /** Scannable, undirected (ADV_SCAN_IND) */
+    BT_ADV_TYPE_SCAN_IND,
+    /** Non-connectable, undirected (ADV_NONCONN_IND) — e.g. most beacons/telemetry */
+    BT_ADV_TYPE_NONCONN,
+    /** Connectable, directed (ADV_DIRECT_IND) */
+    BT_ADV_TYPE_DIRECT,
+    /** Scan response to a SCAN_REQ (SCAN_RSP) */
+    BT_ADV_TYPE_SCAN_RSP,
+};
+
 // ---- Radio ----
 
 enum BtRadioState {
@@ -52,13 +70,55 @@ struct BtPeerRecord {
     bool paired;
     bool connected;
 
+    /** Advertising PDU type / connectability (BtAdvType value). */
+    uint8_t adv_type;
+    /** Advertising flags byte (BLE_HS_ADV_FLAGS_*), 0 if the packet carried none. */
+    uint8_t adv_flags;
+    /** Tx power quoted in the advertising header (dBm). 0x7F when not present. */
+    int8_t tx_power;
+
     /** Manufacturer-specific data from the advertisement (includes the 2-byte company ID at
      * manuf_data[0..1], little-endian). Copied from the advertising packet during scan; empty
      * (manuf_len == 0) when the peer advertised no manufacturer data. Used e.g. to identify
      * Apple AirTag / Find My trackers by their 0x004C company ID + 0x12 offline-finding type. */
-    uint8_t manuf_data[24];
+    uint8_t manuf_data[32];
     /** Number of valid bytes in manuf_data (0 = none). */
     uint8_t manuf_len;
+
+    /** 16-bit Service Data AD (type 0x16): the parsed service UUID code and the payload bytes
+     * that follow it. svc_uuid16 == 0 when no 16-bit service data was advertised. Used e.g. to
+     * detect Eddystone (0xFEAA) and other service-data beacons/telemetry. */
+    uint16_t svc_uuid16;
+    /** Service data payload bytes after the 2-byte UUID (0 = none). */
+    uint8_t svc_data[24];
+    /** Number of valid bytes in svc_data (0 = none). */
+    uint8_t svc_data_len;
+
+    /** Raw advertising PDU payload as received (for a hex/sniffer view). */
+    uint8_t adv_data[31];
+    /** Number of valid bytes in adv_data (0 = none). */
+    uint8_t adv_len;
+};
+
+// ---- Scan parameters ----
+
+/**
+ * Explicit scan configuration, used by a caller (e.g. a sniffer/observer) that wants control over
+ * the radio's scan behaviour rather than the default active, duplicate-filtered scan.
+ */
+struct BtScanParams {
+    /** true for a passive scan (no SCAN_REQ is sent; observe-only), false for active. */
+    bool passive;
+    /** true to suppress duplicate-address reports, false to receive every advertising packet
+     * (needed to observe a beacon whose data changes between reports). */
+    bool filter_duplicates;
+    /** true to also connect to unnamed peers after the scan to resolve their GATT name; false to
+     * stay strictly non-intrusive (address-only rows for unnamed peers). */
+    bool resolve_names;
+    /** Scan interval in 0.625 ms units (0 = controller default). */
+    uint16_t itvl;
+    /** Scan window in 0.625 ms units (0 = controller default). */
+    uint16_t window;
 };
 
 // ---- Profile identifiers ----
@@ -209,6 +269,15 @@ struct BluetoothApi {
      * @return ERROR_NONE on success
      */
     error_t (*scan_start)(struct Device* device);
+
+    /**
+     * Start scanning with explicit radio parameters.
+     * @param[in] device the bluetooth device
+     * @param[in] params scan configuration; if NULL, behaves like scan_start (active scan,
+     * duplicate filtering on, GATT name resolution on, default window)
+     * @return ERROR_NONE on success
+     */
+    error_t (*scan_start_params)(struct Device* device, const struct BtScanParams* params);
 
     /**
      * Stop an active scan.
@@ -365,6 +434,7 @@ struct Device* bluetooth_find_first_ready_device(void);
 error_t bluetooth_get_radio_state(struct Device* device, enum BtRadioState* state);
 error_t bluetooth_set_radio_enabled(struct Device* device, bool enabled);
 error_t bluetooth_scan_start(struct Device* device);
+error_t bluetooth_scan_start_params(struct Device* device, const struct BtScanParams* params);
 error_t bluetooth_scan_stop(struct Device* device);
 bool    bluetooth_is_scanning(struct Device* device);
 error_t bluetooth_pair(struct Device* device, const BtAddr addr);
