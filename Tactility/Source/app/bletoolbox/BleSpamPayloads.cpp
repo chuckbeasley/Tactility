@@ -7,17 +7,6 @@ namespace tt::app::bletoolbox {
 // (https://github.com/Next-Flip/Momentum-Apps/tree/dev/ble_spam) projects. Each array is the
 // complete AD data passed verbatim to ble_gap_adv_set_data().
 
-// ---- Apple: offline-finding / Find My tracker (AirTag) ----
-// Manufacturer record (company 0x004C, type 0x12 nearby-info, status + key + hint).
-static const uint8_t kAirtag[] = {
-    0x1e, 0xff, 0x4c, 0x00, 0x12, 0x19, 0x01,
-    // 22-byte public key (zeros) + key bits + hint
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00,
-};
-
 // ---- Apple: proximity pair (31 bytes, model byte at index 7) ----
 
 static const uint8_t kAirpods[] = {
@@ -172,7 +161,6 @@ const Family kFamilies[kFamilyCount] = {
 
 const Payload kPayloads[] = {
     // Apple
-    { 0, "AirTag", kAirtag, sizeof(kAirtag) },
     { 0, "AirPods", kAirpods, sizeof(kAirpods) },
     { 0, "AirPods Pro", kAirpodsPro, sizeof(kAirpodsPro) },
     { 0, "AirPods Pro 2", kAirpodsPro2, sizeof(kAirpodsPro2) },

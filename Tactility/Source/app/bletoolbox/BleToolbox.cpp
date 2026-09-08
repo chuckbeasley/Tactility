@@ -113,7 +113,12 @@ static bool isOfflineFinding(const uint8_t* manuf, uint8_t manufLen) {
            manuf[2] == AIRTAG_OF_TYPE;
 }
 
+// Enables the BT radio if not already on. Null-safe: a missing device must not be dereferenced.
 static void ensureBluetoothOn(Device* dev) {
+    if (dev == nullptr) {
+        LOG_W(TAG, "No Bluetooth device available");
+        return;
+    }
     if (!bluetooth::isRadioOnOrPending(dev)) {
         LOG_I(TAG, "Enabling Bluetooth radio");
         bluetooth::start(dev);
@@ -540,8 +545,19 @@ static void onPollTick(Context* ctx) {
     // Without it the LVGL refresh task can race the invalidation and hang the app (task watchdog).
     lvgl_lock();
     if (ctx->statusLabel != nullptr) {
-        const char* text = ctx->spamRunning ? "Spamming"
-            : (ctx->airtagRunning ? "Monitoring" : (ctx->scanRunning ? "Scanning" : "Stopped"));
+        const char* text;
+        // No BLE device to drive: tell the user why the buttons appear to do nothing.
+        if (ctx->dev == nullptr) {
+            text = "No BLE device";
+        } else if (ctx->spamRunning) {
+            text = "Spamming";
+        } else if (ctx->airtagRunning) {
+            text = "Monitoring";
+        } else if (ctx->scanRunning) {
+            text = "Scanning";
+        } else {
+            text = "Stopped";
+        }
         lv_label_set_text(ctx->statusLabel, text);
     }
     if (ctx->startButtonLabel != nullptr) {
@@ -597,18 +613,24 @@ int32_t appMain(int argc, char* argv[]) {
     AppEventSubscription sub{};
     app_event_subscribe(&sub, &event_group);
 
-    // Resolve the BLE device and subscribe to scan/radio events.
+    // Resolve the BLE device and subscribe to scan/radio events. The devicetree marks ble0
+    // "disabled" (constructed but not started), so get_first_active_by_type() finds nothing and
+    // every button would silently no-op (or crash on the null device in ensureBluetoothOn). Use
+    // get_first_by_type() to find the not-yet-started device, then start it so the radio can be
+    // driven and the driver is ready to log events.
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
     Device* dev = nullptr;
-    if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
+    if (device_get_first_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE && dev != nullptr) {
         ctx.dev = dev;
+        bluetooth::start(dev);
         if (bluetooth_event_subscribe(dev, &ctx.btSub, &event_group) == ERROR_NONE) {
             LOG_I(TAG, "Subscribed to BLE events");
         } else {
             LOG_W(TAG, "Failed to subscribe to BLE events");
         }
     } else {
-        LOG_W(TAG, "No active BLE device");
+        LOG_W(TAG, "No Bluetooth device found");
+        ctx.dev = nullptr;
     }
 #endif
 
