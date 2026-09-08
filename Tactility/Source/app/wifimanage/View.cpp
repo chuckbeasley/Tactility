@@ -171,6 +171,7 @@ void View::updateNetworkList() {
     lv_obj_align(enable_label, LV_ALIGN_LEFT_MID, 0, 0);
 
     enable_on_boot_switch = lv_switch_create(enable_on_boot_wrapper);
+    lv_obj_set_size(enable_on_boot_switch, 40, 22);
     lv_obj_align(enable_on_boot_switch, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_add_event_cb(enable_on_boot_switch, onEnableOnBootSwitchChanged, LV_EVENT_VALUE_CHANGED, bindings);
     lv_obj_add_event_cb(enable_on_boot_wrapper, onEnableOnBootParentClicked, LV_EVENT_SHORT_CLICKED, enable_on_boot_switch);
@@ -345,6 +346,7 @@ void View::init(uint32_t newAppInstanceId, lv_obj_t* parent) {
     scanning_spinner = lvgl_toolbar_add_spinner_action(toolbar);
 
     enable_switch = lvgl_toolbar_add_switch_action(toolbar);
+    lv_obj_set_size(enable_switch, 40, 22);
     lv_obj_add_event_cb(enable_switch, onEnableSwitchChanged, LV_EVENT_VALUE_CHANGED, bindings);
 
      // Networks
