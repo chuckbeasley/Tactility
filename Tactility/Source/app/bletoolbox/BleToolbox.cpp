@@ -216,95 +216,79 @@ static const char* advTypeToString(uint8_t type) {
     }
 }
 
-static std::string hexBytes(const uint8_t* data, uint8_t len) {
+static std::string hexShort(const uint8_t* data, uint8_t len) {
     std::string out;
-    out.reserve(static_cast<size_t>(len) * 3);
+    out.reserve(static_cast<size_t>(len) * 2);
     for (uint8_t i = 0; i < len; ++i) {
-        char b[4];
-        std::snprintf(b, sizeof(b), "%02x ", data[i]);
+        char b[3];
+        std::snprintf(b, sizeof(b), "%02x", data[i]);
         out += b;
     }
     return out;
 }
 
-// Human-readable classification of an advertising frame, from the fields the driver captured.
-static std::string decodeObserverDesc(const ObsEntry& e) {
-    if (e.adv_type == BT_ADV_TYPE_DIRECT) {
-        return "directed";
-    }
+// Concise, table-cell friendly summary of an advertising frame. lv_table cells do not wrap, so keep
+// it short; the Type / RSSI / Addr columns carry the rest. Full per-field decode (raw PDU hex) is
+// traded for a readable, always-visible sniffer summary.
+static std::string decodeObserverCell(const ObsEntry& e) {
+    if (e.adv_type == BT_ADV_TYPE_DIRECT) return "directed";
 
-    // Apple iBeacon: manufacturer data 0x004C, beacon type 0x02. Layout inside manuf_data:
-    // [0..1] company ID, [2] type, [3..18] proximity UUID, [19..20] major, [21..22] minor,
-    // [23] measured tx power.
+    // Apple iBeacon: 0x004C, type 0x02. Layout inside manuf_data:
+    // [0..1] company ID, [2] type, [3..18] proximity UUID, [19..20] major, [21..22] minor.
     if (e.manuf_len >= 24 &&
         e.manuf[0] == APPLE_COMPANY_LO && e.manuf[1] == APPLE_COMPANY_HI &&
         e.manuf[2] == 0x02) {
-        char uuid[37];
-        int p = 0;
-        for (uint8_t i = 0; i < 16; ++i) {
-            if (i == 4 || i == 6 || i == 8 || i == 10) uuid[p++] = '-';
-            p += std::snprintf(uuid + p, sizeof(uuid) - static_cast<size_t>(p), "%02x", e.manuf[3 + i]);
-        }
-        uuid[p] = '\0';
         uint16_t major = static_cast<uint16_t>((e.manuf[19] << 8) | e.manuf[20]);
         uint16_t minor = static_cast<uint16_t>((e.manuf[21] << 8) | e.manuf[22]);
-        return std::format("iBeacon U={} Maj={} Min={} ", uuid, major, minor);
+        // Shorten the 16-byte UUID to its first 4 bytes for the narrow cell.
+        return std::format("iBeacon {}.. M={} m={}", hexShort(e.manuf + 3, 4), major, minor);
     }
 
     // Apple offline-finding (AirTag / Find My): 0x004C + type 0x12.
-    if (isOfflineFinding(e.manuf, e.manuf_len)) {
-        return "Apple FindMy";
-    }
+    if (isOfflineFinding(e.manuf, e.manuf_len)) return "Apple FindMy";
 
     // Eddystone (service-data UUID 0xFEAA).
     if (e.svc_uuid16 == 0xFEAA && e.svc_data_len >= 1) {
         uint8_t frame = e.svc_data[0];
-        if (frame == 0x00 && e.svc_data_len >= 17) {
-            // UID: 16-byte beacon id (10-byte namespace + 6-byte instance), bytes [1..16].
-            return "Eddystone UID " + hexBytes(e.svc_data + 1, 16);
-        } else if (frame == 0x10) {
-            return "Eddystone URL";
-        } else if (frame == 0x20 && e.svc_data_len >= 12) {
-            // TLM: version [1], battery mV [2..3], temperature [4..5] (0.0625 C / unit),
-            // adv-count [6..9], time [10..13].
+        if (frame == 0x00) return "Eddystone UID";
+        if (frame == 0x10) return "Eddystone URL";
+        if (frame == 0x20 && e.svc_data_len >= 12) {
+            // TLM: version [1], battery mV [2..3], temperature [4..5] in 0.0625 C units (= /16).
             uint16_t batt = static_cast<uint16_t>((e.svc_data[2] << 8) | e.svc_data[3]);
-            int16_t tempRaw = static_cast<int16_t>((e.svc_data[4] << 8) | e.svc_data[5]);
-            char tstr[16];
-            std::snprintf(tstr, sizeof(tstr), "%.1f", tempRaw * 0.0625f);
-            return std::format("Eddystone TLM batt={}mV temp={}C ", batt, tstr);
+            int16_t tempC = static_cast<int16_t>((e.svc_data[4] << 8) | e.svc_data[5]) / 16;
+            return std::format("TLM {}mV {}C", batt, tempC);
         }
         return "Eddystone";
     }
 
-    if (e.name[0] != '\0') {
-        return std::format("Name={}", e.name);
-    }
+    if (e.name[0] != '\0') return std::format("Name={}", e.name);
     return "advert";
 }
 
-// Serialize the observer log as a single wrapped string. Built newest-first so the most recent
-// captures sit at the top of the scroll container and stay visible as the log grows.
+// Rebuild the observer log table (Type | RSSI | Addr | Info), newest-first so the latest capture is
+// at the top and visible without having to scroll to it. lv_table is a bounded, self-scrolling
+// widget (same as the Scan screen's list), so the controls below stay in place.
 static void rebuildObserverLog(Context* ctx) {
-    if (ctx->obsLogLabel == nullptr) return;
-    std::string text;
-    text.reserve(OBS_LOG_MAX * 96);
-    size_t count = 0;
-    for (auto it = ctx->obsEntries.rbegin(); it != ctx->obsEntries.rend() && count < OBS_LOG_MAX; ++it, ++count) {
+    lv_obj_t* table = ctx->obsLogLabel;
+    if (table == nullptr) return;
+    const size_t count = std::min(ctx->obsEntries.size(), OBS_LOG_MAX);
+    lv_table_set_row_count(table, static_cast<uint32_t>(count + 1)); // +1 for the header row
+    lv_table_set_cell_value(table, 0, 0, "Type");
+    lv_table_set_cell_value(table, 0, 1, "RSSI");
+    lv_table_set_cell_value(table, 0, 2, "Addr");
+    lv_table_set_cell_value(table, 0, 3, "Info");
+    size_t row = 1;
+    for (auto it = ctx->obsEntries.rbegin(); it != ctx->obsEntries.rend() && row <= count; ++it, ++row) {
         const ObsEntry& e = *it;
+        lv_table_set_cell_value(table, static_cast<uint32_t>(row), 0, advTypeToString(e.adv_type));
+        const std::string rssi = std::to_string(e.rssi);
+        lv_table_set_cell_value(table, static_cast<uint32_t>(row), 1, rssi.c_str());
         char addr[18];
         formatAddr(e.addr.data(), addr, sizeof(addr));
-        text += std::format("#{:04d} {:6d}ms {} {:4d}dBm {} ",
-            static_cast<unsigned>(count),
-            static_cast<unsigned>(e.uptimeMs),
-            advTypeToString(e.adv_type),
-            static_cast<int>(e.rssi),
-            addr);
-        text += decodeObserverDesc(e);
-        text += "\n   PDU:";
-        text += hexBytes(e.adv_data, e.adv_len);
-        text += "\n";
+        lv_table_set_cell_value(table, static_cast<uint32_t>(row), 2, addr);
+        const std::string info = decodeObserverCell(e);
+        lv_table_set_cell_value(table, static_cast<uint32_t>(row), 3, info.c_str());
     }
-    lv_textarea_set_text(ctx->obsLogLabel, text.c_str());
 }
 
 // Scan parameters for the observer: raw (no duplicate filter), optionally passive, and no GATT
@@ -809,22 +793,29 @@ static void showObserverScreen(Context* ctx) {
     ctx->statusLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->statusLabel, "Stopped");
 
-    // The frame log is a read-only lv_textarea: a self-contained scrolling text widget (same
-    // bounded-flex behaviour as the lv_table used by the Scan screen), so it fills the space
-    // between the status line and the controls and scrolls internally instead of growing unbounded
-    // and pushing the Start/Stop button off-screen. Newest-first (see rebuildObserverLog).
-    auto* logText = lv_textarea_create(ctx->body);
-    lv_obj_set_width(logText, LV_PCT(100));
-    lv_obj_set_flex_grow(logText, 1);
-    lv_obj_set_style_pad_all(logText, 0, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(logText, LV_OPA_TRANSP, LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(logText, 0, LV_STATE_DEFAULT);
-    lv_textarea_set_text(logText, "No frames yet.");
-    lv_textarea_set_one_line(logText, false);
-    // Read-only log: don't let it grab touch focus (avoids a visible caret / keypad).
-    lv_obj_remove_flag(logText, LV_OBJ_FLAG_CLICK_FOCUSABLE);
-    lv_textarea_set_cursor_click_pos(logText, false);
-    ctx->obsLogLabel = logText; // stored so rebuildObserverLog() can set the text
+    // The frame log is an lv_table (same bounded, self-scrolling widget as the Scan screen's list),
+    // so it fills the space between the status line and the controls and scrolls internally instead
+    // of growing unbounded and pushing the Start/Stop button off-screen. Newest-first
+    // (see rebuildObserverLog), so the latest capture is at the top.
+    ctx->obsLogLabel = lv_table_create(ctx->body);
+    lv_table_set_column_count(ctx->obsLogLabel, 4);
+    lv_table_set_column_width(ctx->obsLogLabel, 0, 58);
+    lv_table_set_column_width(ctx->obsLogLabel, 1, 48);
+    lv_table_set_column_width(ctx->obsLogLabel, 2, 122);
+    lv_table_set_column_width(ctx->obsLogLabel, 3, 220);
+    // Compact rows: shrink vertical cell padding so more records fit on the small display.
+    lv_obj_set_style_pad_ver(ctx->obsLogLabel, 2, LV_PART_ITEMS);
+    lv_obj_set_style_pad_left(ctx->obsLogLabel, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_right(ctx->obsLogLabel, 4, LV_PART_ITEMS);
+    lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
+    lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
+    lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
+    lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
+    lv_table_set_row_count(ctx->obsLogLabel, 1);
+    lv_table_set_cell_value(ctx->obsLogLabel, 0, 0, "Type");
+    lv_table_set_cell_value(ctx->obsLogLabel, 0, 1, "RSSI");
+    lv_table_set_cell_value(ctx->obsLogLabel, 0, 2, "Addr");
+    lv_table_set_cell_value(ctx->obsLogLabel, 0, 3, "Info");
 
     // Mode row: passive/active toggle (left) + clear (right).
     auto* modeRow = lv_obj_create(ctx->body);
