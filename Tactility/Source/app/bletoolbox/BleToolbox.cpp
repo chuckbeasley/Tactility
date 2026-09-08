@@ -487,6 +487,10 @@ static void ShowScreen(Context* ctx, Screen screen) {
     ctx->screen = screen;
     if (ctx->body != nullptr) {
         lv_obj_clean(ctx->body);
+        // Default body is vertically scrollable (set once in createWidgets). The Observer screen
+        // disables it so its log container's flex_grow gets a real (bounded) height; restore VER
+        // here so every other screen keeps its normal scroll behaviour.
+        lv_obj_set_scroll_dir(ctx->body, LV_DIR_VER);
     }
     ctx->statusLabel = nullptr;
     ctx->countLabel = nullptr;
@@ -798,6 +802,11 @@ static void onClearObserver(lv_event_t* event) {
 }
 
 static void showObserverScreen(Context* ctx) {
+    // Bounded layout: the body is NOT scrollable here, so the log container's flex_grow gets a real
+    // (bounded) height and scrolls internally. This keeps the Start/Stop control always reachable
+    // instead of the log pushing it off-screen.
+    lv_obj_set_scroll_dir(ctx->body, LV_DIR_NONE);
+
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, "Sniffs BLE advertisements.");
     lv_obj_set_width(label, LV_PCT(100));
@@ -805,18 +814,23 @@ static void showObserverScreen(Context* ctx) {
     ctx->statusLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->statusLabel, "Stopped");
 
-    // The frame log sits above the controls (mode/start/count) so the live captures are the first
-    // thing visible. A single wrapped label placed directly in the scrollable body (same pattern as
-    // WifiToolbox's network-results log) — a label nested in its own flex_grow=1 scroll container
-    // gets clipped to ~0 because a scrollable flex parent sizes to its content, so flex_grow leaves
-    // the inner container with no height. Built newest-first (see rebuildObserverLog), so the latest
-    // capture is at the top, right below the status line, and older frames are revealed by scrolling.
-    ctx->obsLogLabel = lv_label_create(ctx->body);
+    // The frame log scrolls inside a flex_grow container that fills the space between the status
+    // line and the (pinned, bottom) controls. Newest-first (see rebuildObserverLog), so the latest
+    // capture sits at the top of the log.
+    auto* logScroll = lv_obj_create(ctx->body);
+    lv_obj_set_width(logScroll, LV_PCT(100));
+    lv_obj_set_flex_grow(logScroll, 1);
+    lv_obj_set_scroll_dir(logScroll, LV_DIR_VER);
+    lv_obj_set_style_pad_all(logScroll, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(logScroll, LV_OPA_TRANSP, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(logScroll, 0, LV_STATE_DEFAULT);
+
+    ctx->obsLogLabel = lv_label_create(logScroll);
     lv_label_set_long_mode(ctx->obsLogLabel, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
     lv_label_set_text(ctx->obsLogLabel, "No frames yet.");
 
-    // Mode row: passive/active toggle (left) + clear (right).
+    // Mode row: passive/active toggle (left) + clear (right). Pinned at the bottom.
     auto* modeRow = lv_obj_create(ctx->body);
     lv_obj_set_width(modeRow, LV_PCT(100));
     lv_obj_set_flex_flow(modeRow, LV_FLEX_FLOW_ROW);
