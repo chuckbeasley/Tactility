@@ -805,6 +805,17 @@ static void showObserverScreen(Context* ctx) {
     ctx->statusLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->statusLabel, "Stopped");
 
+    // The frame log sits above the controls (mode/start/count) so the live captures are the first
+    // thing visible. A single wrapped label placed directly in the scrollable body (same pattern as
+    // WifiToolbox's network-results log) — a label nested in its own flex_grow=1 scroll container
+    // gets clipped to ~0 because a scrollable flex parent sizes to its content, so flex_grow leaves
+    // the inner container with no height. Built newest-first (see rebuildObserverLog), so the latest
+    // capture is at the top, right below the status line, and older frames are revealed by scrolling.
+    ctx->obsLogLabel = lv_label_create(ctx->body);
+    lv_label_set_long_mode(ctx->obsLogLabel, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
+    lv_label_set_text(ctx->obsLogLabel, "No frames yet.");
+
     // Mode row: passive/active toggle (left) + clear (right).
     auto* modeRow = lv_obj_create(ctx->body);
     lv_obj_set_width(modeRow, LV_PCT(100));
@@ -843,17 +854,6 @@ static void showObserverScreen(Context* ctx) {
 
     ctx->countLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->countLabel, "0 frames");
-
-    // The log is just a single wrapped label placed directly in the scrollable body (same pattern
-    // as WifiToolbox's network-results log). A label nested in its own flex_grow=1 scroll container
-    // gets clipped to ~0 because a scrollable flex parent sizes to its content, so flex_grow leaves
-    // the inner container with no height. Built newest-first (see rebuildObserverLog) so the latest
-    // captures sit at the top of the label, right below the controls, and remain visible as the
-    // body scrolls.
-    ctx->obsLogLabel = lv_label_create(ctx->body);
-    lv_label_set_long_mode(ctx->obsLogLabel, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
-    lv_label_set_text(ctx->obsLogLabel, "No frames yet.");
 }
 
 // ---- Polling (timer task) ----
