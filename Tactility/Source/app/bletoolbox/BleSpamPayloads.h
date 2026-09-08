@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace tt::app::blespam {
+namespace tt::app::bletoolbox {
 
 /** Number of packet families (Apple, Android, Windows, Samsung). */
 static constexpr size_t kFamilyCount = 4;
@@ -25,4 +25,4 @@ extern const Family kFamilies[kFamilyCount];
 extern const Payload kPayloads[];
 extern const size_t kPayloadCount;
 
-} // namespace tt::app::blespam
+} // namespace tt::app::bletoolbox
