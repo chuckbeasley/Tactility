@@ -132,7 +132,6 @@ struct Context {
     lv_obj_t* startButtonLabel = nullptr;
     lv_obj_t* spamLabel = nullptr;
     lv_obj_t* obsLogLabel = nullptr;
-    lv_obj_t* obsModeLabel = nullptr;
 
     bool uiDirty = false;
     bool listDirty = false;
@@ -482,7 +481,6 @@ static void ShowScreen(Context* ctx, Screen screen) {
     ctx->startButtonLabel = nullptr;
     ctx->spamLabel = nullptr;
     ctx->obsLogLabel = nullptr;
-    ctx->obsModeLabel = nullptr;
 
     switch (screen) {
         case Screen::Main: showMainScreen(ctx); break;
@@ -756,6 +754,9 @@ static void onStartObserver(lv_event_t* event) {
         if (dev != nullptr && bluetooth_is_scanning(dev)) {
             bluetooth_scan_stop(dev);
         }
+        // Toggle the button label immediately (this LVGL callback runs on the LVGL task), so the
+        // state change is visible regardless of the poll tick's screen check.
+        lv_label_set_text(ctx->startButtonLabel, "Start Observing");
         ctx->uiDirty = true;
         return;
     }
@@ -766,6 +767,7 @@ static void onStartObserver(lv_event_t* event) {
         ctx->obsEntries.clear();
         ctx->obsDirty = true;
         ctx->uiDirty = true;
+        lv_label_set_text(ctx->startButtonLabel, "Stop Observing");
         if (bluetooth::getRadioState() == bluetooth::RadioState::On && !bluetooth_is_scanning(ctx->dev)) {
             observerStartScan(ctx->dev, ctx);
         }
@@ -773,30 +775,26 @@ static void onStartObserver(lv_event_t* event) {
 #endif
 }
 
-static void onToggleObserverMode(lv_event_t* event) {
-    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    ctx->obsPassive = !ctx->obsPassive;
-    ctx->uiDirty = true;
-}
-
 static void onClearObserver(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
     ctx->obsEntries.clear();
     ctx->obsDirty = true;
+    // Stop the observer so the cleared log isn't instantly refilled by a still-running scan.
+    ctx->obsRunning = false;
+    if (ctx->dev != nullptr && bluetooth_is_scanning(ctx->dev)) {
+        bluetooth_scan_stop(ctx->dev);
+    }
+    ctx->uiDirty = true;
 }
 
 static void showObserverScreen(Context* ctx) {
-    auto* label = lv_label_create(ctx->body);
-    lv_label_set_text(label, "Sniffs BLE advertisements.");
-    lv_obj_set_width(label, LV_PCT(100));
+    // Layout: the frame log fills the remaining page space (flex_grow) and scrolls internally; the
+    // Start/Stop + Clear row sits directly above the footer frame-count. The body is non-scrollable
+    // so the log's flex_grow gets a real (bounded) height and nothing is clipped off-screen.
+    lv_obj_set_scroll_dir(ctx->body, LV_DIR_NONE);
 
-    ctx->statusLabel = lv_label_create(ctx->body);
-    lv_label_set_text(ctx->statusLabel, "Stopped");
-
-    // The frame log is an lv_table (same bounded, self-scrolling widget as the Scan screen's list),
-    // so it fills the space between the status line and the controls and scrolls internally instead
-    // of growing unbounded and pushing the Start/Stop button off-screen. Newest-first
-    // (see rebuildObserverLog), so the latest capture is at the top.
+    // Frame log as a table (Type | RSSI | Addr | Info), filling the space above the controls. Same
+    // bounded, self-scrolling widget the Scan screen uses.
     ctx->obsLogLabel = lv_table_create(ctx->body);
     lv_table_set_column_count(ctx->obsLogLabel, 4);
     lv_table_set_column_width(ctx->obsLogLabel, 0, 58);
@@ -807,6 +805,8 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_pad_ver(ctx->obsLogLabel, 2, LV_PART_ITEMS);
     lv_obj_set_style_pad_left(ctx->obsLogLabel, 4, LV_PART_ITEMS);
     lv_obj_set_style_pad_right(ctx->obsLogLabel, 4, LV_PART_ITEMS);
+    lv_obj_set_style_pad_top(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
     lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
@@ -817,26 +817,26 @@ static void showObserverScreen(Context* ctx) {
     lv_table_set_cell_value(ctx->obsLogLabel, 0, 2, "Addr");
     lv_table_set_cell_value(ctx->obsLogLabel, 0, 3, "Info");
 
-    // Mode row: passive/active toggle (left) + clear (right).
-    auto* modeRow = lv_obj_create(ctx->body);
-    lv_obj_set_width(modeRow, LV_PCT(100));
-    lv_obj_set_flex_flow(modeRow, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(modeRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_all(modeRow, 0, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(modeRow, LV_OPA_TRANSP, LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(modeRow, 0, LV_STATE_DEFAULT);
-    lv_obj_set_scroll_dir(modeRow, LV_DIR_NONE);
+    // Buttons row: Start/Stop (left) + Clear (right), directly above the footer.
+    auto* bottomRow = lv_obj_create(ctx->body);
+    lv_obj_set_width(bottomRow, LV_PCT(100));
+    lv_obj_set_flex_flow(bottomRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(bottomRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_all(bottomRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(bottomRow, LV_OPA_TRANSP, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(bottomRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_scroll_dir(bottomRow, LV_DIR_NONE);
 
-    auto* modeBtn = lv_button_create(modeRow);
-    lv_obj_set_width(modeBtn, LV_PCT(50));
-    lv_obj_set_height(modeBtn, 32);
-    lv_obj_set_style_pad_all(modeBtn, 0, LV_STATE_DEFAULT);
-    ctx->obsModeLabel = lv_label_create(modeBtn);
-    lv_label_set_text(ctx->obsModeLabel, ctx->obsPassive ? "Mode: Passive" : "Mode: Active");
-    lv_obj_center(ctx->obsModeLabel);
-    lv_obj_add_event_cb(modeBtn, onToggleObserverMode, LV_EVENT_SHORT_CLICKED, ctx);
+    auto* startBtn = lv_button_create(bottomRow);
+    lv_obj_set_width(startBtn, LV_PCT(50));
+    lv_obj_set_height(startBtn, 32);
+    lv_obj_set_style_pad_all(startBtn, 0, LV_STATE_DEFAULT);
+    ctx->startButtonLabel = lv_label_create(startBtn);
+    lv_label_set_text(ctx->startButtonLabel, "Start Observing");
+    lv_obj_center(ctx->startButtonLabel);
+    lv_obj_add_event_cb(startBtn, onStartObserver, LV_EVENT_SHORT_CLICKED, ctx);
 
-    auto* clearBtn = lv_button_create(modeRow);
+    auto* clearBtn = lv_button_create(bottomRow);
     lv_obj_set_width(clearBtn, LV_PCT(50));
     lv_obj_set_height(clearBtn, 32);
     lv_obj_set_style_pad_all(clearBtn, 0, LV_STATE_DEFAULT);
@@ -846,13 +846,7 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_center(clearLabel);
     lv_obj_add_event_cb(clearBtn, onClearObserver, LV_EVENT_SHORT_CLICKED, ctx);
 
-    auto* button = lv_button_create(ctx->body);
-    lv_obj_set_width(button, LV_PCT(100));
-    ctx->startButtonLabel = lv_label_create(button);
-    lv_label_set_text(ctx->startButtonLabel, "Start Observing");
-    lv_obj_center(ctx->startButtonLabel);
-    lv_obj_add_event_cb(button, onStartObserver, LV_EVENT_SHORT_CLICKED, ctx);
-
+    // Footer frame count at the very bottom.
     ctx->countLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->countLabel, "0 frames");
 }
@@ -902,9 +896,6 @@ static void onPollTick(Context* ctx) {
     if (ctx->screen == Screen::Observer) {
         if (ctx->countLabel != nullptr) {
             lv_label_set_text(ctx->countLabel, std::format("{} frames", (unsigned)ctx->obsEntries.size()).c_str());
-        }
-        if (ctx->obsModeLabel != nullptr) {
-            lv_label_set_text(ctx->obsModeLabel, ctx->obsPassive ? "Mode: Passive" : "Mode: Active");
         }
     }
     if (ctx->screen == Screen::Spam && ctx->spamLabel != nullptr) {
