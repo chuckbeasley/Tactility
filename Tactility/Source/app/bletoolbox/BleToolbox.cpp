@@ -133,7 +133,6 @@ struct Context {
     lv_obj_t* spamLabel = nullptr;
     lv_obj_t* obsLogLabel = nullptr;
     lv_obj_t* obsModeLabel = nullptr;
-    lv_obj_t* obsScroll = nullptr;
 
     bool uiDirty = false;
     bool listDirty = false;
@@ -496,7 +495,6 @@ static void ShowScreen(Context* ctx, Screen screen) {
     ctx->spamLabel = nullptr;
     ctx->obsLogLabel = nullptr;
     ctx->obsModeLabel = nullptr;
-    ctx->obsScroll = nullptr;
 
     switch (screen) {
         case Screen::Main: showMainScreen(ctx); break;
@@ -846,18 +844,13 @@ static void showObserverScreen(Context* ctx) {
     ctx->countLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->countLabel, "0 frames");
 
-    // The log: a scrollable, transparent container holding one wrapped label. Built newest-first
-    // (see rebuildObserverLog) so the latest captures stay at the top and remain visible as the
-    // log grows.
-    auto* scroll = lv_obj_create(ctx->body);
-    lv_obj_set_width(scroll, LV_PCT(100));
-    lv_obj_set_flex_grow(scroll, 1);
-    lv_obj_set_scroll_dir(scroll, LV_DIR_VER);
-    lv_obj_set_style_pad_all(scroll, 0, LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(scroll, LV_OPA_TRANSP, LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(scroll, 0, LV_STATE_DEFAULT);
-    ctx->obsScroll = scroll;
-    ctx->obsLogLabel = lv_label_create(scroll);
+    // The log is just a single wrapped label placed directly in the scrollable body (same pattern
+    // as WifiToolbox's network-results log). A label nested in its own flex_grow=1 scroll container
+    // gets clipped to ~0 because a scrollable flex parent sizes to its content, so flex_grow leaves
+    // the inner container with no height. Built newest-first (see rebuildObserverLog) so the latest
+    // captures sit at the top of the label, right below the controls, and remain visible as the
+    // body scrolls.
+    ctx->obsLogLabel = lv_label_create(ctx->body);
     lv_label_set_long_mode(ctx->obsLogLabel, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
     lv_label_set_text(ctx->obsLogLabel, "No frames yet.");
