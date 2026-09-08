@@ -129,12 +129,21 @@ lv_obj_t* lvgl_toolbar_create(lv_obj_t* parent, const char* title) {
         lv_obj_set_style_bg_opa(toolbar->close_button, LV_OPA_TRANSP, LV_STATE_DEFAULT);
     }
 
-    lv_obj_set_size(toolbar->close_button, toolbar_height - icon_padding, toolbar_height - icon_padding);
+    // Smaller than the (square) action buttons so the close control reads as a compact X, matching
+    // the compact settings switches. Compact density already uses a tiny button, so only shrink the
+    // default-density button.
+    auto close_button_size = (ui_density == LVGL_UI_DENSITY_COMPACT)
+        ? (toolbar_height - icon_padding)
+        : (toolbar_height - 2 * icon_padding);
+    lv_obj_set_size(toolbar->close_button, close_button_size, close_button_size);
     lv_obj_set_ext_click_area(toolbar->close_button, getButtonHitSlop(ui_density));
 
     lv_obj_set_style_pad_all(toolbar->close_button, 0, LV_STATE_DEFAULT);
     lv_obj_align(toolbar->close_button, LV_ALIGN_CENTER, 0, 0);
     toolbar->close_button_image = lv_image_create(toolbar->close_button);
+    // Use the default (smaller) text font so the X glyph renders small enough to fit the shrunken
+    // button; the toolbar's LARGE font would otherwise overflow it.
+    lv_obj_set_style_text_font(toolbar->close_button_image, lvgl_get_text_font(FONT_SIZE_DEFAULT), LV_STATE_DEFAULT);
     lv_obj_align(toolbar->close_button_image, LV_ALIGN_CENTER, 0, 0);
 
     auto* title_wrapper = lv_obj_create(obj);
