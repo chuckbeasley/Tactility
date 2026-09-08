@@ -131,7 +131,9 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_align(languageLabel, LV_ALIGN_LEFT_MID, 4, 0);
 
     ctx->languageDropdown = lv_dropdown_create(language_wrapper);
-    lv_obj_set_width(ctx->languageDropdown, 150);
+    // Generous width so longer language names (e.g. "English (United States)") aren't truncated and
+    // the open option list stays on-screen when the dropdown is right-aligned.
+    lv_obj_set_width(ctx->languageDropdown, LV_PCT(55));
     lv_obj_align(ctx->languageDropdown, LV_ALIGN_RIGHT_MID, 0, 0);
     std::string language_options = getLanguageOptions(ctx);
     lv_dropdown_set_options(ctx->languageDropdown, language_options.c_str());
