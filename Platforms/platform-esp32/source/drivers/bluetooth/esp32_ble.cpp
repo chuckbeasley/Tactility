@@ -930,7 +930,12 @@ static error_t api_scan_start_params(struct Device* device, const struct BtScanP
     } else {
         disc_params.passive           = 0;
         disc_params.filter_duplicates = 1;
-        ctx->scan_resolve_names.store(true);
+        // Default scan: do NOT resolve names by opening a GATT connection to every advertising
+        // peer. On the single-core ESP32-C5 that connect storm starves the controller/host and the
+        // whole system (Web server times out, stack/threads overflow, watchdog reboot). Names that
+        // a device puts in its advertising payload are still shown; only GATT-readable names are
+        // not. Callers that really need resolved names can opt in via scan_start_params(resolve_names=true).
+        ctx->scan_resolve_names.store(false);
     }
 
     uint8_t own_addr_type;
@@ -1235,7 +1240,7 @@ static error_t esp32_ble_start_device(struct Device* device) {
     ctx->subscriptions = nullptr;
     ctx->radio_state.store(BT_RADIO_STATE_OFF);
     ctx->scan_active.store(false);
-    ctx->scan_resolve_names.store(true);
+    ctx->scan_resolve_names.store(false);
     ctx->hid_host_active.store(false);
     ctx->spp_conn_handle.store(BLE_HS_CONN_HANDLE_NONE);
     ctx->spp_active.store(false);
