@@ -107,6 +107,55 @@ static bool isSmartGlasses(const uint8_t* manuf, uint8_t manufLen) {
     return false;
 }
 
+// SoC / radio-chipset vendor company IDs that smart glasses commonly run on. This is a LOW-confidence
+// signal and is deliberately separate from the manufacturer / Appearance match: Qualcomm (0x00D7), Nordic
+// (0x0059) and Espressif (0x02E5) silicon sits in the MAJORITY of BLE products (phones, watches, sensors,
+// keyboards, dev kits), so matching these flags far more than just eyewear. Use it only as a "possible"
+// hint, not proof of a smart glass — hence the softer cyan highlight in the table.
+constexpr uint16_t kGlassesChipsetIds[] = {
+    0x000A, // Qualcomm Technologies (QTIL)
+    0x001D, // Qualcomm (legacy)
+    0x0059, // Nordic Semiconductor (nRF52/nRF53 — many smart glasses and most fitness/sensor BLE)
+    0x00D7, // Qualcomm Snapdragon (XR/AR glasses, but also most modern phones)
+    0x00D8, // Qualcomm
+    0x02E5, // Espressif Systems (ESP32 — many budget smart glasses, plus every dev board)
+};
+constexpr size_t kGlassesChipsetIdCount = sizeof(kGlassesChipsetIds) / sizeof(kGlassesChipsetIds[0]);
+
+// True when the manufacturer data's company ID looks like a glass-common chipset (low confidence).
+static bool isGlassChipset(const uint8_t* manuf, uint8_t manufLen) {
+    if (manufLen < 2) return false;
+    const uint16_t company = static_cast<uint16_t>(manuf[0] | (manuf[1] << 8));
+    for (size_t i = 0; i < kGlassesChipsetIdCount; ++i) {
+        if (company == kGlassesChipsetIds[i]) return true;
+    }
+    return false;
+}
+
+// Walk a raw BLE advertising-data buffer (repeated [len][type][data...]) and return the GAP
+// Appearance value (AD type 0x19, 2 bytes little-endian on air). Returns 0 when not advertised.
+static uint16_t parseAppearance(const uint8_t* adv, uint8_t len) {
+    if (adv == nullptr || len < 3) return 0;
+    uint8_t i = 0;
+    while (i + 2 <= len) {
+        const uint8_t l = adv[i];
+        if (l == 0) break;                            // AD terminator
+        if ((uint16_t)i + 1 + l > len) break;          // truncated / malformed
+        if (adv[i + 1] == 0x19 && l >= 3) {            // Appearance AD (type + 2 value bytes)
+            return static_cast<uint16_t>(adv[i + 2] | (adv[i + 3] << 8));
+        }
+        i += static_cast<uint8_t>(1 + l);
+    }
+    return 0;
+}
+
+// True when the advertised GAP Appearance says "Eye Glasses". Smart glasses / AR-VR advertise this
+// category (GENERIC_EYE_GLASSES = 448 = 0x01C0); this is the most specific BLE metadata signal for
+// eyewear, more reliable than either the manufacturer or chipset company ID.
+static bool isGlassAppearance(uint16_t appearance) {
+    return appearance == 448; // 0x01C0 GENERIC_EYE_GLASSES
+}
+
 // Shared row highlight for smart glasses: gold text + subtle gold background tint. Implemented via
 // the table's item-part style selected by LV_STATE_USER_1, and cells are flagged with
 // LV_TABLE_CELL_CTRL_CUSTOM_1 (this LVGL table version has no per-cell set_cell_style API).
@@ -126,6 +175,23 @@ static void applyGlassesItemStyle(lv_obj_t* table) {
     lv_obj_add_style(table, &s_glassesItemStyle, LV_PART_ITEMS | LV_STATE_USER_1);
 }
 
+// Secondary, lower-confidence highlight for rows that advertise a glass-common chipset vendor ID:
+// cyan text + subtle cyan background tint, via LV_STATE_USER_2 / LV_TABLE_CELL_CTRL_CUSTOM_2. Kept
+// visually distinct (and dimmer) from the gold manufacturer/Appearance match.
+static lv_style_t s_chipsetItemStyle;
+static bool s_chipsetItemStyleReady = false;
+
+static void applyChipsetItemStyle(lv_obj_t* table) {
+    if (!s_chipsetItemStyleReady) {
+        lv_style_init(&s_chipsetItemStyle);
+        lv_style_set_text_color(&s_chipsetItemStyle, lv_color_hex(0x7FE8FF));
+        lv_style_set_bg_color(&s_chipsetItemStyle, lv_color_hex(0x00242E));
+        lv_style_set_bg_opa(&s_chipsetItemStyle, LV_OPA_60);
+        s_chipsetItemStyleReady = true;
+    }
+    lv_obj_add_style(table, &s_chipsetItemStyle, LV_PART_ITEMS | LV_STATE_USER_2);
+}
+
 // A device discovered during scan/monitor. `manuf` carries the advertisement manufacturer bytes.
 struct Peer {
     std::array<uint8_t, 6> addr;
@@ -134,6 +200,7 @@ struct Peer {
     uint8_t addr_type;
     uint8_t manuf[32];
     uint8_t manuf_len;
+    uint16_t appearance; // GAP Appearance AD (type 0x19), 0 if not advertised
     uint32_t seenCount;
 };
 
@@ -151,6 +218,7 @@ struct ObsEntry {
     uint8_t svc_data_len;
     uint8_t adv_data[31];
     uint8_t adv_len;
+    uint16_t appearance; // GAP Appearance AD (type 0x19), 0 if not advertised
     char name[BT_NAME_MAX + 1];
     // Milliseconds since the observer started (for a per-frame timestamp).
     uint32_t uptimeMs;
@@ -335,10 +403,11 @@ static void rebuildObserverLog(Context* ctx) {
     const size_t count = std::min(ctx->obsEntries.size(), OBS_LOG_MAX);
     lv_table_set_row_count(table, static_cast<uint32_t>(count + 1)); // +1 for the header row
     // Clear any previous highlight first — frame indices shift as new frames arrive, so a leftover
-    // CUSTOM_1 flag would land on the wrong (now different) frame.
+    // CUSTOM_1/CUSTOM_2 flag would land on the wrong (now different) frame.
     for (uint32_t r = 1; r <= (uint32_t)count; ++r) {
         for (uint8_t c = 0; c < 4; ++c) {
             lv_table_clear_cell_ctrl(table, r, c, LV_TABLE_CELL_CTRL_CUSTOM_1);
+            lv_table_clear_cell_ctrl(table, r, c, LV_TABLE_CELL_CTRL_CUSTOM_2);
         }
     }
     lv_table_set_cell_value(table, 0, 0, "Type");
@@ -356,10 +425,16 @@ static void rebuildObserverLog(Context* ctx) {
         lv_table_set_cell_value(table, static_cast<uint32_t>(row), 2, addr);
         const std::string info = decodeObserverCell(e);
         lv_table_set_cell_value(table, static_cast<uint32_t>(row), 3, info.c_str());
-        // Highlight rows that advertise a smart-glasses / AR-VR manufacturer's company ID.
-        if (isSmartGlasses(e.manuf, e.manuf_len)) {
+        // Highlight rows that advertise a smart-glasses / AR-VR manufacturer's company ID OR an
+        // explicit "Eye Glasses" GAP Appearance (gold). Absent those, flag a glass-common chipset
+        // vendor ID with the dimmer cyan highlight (low-confidence "possible" hint).
+        if (isSmartGlasses(e.manuf, e.manuf_len) || isGlassAppearance(e.appearance)) {
             for (uint8_t c = 0; c < 4; ++c) {
                 lv_table_set_cell_ctrl(table, static_cast<uint32_t>(row), c, LV_TABLE_CELL_CTRL_CUSTOM_1);
+            }
+        } else if (isGlassChipset(e.manuf, e.manuf_len)) {
+            for (uint8_t c = 0; c < 4; ++c) {
+                lv_table_set_cell_ctrl(table, static_cast<uint32_t>(row), c, LV_TABLE_CELL_CTRL_CUSTOM_2);
             }
         }
     }
@@ -397,6 +472,7 @@ static void rebuildList(Context* ctx) {
     for (uint32_t r = 1; r <= (uint32_t)peers.size(); ++r) {
         for (uint8_t c = 0; c < 3; ++c) {
             lv_table_clear_cell_ctrl(ctx->list, r, c, LV_TABLE_CELL_CTRL_CUSTOM_1);
+            lv_table_clear_cell_ctrl(ctx->list, r, c, LV_TABLE_CELL_CTRL_CUSTOM_2);
         }
     }
     char addr[18];
@@ -408,9 +484,14 @@ static void rebuildList(Context* ctx) {
         lv_table_set_cell_value(ctx->list, row, 1, addr);
         lv_table_set_cell_value(ctx->list, row, 2, std::to_string(peer.rssi).c_str());
         // Highlight smart glasses on the Scan screen (the AirTag tracker list shouldn't be flagged).
-        if (!airtag && isSmartGlasses(peer.manuf, peer.manuf_len)) {
+        // Gold = manufacturer company ID or Eye-Glasses Appearance; cyan = glass-common chipset only.
+        if (!airtag && (isSmartGlasses(peer.manuf, peer.manuf_len) || isGlassAppearance(peer.appearance))) {
             for (uint8_t c = 0; c < 3; ++c) {
                 lv_table_set_cell_ctrl(ctx->list, row, c, LV_TABLE_CELL_CTRL_CUSTOM_1);
+            }
+        } else if (!airtag && isGlassChipset(peer.manuf, peer.manuf_len)) {
+            for (uint8_t c = 0; c < 3; ++c) {
+                lv_table_set_cell_ctrl(ctx->list, row, c, LV_TABLE_CELL_CTRL_CUSTOM_2);
             }
         }
     }
@@ -434,6 +515,7 @@ static void onBtEvent(Context* ctx, const BtEvent& event) {
             peer.rssi = event.peer.rssi;
             peer.manuf_len = event.peer.manuf_len;
             if (peer.manuf_len > 0) memcpy(peer.manuf, event.peer.manuf_data, peer.manuf_len);
+            peer.appearance = parseAppearance(event.peer.adv_data, event.peer.adv_len);
             if (event.peer.name[0] != '\0') {
                 std::strncpy(peer.name, event.peer.name, BT_NAME_MAX);
                 peer.name[BT_NAME_MAX] = '\0';
@@ -467,6 +549,7 @@ static void onBtEvent(Context* ctx, const BtEvent& event) {
                 if (obs.svc_data_len > 0) memcpy(obs.svc_data, event.peer.svc_data, obs.svc_data_len);
                 obs.adv_len = event.peer.adv_len;
                 if (obs.adv_len > 0) memcpy(obs.adv_data, event.peer.adv_data, obs.adv_len);
+                obs.appearance = parseAppearance(event.peer.adv_data, event.peer.adv_len);
                 if (event.peer.name[0] != '\0') {
                     std::strncpy(obs.name, event.peer.name, BT_NAME_MAX);
                     obs.name[BT_NAME_MAX] = '\0';
@@ -678,6 +761,7 @@ static void showScanScreen(Context* ctx) {
     lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->list, 0, LV_STATE_DEFAULT);
     applyGlassesItemStyle(ctx->list);
+    applyChipsetItemStyle(ctx->list);
 
     auto* button = lv_button_create(ctx->body);
     lv_obj_set_width(button, LV_PCT(100));
@@ -820,6 +904,7 @@ static void showAirtagScreen(Context* ctx) {
     lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->list, 0, LV_STATE_DEFAULT);
     applyGlassesItemStyle(ctx->list);
+    applyChipsetItemStyle(ctx->list);
 
     auto* button = lv_button_create(ctx->body);
     lv_obj_set_width(button, LV_PCT(100));
@@ -910,6 +995,7 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     applyGlassesItemStyle(ctx->obsLogLabel);
+    applyChipsetItemStyle(ctx->obsLogLabel);
     lv_table_set_row_count(ctx->obsLogLabel, 1);
     lv_table_set_cell_value(ctx->obsLogLabel, 0, 0, "Type");
     lv_table_set_cell_value(ctx->obsLogLabel, 0, 1, "RSSI");
