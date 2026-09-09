@@ -137,7 +137,6 @@ struct Context {
     uint8_t channelIndex = 0;
     uint8_t hopTick = 0;
     uint8_t targetMac[6] = {0};
-    bool macFilterEnabled = false;
     uint8_t apBssid[6] = {0};
     bool apBssidKnown = false;
 #endif
@@ -299,10 +298,13 @@ static void onPacket(void* context, const uint8_t* payload, size_t length, WifiP
         }
     }
 
-    if (ctx->macFilterEnabled && length >= 22) {
+    // Capture filter: when a target client MAC is set, only log frames that mention that MAC (its
+    // addresses could be addr1/addr2/addr3 of the handshake). The same field drives the deauth
+    // target, so the capture focuses on exactly the client whose handshake we're eliciting.
+    if (ctx->deauthClientKnown && length >= 22) {
         bool matched = false;
         for (size_t off = 4; off + 6 <= length && off <= 16; off += 6) {
-            if (std::memcmp(payload + off, ctx->targetMac, 6) == 0) {
+            if (std::memcmp(payload + off, ctx->deauthClient, 6) == 0) {
                 matched = true;
                 break;
             }
@@ -814,18 +816,6 @@ static void onCaptureChannelChanged(lv_event_t* event) {
     }
 }
 
-static void onCaptureMacChanged(lv_event_t* event) {
-    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
-    auto* textarea = static_cast<lv_obj_t*>(lv_event_get_target(event));
-    uint8_t mac[6];
-    if (parseMac(lv_textarea_get_text(textarea), mac)) {
-        std::memcpy(ctx->targetMac, mac, 6);
-        ctx->macFilterEnabled = true;
-    } else {
-        ctx->macFilterEnabled = false;
-    }
-}
-
 static void onCaptureDeauthToggled(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
     auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(event));
@@ -852,12 +842,6 @@ static void showCaptureScreen(Context* ctx) {
     lv_dropdown_set_selected(channelDropdown, 0);
     lv_obj_set_width(channelDropdown, LV_PCT(100));
     lv_obj_add_event_cb(channelDropdown, onCaptureChannelChanged, LV_EVENT_VALUE_CHANGED, ctx);
-
-    auto* macTextarea = lv_textarea_create(ctx->body);
-    lv_textarea_set_placeholder_text(macTextarea, "Filter MAC (blank = all), e.g. 34:3e:a4:7e:90:45");
-    lv_textarea_set_one_line(macTextarea, true);
-    lv_obj_set_width(macTextarea, LV_PCT(100));
-    lv_obj_add_event_cb(macTextarea, onCaptureMacChanged, LV_EVENT_VALUE_CHANGED, ctx);
 
     // Deauth-to-force-handshake: while capturing, burst deauth frames (spoofing the target AP) so a
     // connected client reassociates and emits a fresh EAPOL/PMKID that the sniffer writes to PCAP.
@@ -888,7 +872,7 @@ static void showCaptureScreen(Context* ctx) {
     lv_obj_add_event_cb(deauthBssid, onInjectBssidChanged, LV_EVENT_VALUE_CHANGED, ctx);
 
     auto* deauthClientTa = lv_textarea_create(ctx->body);
-    lv_textarea_set_placeholder_text(deauthClientTa, "Client MAC to deauth (blank = all clients)");
+    lv_textarea_set_placeholder_text(deauthClientTa, "Target client MAC (blank = broadcast deauth + capture all)");
     lv_textarea_set_one_line(deauthClientTa, true);
     lv_textarea_set_accepted_chars(deauthClientTa, "0123456789abcdefABCDEF:");
     lv_obj_set_width(deauthClientTa, LV_PCT(100));
