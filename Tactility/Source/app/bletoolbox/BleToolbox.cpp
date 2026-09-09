@@ -294,7 +294,7 @@ static void rebuildObserverLog(Context* ctx) {
 static BtScanParams observerScanParams(const Context* ctx) {
     BtScanParams p = {};
     p.passive = true; // observe-only: never send SCAN_REQ (quieter, less intrusive)
-    p.filter_duplicates = false;
+    p.filter_duplicates = true; // show each device once (like BLE Scan), not every advertising packet
     p.resolve_names = false;
     p.itvl = OBS_SCAN_ITVL;
     p.window = OBS_SCAN_WINDOW;
