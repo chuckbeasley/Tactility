@@ -863,9 +863,17 @@ static void showCaptureScreen(Context* ctx) {
     // connected client reassociates and emits a fresh EAPOL/PMKID that the sniffer writes to PCAP.
     auto* deauthRow = lv_obj_create(ctx->body);
     lv_obj_set_width(deauthRow, LV_PCT(100));
+    lv_obj_set_height(deauthRow, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(deauthRow, LV_FLEX_FLOW_ROW);
     lv_obj_set_style_pad_all(deauthRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_row(deauthRow, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_pad_column(deauthRow, 8, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(deauthRow, LV_OPA_TRANSP, LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(deauthRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(deauthRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(deauthRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_left(deauthRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_right(deauthRow, 0, LV_STATE_DEFAULT);
     auto* deauthLabel = lv_label_create(deauthRow);
     lv_obj_set_flex_grow(deauthLabel, 1);
     lv_label_set_text(deauthLabel, "Deauth to force handshake");
