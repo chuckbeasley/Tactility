@@ -817,9 +817,9 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_pad_top(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
-    // Fill the space above the controls so the Start/Stop + Clear row sits at the bottom edge of the
-    // screen (body is non-scrollable, so flex_grow is bounded and actually expands the table).
-    lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
+    // Explicit height that fills the space between the counter and the Start/Stop + Clear row, so the
+    // row sits at the bottom edge of the screen. flex_grow proved unreliable at expanding the table.
+    lv_obj_set_height(ctx->obsLogLabel, 200);
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_table_set_row_count(ctx->obsLogLabel, 1);
