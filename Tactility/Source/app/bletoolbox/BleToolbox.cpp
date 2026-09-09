@@ -797,9 +797,11 @@ static void showObserverScreen(Context* ctx) {
     // so the log's flex_grow gets a real (bounded) height and nothing is clipped off-screen.
     lv_obj_set_scroll_dir(ctx->body, LV_DIR_NONE);
 
-    // Frame counter, above the table (guaranteed visible, right under the toolbar).
+    // Frame counter, above the table (guaranteed visible, right under the toolbar). Fixed height so
+    // the flex_grow table below gets a definite, bounded region.
     ctx->countLabel = lv_label_create(ctx->body);
     lv_obj_set_width(ctx->countLabel, LV_PCT(100));
+    lv_obj_set_height(ctx->countLabel, 22);
     lv_label_set_text(ctx->countLabel, "0 frames");
 
     // Frame log as a table (Type | RSSI | Addr | Info), filling the space above the controls. Same
@@ -817,9 +819,9 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_pad_top(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
-    // Explicit height that fills the space between the counter and the Start/Stop + Clear row, so the
-    // row sits at the bottom edge of the screen. flex_grow proved unreliable at expanding the table.
-    lv_obj_set_height(ctx->obsLogLabel, 200);
+    // Fill the space between the counter and the bottom edge so the Start/Stop + Clear row sits at
+    // the bottom of the screen and stays visible (same flex_grow the Scan screen uses).
+    lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_table_set_row_count(ctx->obsLogLabel, 1);
@@ -837,6 +839,9 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_bg_opa(bottomRow, LV_OPA_TRANSP, LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(bottomRow, 0, LV_STATE_DEFAULT);
     lv_obj_set_scroll_dir(bottomRow, LV_DIR_NONE);
+    // Pin the controls to the bottom edge of the body so they're always visible and never pushed
+    // off-screen by the table (the flex layout was unreliable at filling/placing them).
+    lv_obj_align(bottomRow, LV_ALIGN_BOTTOM_MID, 0, 0);
 
     auto* startBtn = lv_button_create(bottomRow);
     lv_obj_set_width(startBtn, LV_PCT(48));
