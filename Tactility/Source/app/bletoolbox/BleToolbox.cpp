@@ -105,9 +105,8 @@ struct Context {
     bool airtagRunning = false;
     bool spamRunning = false;
     // BLE Observer (advertising sniffer). Uses the same scan subscription but with a raw,
-    // non-de-duplicated, optionally passive scan, and does NOT do GATT name resolution.
+    // non-de-duplicated, passive scan, and does NOT do GATT name resolution.
     bool obsRunning = false;
-    bool obsPassive = false;
     uint32_t obsStartMs = 0;
     size_t currentPayload = 0;
     bool randomizeAddress = true;
@@ -294,7 +293,7 @@ static void rebuildObserverLog(Context* ctx) {
 // name resolution (a sniffer must stay non-intrusive and not initiate central connections).
 static BtScanParams observerScanParams(const Context* ctx) {
     BtScanParams p = {};
-    p.passive = ctx->obsPassive;
+    p.passive = true; // observe-only: never send SCAN_REQ (quieter, less intrusive)
     p.filter_duplicates = false;
     p.resolve_names = false;
     p.itvl = OBS_SCAN_ITVL;
@@ -902,6 +901,13 @@ static void onPollTick(Context* ctx) {
         if (ctx->countLabel != nullptr) {
             lv_label_set_text(ctx->countLabel, std::format("{} frames", (unsigned)ctx->obsEntries.size()).c_str());
         }
+        if (ctx->obsDirty && ctx->obsLogLabel != nullptr) {
+            ctx->obsDirty = false;
+            // Rebuild the table here (every ~300ms) instead of on every BLE event; doing it per event
+            // held the LVGL lock constantly under the flood of advertising reports and starved the
+            // LVGL task (lockup). We already hold the LVGL lock in onPollTick.
+            rebuildObserverLog(ctx);
+        }
     }
     if (ctx->screen == Screen::Spam && ctx->spamLabel != nullptr) {
         // Show the live spoof name only while actively broadcasting; keep it blank when stopped.
@@ -1006,14 +1012,8 @@ int32_t appMain(int argc, char* argv[]) {
             lvgl_unlock();
         }
 
-        // The observer log is a single (potentially long) wrapped label; rebuild it the same way,
-        // under the LVGL lock, and only when a new frame was captured.
-        if (ctx.obsDirty && ctx.obsLogLabel != nullptr) {
-            ctx.obsDirty = false;
-            lvgl_lock();
-            rebuildObserverLog(&ctx);
-            lvgl_unlock();
-        }
+        // The observer log now rebuilds inside onPollTick (throttled to ~300ms) to avoid holding the
+        // LVGL lock under the flood of advertising reports.
     }
 
     stopAllActive(&ctx);
