@@ -63,6 +63,69 @@ constexpr size_t OBS_LOG_MAX = 200;
 constexpr uint16_t OBS_SCAN_ITVL = 0x0040;
 constexpr uint16_t OBS_SCAN_WINDOW = 0x0030;
 
+// Bluetooth SIG Company Identifiers of smart-glasses / AR-VR manufacturers. In Manufacturer Specific
+// Data the 16-bit company ID is the two leading octets, little-endian on air (manuf[0] | manuf[1]<<8).
+// NOTE: a big-tech ID (Apple 0x004C, Google 0x00E0, Samsung 0x0075, Meta 0x01AB, ...) matches EVERY
+// device that company makes, not only its smart glasses; the dedicated AR/VR OEMs (Snap, Kopin,
+// Even Realities, Luxottica, ...) are far more specific.
+constexpr uint16_t kSmartGlassesCompanyIds[] = {
+    0x0002, // Intel (Vaunt)
+    0x0006, // Microsoft (HoloLens / Mesh)
+    0x0040, // Seiko Epson (Moverio)
+    0x004C, // Apple (Vision Pro / Find-My) — also iPhones, AirPods, Watch
+    0x0075, // Samsung
+    0x0092, // ThinkOptics
+    0x009E, // Bose (Frames audio glasses)
+    0x00A8, // ARP Devices
+    0x00C4, // LG
+    0x00E0, // Google (Glass)
+    0x00F3, // Kent Displays
+    0x012D, // Sony
+    0x0171, // Amazon (Echo Frames)
+    0x01AB, // Meta Platforms (was Facebook) — Ray-Ban Meta, Quest
+    0x027D, // Huawei
+    0x02C5, // Lenovo (ThinkReality)
+    0x02ED, // HTC
+    0x02EF, // SMART-INNOVATION
+    0x02F7, // DreamVisions
+    0x038F, // Xiaomi
+    0x03C2, // Snap (Spectacles)
+    0x041F, // Kopin
+    0x0BC6, // TCL
+    0x0D53, // Luxottica (Ray-Ban / EssilorLuxottica)
+    0x10F9, // Even Realities
+};
+constexpr size_t kSmartGlassesCompanyIdCount = sizeof(kSmartGlassesCompanyIds) / sizeof(kSmartGlassesCompanyIds[0]);
+
+// True when a device advertises a smart-glasses / AR-VR manufacturer's company ID.
+static bool isSmartGlasses(const uint8_t* manuf, uint8_t manufLen) {
+    if (manufLen < 2) return false;
+    const uint16_t company = static_cast<uint16_t>(manuf[0] | (manuf[1] << 8));
+    for (size_t i = 0; i < kSmartGlassesCompanyIdCount; ++i) {
+        if (company == kSmartGlassesCompanyIds[i]) return true;
+    }
+    return false;
+}
+
+// Shared row highlight for smart glasses: gold text + subtle gold background tint. Implemented via
+// the table's item-part style selected by LV_STATE_USER_1, and cells are flagged with
+// LV_TABLE_CELL_CTRL_CUSTOM_1 (this LVGL table version has no per-cell set_cell_style API).
+static lv_style_t s_glassesItemStyle;
+static bool s_glassesItemStyleReady = false;
+
+// Register the highlight style on a table once. Cells set to LV_TABLE_CELL_CTRL_CUSTOM_1 then render
+// in gold. Call after the table is created.
+static void applyGlassesItemStyle(lv_obj_t* table) {
+    if (!s_glassesItemStyleReady) {
+        lv_style_init(&s_glassesItemStyle);
+        lv_style_set_text_color(&s_glassesItemStyle, lv_color_hex(0xFFE066));
+        lv_style_set_bg_color(&s_glassesItemStyle, lv_color_hex(0x3A3200));
+        lv_style_set_bg_opa(&s_glassesItemStyle, LV_OPA_60);
+        s_glassesItemStyleReady = true;
+    }
+    lv_obj_add_style(table, &s_glassesItemStyle, LV_PART_ITEMS | LV_STATE_USER_1);
+}
+
 // A device discovered during scan/monitor. `manuf` carries the advertisement manufacturer bytes.
 struct Peer {
     std::array<uint8_t, 6> addr;
@@ -271,6 +334,13 @@ static void rebuildObserverLog(Context* ctx) {
     if (table == nullptr) return;
     const size_t count = std::min(ctx->obsEntries.size(), OBS_LOG_MAX);
     lv_table_set_row_count(table, static_cast<uint32_t>(count + 1)); // +1 for the header row
+    // Clear any previous highlight first — frame indices shift as new frames arrive, so a leftover
+    // CUSTOM_1 flag would land on the wrong (now different) frame.
+    for (uint32_t r = 1; r <= (uint32_t)count; ++r) {
+        for (uint8_t c = 0; c < 4; ++c) {
+            lv_table_clear_cell_ctrl(table, r, c, LV_TABLE_CELL_CTRL_CUSTOM_1);
+        }
+    }
     lv_table_set_cell_value(table, 0, 0, "Type");
     lv_table_set_cell_value(table, 0, 1, "RSSI");
     lv_table_set_cell_value(table, 0, 2, "Addr");
@@ -286,6 +356,12 @@ static void rebuildObserverLog(Context* ctx) {
         lv_table_set_cell_value(table, static_cast<uint32_t>(row), 2, addr);
         const std::string info = decodeObserverCell(e);
         lv_table_set_cell_value(table, static_cast<uint32_t>(row), 3, info.c_str());
+        // Highlight rows that advertise a smart-glasses / AR-VR manufacturer's company ID.
+        if (isSmartGlasses(e.manuf, e.manuf_len)) {
+            for (uint8_t c = 0; c < 4; ++c) {
+                lv_table_set_cell_ctrl(table, static_cast<uint32_t>(row), c, LV_TABLE_CELL_CTRL_CUSTOM_1);
+            }
+        }
     }
 }
 
@@ -317,6 +393,12 @@ static void rebuildList(Context* ctx) {
     lv_table_set_cell_value(ctx->list, 0, 0, "Name");
     lv_table_set_cell_value(ctx->list, 0, 1, "Address");
     lv_table_set_cell_value(ctx->list, 0, 2, "RSSI");
+    // Clear any previous highlight (row indices can shift as peers are added/evicted).
+    for (uint32_t r = 1; r <= (uint32_t)peers.size(); ++r) {
+        for (uint8_t c = 0; c < 3; ++c) {
+            lv_table_clear_cell_ctrl(ctx->list, r, c, LV_TABLE_CELL_CTRL_CUSTOM_1);
+        }
+    }
     char addr[18];
     for (size_t i = 0; i < peers.size(); ++i) {
         const uint32_t row = (uint32_t)(i + 1);
@@ -325,6 +407,12 @@ static void rebuildList(Context* ctx) {
         formatAddr(peer.addr.data(), addr, sizeof(addr));
         lv_table_set_cell_value(ctx->list, row, 1, addr);
         lv_table_set_cell_value(ctx->list, row, 2, std::to_string(peer.rssi).c_str());
+        // Highlight smart glasses on the Scan screen (the AirTag tracker list shouldn't be flagged).
+        if (!airtag && isSmartGlasses(peer.manuf, peer.manuf_len)) {
+            for (uint8_t c = 0; c < 3; ++c) {
+                lv_table_set_cell_ctrl(ctx->list, row, c, LV_TABLE_CELL_CTRL_CUSTOM_1);
+            }
+        }
     }
 }
 
@@ -589,6 +677,7 @@ static void showScanScreen(Context* ctx) {
     lv_obj_set_flex_grow(ctx->list, 1);
     lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->list, 0, LV_STATE_DEFAULT);
+    applyGlassesItemStyle(ctx->list);
 
     auto* button = lv_button_create(ctx->body);
     lv_obj_set_width(button, LV_PCT(100));
@@ -730,6 +819,7 @@ static void showAirtagScreen(Context* ctx) {
     lv_obj_set_flex_grow(ctx->list, 1);
     lv_obj_set_scroll_dir(ctx->list, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->list, 0, LV_STATE_DEFAULT);
+    applyGlassesItemStyle(ctx->list);
 
     auto* button = lv_button_create(ctx->body);
     lv_obj_set_width(button, LV_PCT(100));
@@ -819,6 +909,7 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
+    applyGlassesItemStyle(ctx->obsLogLabel);
     lv_table_set_row_count(ctx->obsLogLabel, 1);
     lv_table_set_cell_value(ctx->obsLogLabel, 0, 0, "Type");
     lv_table_set_cell_value(ctx->obsLogLabel, 0, 1, "RSSI");
