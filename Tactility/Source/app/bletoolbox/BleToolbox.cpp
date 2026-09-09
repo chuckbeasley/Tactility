@@ -797,6 +797,11 @@ static void showObserverScreen(Context* ctx) {
     // so the log's flex_grow gets a real (bounded) height and nothing is clipped off-screen.
     lv_obj_set_scroll_dir(ctx->body, LV_DIR_NONE);
 
+    // Frame counter, above the table (guaranteed visible, right under the toolbar).
+    ctx->countLabel = lv_label_create(ctx->body);
+    lv_obj_set_width(ctx->countLabel, LV_PCT(100));
+    lv_label_set_text(ctx->countLabel, "0 frames");
+
     // Frame log as a table (Type | RSSI | Addr | Info), filling the space above the controls. Same
     // bounded, self-scrolling widget the Scan screen uses.
     ctx->obsLogLabel = lv_table_create(ctx->body);
@@ -812,9 +817,9 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_pad_top(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
-    // Explicit height that fills the space above the buttons/footer. flex_grow proved unreliable for
-    // making the table expand here, so the height is fixed to fill the 480x320 body.
-    lv_obj_set_height(ctx->obsLogLabel, 164);
+    // Fill the space above the controls so the Start/Stop + Clear row sits at the bottom edge of the
+    // screen (body is non-scrollable, so flex_grow is bounded and actually expands the table).
+    lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_table_set_row_count(ctx->obsLogLabel, 1);
@@ -851,10 +856,6 @@ static void showObserverScreen(Context* ctx) {
     lv_label_set_text(clearLabel, "Clear");
     lv_obj_center(clearLabel);
     lv_obj_add_event_cb(clearBtn, onClearObserver, LV_EVENT_SHORT_CLICKED, ctx);
-
-    // Footer frame count at the very bottom.
-    ctx->countLabel = lv_label_create(ctx->body);
-    lv_label_set_text(ctx->countLabel, "0 frames");
 }
 
 // ---- Polling (timer task) ----
