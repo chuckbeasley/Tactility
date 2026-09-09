@@ -792,16 +792,12 @@ static void onClearObserver(lv_event_t* event) {
 }
 
 static void showObserverScreen(Context* ctx) {
-    // Layout: the frame log fills the remaining page space (flex_grow) and scrolls internally; the
-    // Start/Stop + Clear row sits directly above the footer frame-count. The body is non-scrollable
-    // so the log's flex_grow gets a real (bounded) height and nothing is clipped off-screen.
-    lv_obj_set_scroll_dir(ctx->body, LV_DIR_NONE);
+    // Keep the body scrollable (as the AirTag monitor does) — setting it non-scrollable is what
+    // caused the flex_grow table below to collapse instead of filling.
 
-    // Frame counter, above the table (guaranteed visible, right under the toolbar). Fixed height so
-    // the flex_grow table below gets a definite, bounded region.
+    // Frame counter, above the table.
     ctx->countLabel = lv_label_create(ctx->body);
     lv_obj_set_width(ctx->countLabel, LV_PCT(100));
-    lv_obj_set_height(ctx->countLabel, 22);
     lv_label_set_text(ctx->countLabel, "0 frames");
 
     // Frame log as a table (Type | RSSI | Addr | Info), filling the space above the controls. Same
@@ -819,9 +815,7 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_pad_top(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
-    // Fixed height that fills the space between the counter and the Start/Stop + Clear row, keeping
-    // the buttons low on the screen. (The app body doesn't give flex_grow a definite height to fill.)
-    lv_obj_set_height(ctx->obsLogLabel, 185);
+    lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_table_set_row_count(ctx->obsLogLabel, 1);
@@ -830,11 +824,12 @@ static void showObserverScreen(Context* ctx) {
     lv_table_set_cell_value(ctx->obsLogLabel, 0, 2, "Addr");
     lv_table_set_cell_value(ctx->obsLogLabel, 0, 3, "Info");
 
-    // Buttons row: Start/Stop (left) + Clear (right), directly above the footer.
+    // A single non-flex container holding both buttons (aligned left/right so they sit side by side).
+    // Keeping it non-flex (not a flex-row) and fixed-height lets the flex_grow table above expand
+    // and push this container to the bottom, as the stacked full-width buttons did.
     auto* bottomRow = lv_obj_create(ctx->body);
     lv_obj_set_width(bottomRow, LV_PCT(100));
-    lv_obj_set_flex_flow(bottomRow, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(bottomRow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_set_height(bottomRow, 32);
     lv_obj_set_style_pad_all(bottomRow, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(bottomRow, LV_OPA_TRANSP, LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(bottomRow, 0, LV_STATE_DEFAULT);
@@ -843,16 +838,17 @@ static void showObserverScreen(Context* ctx) {
     auto* startBtn = lv_button_create(bottomRow);
     lv_obj_set_width(startBtn, LV_PCT(48));
     lv_obj_set_height(startBtn, 32);
+    lv_obj_align(startBtn, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_set_style_pad_all(startBtn, 0, LV_STATE_DEFAULT);
     ctx->startButtonLabel = lv_label_create(startBtn);
     lv_label_set_text(ctx->startButtonLabel, "Start Observing");
     lv_obj_center(ctx->startButtonLabel);
-    lv_obj_set_style_text_letter_space(ctx->startButtonLabel, 0, LV_STATE_DEFAULT);
     lv_obj_add_event_cb(startBtn, onStartObserver, LV_EVENT_SHORT_CLICKED, ctx);
 
     auto* clearBtn = lv_button_create(bottomRow);
     lv_obj_set_width(clearBtn, LV_PCT(48));
     lv_obj_set_height(clearBtn, 32);
+    lv_obj_align(clearBtn, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_pad_all(clearBtn, 0, LV_STATE_DEFAULT);
     auto* clearLabel = lv_label_create(clearBtn);
     lv_label_set_text(clearLabel, "Clear");
