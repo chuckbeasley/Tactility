@@ -750,7 +750,9 @@ static void onStartObserver(lv_event_t* event) {
     if (ctx->obsRunning) {
         ctx->obsRunning = false;
         Device* dev = ctx->dev;
-        if (dev != nullptr && bluetooth_is_scanning(dev)) {
+        if (dev != nullptr) {
+            // Stop unconditionally — is_scanning() can read false during the auto-restart gap and
+            // skip the stop, leaving a freshly-restarted scan running until its window ends.
             bluetooth_scan_stop(dev);
         }
         // Toggle the button label immediately (this LVGL callback runs on the LVGL task), so the
