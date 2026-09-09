@@ -819,9 +819,9 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_pad_top(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_pad_bottom(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_obj_set_width(ctx->obsLogLabel, LV_PCT(100));
-    // Fill the space between the counter and the bottom edge so the Start/Stop + Clear row sits at
-    // the bottom of the screen and stays visible (same flex_grow the Scan screen uses).
-    lv_obj_set_flex_grow(ctx->obsLogLabel, 1);
+    // Fixed height that fills the space between the counter and the Start/Stop + Clear row, keeping
+    // the buttons low on the screen. (The app body doesn't give flex_grow a definite height to fill.)
+    lv_obj_set_height(ctx->obsLogLabel, 185);
     lv_obj_set_scroll_dir(ctx->obsLogLabel, LV_DIR_VER);
     lv_obj_set_style_pad_all(ctx->obsLogLabel, 0, LV_STATE_DEFAULT);
     lv_table_set_row_count(ctx->obsLogLabel, 1);
@@ -839,9 +839,6 @@ static void showObserverScreen(Context* ctx) {
     lv_obj_set_style_bg_opa(bottomRow, LV_OPA_TRANSP, LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(bottomRow, 0, LV_STATE_DEFAULT);
     lv_obj_set_scroll_dir(bottomRow, LV_DIR_NONE);
-    // Pin the controls to the bottom edge of the body so they're always visible and never pushed
-    // off-screen by the table (the flex layout was unreliable at filling/placing them).
-    lv_obj_align(bottomRow, LV_ALIGN_BOTTOM_MID, 0, 0);
 
     auto* startBtn = lv_button_create(bottomRow);
     lv_obj_set_width(startBtn, LV_PCT(48));
@@ -929,6 +926,7 @@ static void createWidgets(lv_obj_t* parent, void* userData) {
 
     ctx->body = lv_obj_create(parent);
     lv_obj_set_width(ctx->body, LV_PCT(100));
+    lv_obj_set_height(ctx->body, LV_PCT(100)); // fill the window so flex_grow children have space
     lv_obj_set_flex_grow(ctx->body, 1);
     lv_obj_set_flex_flow(ctx->body, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(ctx->body, 8, LV_STATE_DEFAULT);
