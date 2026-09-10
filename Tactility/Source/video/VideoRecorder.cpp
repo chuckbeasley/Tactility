@@ -1049,7 +1049,11 @@ TtVideoFrameKind tt_video_grab_delta(int quality, int scale, const uint8_t** out
     uint32_t region_w = 0;
     uint32_t region_h = 0;
 
-    if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
+    // No LVGL lock here either, for the same reason as the capture path in tt_video_grab_jpeg():
+    // the dirty rectangle is taken atomically and the region copy is bracketed by the shadow's
+    // sequence counter, so a busy screen costs an occasional retry instead of a wait for rendering
+    // to stop. Nothing in this block walks the widget tree.
+    {
         lv_display_t* display = lv_display_get_default();
         uint8_t* shadow = nullptr;
         uint32_t shadow_w = 0;
@@ -1137,7 +1141,6 @@ TtVideoFrameKind tt_video_grab_delta(int quality, int scale, const uint8_t** out
             }
         }
 
-        lvgl_unlock();
     }
 
     size_t payload_size = 0;
