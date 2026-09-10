@@ -45,13 +45,16 @@ bool tt_video_is_recording(void);
  * calls don't churn the heap. Calls are serialized internally and the returned pointer stays
  * valid only until the next call, so a single consumer must finish with it first.
  *
+ * @param[in]  quality    JPEG quality, 1..100. Pass 0 for the default (60).
+ * @param[in]  scale      Downscale factor, 1..4 (1 or 0 = full resolution). 2 halves each axis,
+ *                        cutting the encode to roughly a quarter of the pixels at half the detail.
  * @param[out] out_data   receives the JPEG bytes (not null-terminated). May be null.
  * @param[out] out_size   receives the JPEG length in bytes. May be null.
  * @param[out] out_width  receives the captured width in pixels. May be null.
  * @param[out] out_height receives the captured height in pixels. May be null.
  * @return true on success; false if the LVGL lock couldn't be taken or capture/encode failed.
  */
-bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* out_width, uint32_t* out_height);
+bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t* out_size, uint32_t* out_width, uint32_t* out_height);
 
 /** Diagnostics for the most recent tt_video_grab_jpeg() call. All times are milliseconds. */
 struct TtVideoGrabStats {
@@ -62,6 +65,10 @@ struct TtVideoGrabStats {
     bool used_shadow_frame;    /**< true when the display's shadow frame was used instead of a snapshot. */
     uint32_t resolution_w;     /**< Display resolution at capture time. */
     uint32_t resolution_h;     /**< Display resolution at capture time. */
+    uint32_t quality;          /**< JPEG quality actually used. */
+    uint32_t scale;            /**< Downscale factor actually used (1 = full resolution). */
+    uint32_t output_w;         /**< Width of the encoded frame. */
+    uint32_t output_h;         /**< Height of the encoded frame. */
 };
 
 /** Copies the timings of the most recent tt_video_grab_jpeg() call into @a out. */

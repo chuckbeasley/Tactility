@@ -28,6 +28,47 @@ namespace {
 // UART up under a slow reader, and a blocked log call stalls the very path being measured.
 TtVideoGrabStats g_grab_stats = {};
 
+// Box-averages an RGB565 frame down by `scale` in place. Raster order makes this safe: an output
+// pixel is always written at or before the input pixels it reads, so the reads never see clobbered
+// data. Returns the new dimensions through out_w/out_h (unchanged when the image is too small).
+static void downscale_rgb565_in_place(uint8_t* data, uint32_t w, uint32_t h, uint32_t scale, uint32_t* out_w, uint32_t* out_h) {
+    const uint32_t new_w = w / scale;
+    const uint32_t new_h = h / scale;
+    if (scale <= 1 || new_w == 0 || new_h == 0) {
+        *out_w = w;
+        *out_h = h;
+        return;
+    }
+
+    uint16_t* px = reinterpret_cast<uint16_t*>(data);
+    const uint32_t samples = scale * scale;
+    const uint32_t half = samples / 2;
+
+    for (uint32_t y = 0; y < new_h; ++y) {
+        for (uint32_t x = 0; x < new_w; ++x) {
+            uint32_t r = 0;
+            uint32_t g = 0;
+            uint32_t b = 0;
+            for (uint32_t sy = 0; sy < scale; ++sy) {
+                const uint16_t* row = px + static_cast<size_t>(y * scale + sy) * w + static_cast<size_t>(x) * scale;
+                for (uint32_t sx = 0; sx < scale; ++sx) {
+                    const uint16_t p = row[sx];
+                    r += (p >> 11) & 0x1Fu;
+                    g += (p >> 5) & 0x3Fu;
+                    b += p & 0x1Fu;
+                }
+            }
+            px[static_cast<size_t>(y) * new_w + x] =
+                static_cast<uint16_t>((((r + half) / samples) << 11) |
+                                      (((g + half) / samples) << 5) |
+                                      ((b + half) / samples));
+        }
+    }
+
+    *out_w = new_w;
+    *out_h = new_h;
+}
+
 // Frame caps keep PSRAM bounded. MJPEG frames are small (~5 KB each, 15 frames). Uncompressed RGB
 // expands to w*h*3 bytes/frame, so it is capped lower to keep peak memory under the 8 MB PSRAM.
 constexpr uint32_t MAX_FRAMES_MJPEG = 15; // ~3 s at 5 fps
@@ -577,7 +618,15 @@ bool tt_video_is_recording(void) {
     return recording;
 }
 
-bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* out_width, uint32_t* out_height) {
+bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t* out_size, uint32_t* out_width, uint32_t* out_height) {
+    // Clamp the caller's knobs before anything else so the rest of the function can rely on them.
+    if (quality < 1 || quality > 100) {
+        quality = 60;
+    }
+    if (scale < 1 || scale > 4) {
+        scale = 1;
+    }
+
     // Scratch buffers live for the process lifetime once allocated: streaming asks for frames
     // continuously, so re-allocating ~300 KB per frame would fragment the heap for no benefit.
     static SemaphoreHandle_t grab_mutex = nullptr;
@@ -688,12 +737,17 @@ bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* ou
         bgr_swap_rgb565(rgb565_buf, static_cast<size_t>(w) * h);
         t_swap_done = esp_timer_get_time();
 
+        // Optional downscale, folded in before the encode so the encoder sees fewer pixels.
+        if (scale > 1) {
+            downscale_rgb565_in_place(rgb565_buf, w, h, scale, &w, &h);
+        }
+
         jpeg_enc_config_t config = DEFAULT_JPEG_ENC_CONFIG();
         config.width = static_cast<int>(w);
         config.height = static_cast<int>(h);
         config.src_type = JPEG_PIXEL_FORMAT_RGB565_LE;
         config.subsampling = JPEG_SUBSAMPLE_420;
-        config.quality = 60;
+        config.quality = quality;
         config.rotate = JPEG_ROTATE_0D;
         config.task_enable = false;
 
@@ -728,6 +782,10 @@ bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* ou
         g_grab_stats.swap_ms = static_cast<uint32_t>((t_swap_done - t_capture_done) / 1000);
         g_grab_stats.encode_ms = static_cast<uint32_t>((t_end - t_swap_done) / 1000);
         g_grab_stats.used_shadow_frame = used_shadow_frame;
+        g_grab_stats.quality = static_cast<uint32_t>(quality);
+        g_grab_stats.scale = static_cast<uint32_t>(scale);
+        g_grab_stats.output_w = w;
+        g_grab_stats.output_h = h;
         if (ok) {
             g_grab_stats.frames++;
         }

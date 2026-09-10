@@ -1362,7 +1362,11 @@ esp_err_t WebServerService::handleApiSysinfo(httpd_req_t* request) {
              << "\"encode_ms\":" << stats.encode_ms << ","
              << "\"shadow_frame\":" << (stats.used_shadow_frame ? "true" : "false") << ","
              << "\"resolution_w\":" << stats.resolution_w << ","
-             << "\"resolution_h\":" << stats.resolution_h
+             << "\"resolution_h\":" << stats.resolution_h << ","
+             << "\"quality\":" << stats.quality << ","
+             << "\"scale\":" << stats.scale << ","
+             << "\"output_w\":" << stats.output_w << ","
+             << "\"output_h\":" << stats.output_h
              << "}";
     }
 
@@ -1850,12 +1854,23 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
             }
         }
 
-        if (frame.len == 1 && payload[0] == 'f') {
+        if (frame.len >= 1 && payload[0] == 'f') {
+            // "f" optionally carries the JPEG quality and/or a downscale factor: "f", "f40", "f40,2".
+            // Zero means "use the default", so the client only sends what it wants to override.
+            int quality = 0;
+            int scale = 0;
+            if (frame.len > 1) {
+                if (std::sscanf(reinterpret_cast<const char*>(payload.data()) + 1, "%d,%d", &quality, &scale) < 1) {
+                    quality = 0;
+                    scale = 0;
+                }
+            }
+
             const uint8_t* jpeg = nullptr;
             size_t jpeg_size = 0;
             uint32_t width = 0;
             uint32_t height = 0;
-            if (!tt_video_grab_jpeg(&jpeg, &jpeg_size, &width, &height)) {
+            if (!tt_video_grab_jpeg(quality, scale, &jpeg, &jpeg_size, &width, &height)) {
                 // Capture failed (commonly: the LVGL lock was busy). Answer so the client can retry
                 // instead of blocking forever waiting for a frame that isn't coming.
                 return remoteReplyText(request, "err");
