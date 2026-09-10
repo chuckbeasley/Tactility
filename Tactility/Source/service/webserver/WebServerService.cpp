@@ -1420,6 +1420,7 @@ esp_err_t WebServerService::handleApiSysinfo(httpd_req_t* request) {
              << "\"output_w\":" << stats.output_w << ","
              << "\"output_h\":" << stats.output_h << ","
              << "\"delta_frames\":" << stats.delta_frames << ","
+             << "\"region_jpeg_frames\":" << stats.region_jpeg_frames << ","
              << "\"full_frames\":" << stats.full_frames << ","
              << "\"same_frames\":" << stats.same_frames
              << "}";
@@ -1913,36 +1914,45 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
             // A client asking for frames is a mirror in use: keep the radio awake for it.
             mirrorRequestLowLatency();
 
-            // "f" optionally carries the JPEG quality and/or a downscale factor: "f", "f40", "f40,2".
-            // Zero means "use the default", so the client only sends what it wants to override.
+            // "f" optionally carries the JPEG quality, a downscale factor and a "send a whole frame"
+            // flag: "f", "f40", "f40,2", "f40,2,1". Zero means "use the default", so the client only
+            // sends what it wants to override.
             int quality = 0;
             int scale = 0;
+            int force_full = 0;
             if (frame.len > 1) {
-                if (std::sscanf(reinterpret_cast<const char*>(payload.data()) + 1, "%d,%d", &quality, &scale) < 1) {
+                if (std::sscanf(reinterpret_cast<const char*>(payload.data()) + 1, "%d,%d,%d",
+                                &quality, &scale, &force_full) < 1) {
                     quality = 0;
                     scale = 0;
+                    force_full = 0;
                 }
             }
 
             // Change-only frame first: most UI updates touch a small part of the screen, and sending
-            // just that raw skips the full-frame copy, swap and encode entirely. "same" means
-            // nothing moved since the previous request.
+            // just that raw skips the full-frame copy and encode entirely. "same" means nothing moved
+            // since the previous request. A client that asks for whole frames (a recorder, or a
+            // measurement of the full-frame path) skips the diff and always gets a JPEG.
             const uint8_t* delta = nullptr;
             size_t delta_size = 0;
             uint32_t delta_x = 0;
             uint32_t delta_y = 0;
             uint32_t delta_w = 0;
             uint32_t delta_h = 0;
-            const TtVideoFrameKind kind =
-                tt_video_grab_delta(&delta, &delta_size, &delta_x, &delta_y, &delta_w, &delta_h);
+            const TtVideoFrameKind kind = (force_full != 0)
+                ? TT_VIDEO_FRAME_FULL
+                : tt_video_grab_delta(&delta, &delta_size, &delta_x, &delta_y, &delta_w, &delta_h);
             if (kind == TT_VIDEO_FRAME_NONE) {
                 return remoteReplyText(request, "same");
             }
-            if (kind == TT_VIDEO_FRAME_DELTA) {
-                // The text header tells the client what the following binary frame covers; a binary
-                // frame with no preceding "D" is a whole JPEG.
+            if (kind == TT_VIDEO_FRAME_DELTA || kind == TT_VIDEO_FRAME_DELTA_JPEG) {
+                // The text header tells the client what the following binary frame covers and how
+                // it is encoded: "D" is raw RGB565, "J" is a JPEG of that region. A binary frame
+                // with no preceding header is a whole-frame JPEG.
+                const bool region_is_jpeg = (kind == TT_VIDEO_FRAME_DELTA_JPEG);
                 char header[48];
-                std::snprintf(header, sizeof(header), "D %u %u %u %u",
+                std::snprintf(header, sizeof(header), "%c %u %u %u %u",
+                    region_is_jpeg ? 'J' : 'D',
                     (unsigned)delta_x, (unsigned)delta_y, (unsigned)delta_w, (unsigned)delta_h);
                 const esp_err_t header_result = remoteReplyText(request, header);
                 if (header_result != ESP_OK) {

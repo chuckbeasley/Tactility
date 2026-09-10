@@ -33,10 +33,19 @@ TtVideoGrabStats g_grab_stats = {};
 SemaphoreHandle_t g_grab_mutex = nullptr;
 uint8_t* g_delta_buf = nullptr;
 size_t g_delta_capacity = 0;
+// Where a change-only region is encoded. Grown to the region's worst case, which is a whole frame's
+// worth of pixels but only ever holds the whole screen when the screen really did all change.
+uint8_t* g_region_jpeg_buf = nullptr;
+size_t g_region_jpeg_capacity = 0;
 
-// How much of the screen a change may cover before it is cheaper to send one JPEG instead: 1/8 of
-// the frame is about 38 KB raw at 480x320, versus ~5 KB encoded.
+// How much of the screen a change may cover before it is compressed rather than sent raw: 1/8 of
+// the frame is about 38 KB raw at 480x320, versus a ~5 KB JPEG - past that point the encode is far
+// cheaper than the pixels.
 constexpr size_t DELTA_MAX_AREA_DIVISOR = 8;
+
+// The region encoder uses the same default quality as a full frame, so a region and a whole frame
+// look alike on the client.
+constexpr int kRegionJpegQuality = 60;
 
 bool ensureGrabMutex() {
     if (g_grab_mutex == nullptr) {
@@ -45,45 +54,40 @@ bool ensureGrabMutex() {
     return g_grab_mutex != nullptr;
 }
 
-// Box-averages an RGB565 frame down by `scale` in place. Raster order makes this safe: an output
-// pixel is always written at or before the input pixels it reads, so the reads never see clobbered
-// data. Returns the new dimensions through out_w/out_h (unchanged when the image is too small).
-static void downscale_rgb565_in_place(uint8_t* data, uint32_t w, uint32_t h, uint32_t scale, uint32_t* out_w, uint32_t* out_h) {
-    const uint32_t new_w = w / scale;
-    const uint32_t new_h = h / scale;
-    if (scale <= 1 || new_w == 0 || new_h == 0) {
-        *out_w = w;
-        *out_h = h;
-        return;
+/** Grows the region scratch buffer to hold `bytes` of raw RGB565. False when it could not. */
+bool ensureDeltaCapacity(size_t bytes) {
+    if (g_delta_capacity >= bytes && g_delta_buf != nullptr) {
+        return true;
     }
-
-    uint16_t* px = reinterpret_cast<uint16_t*>(data);
-    const uint32_t samples = scale * scale;
-    const uint32_t half = samples / 2;
-
-    for (uint32_t y = 0; y < new_h; ++y) {
-        for (uint32_t x = 0; x < new_w; ++x) {
-            uint32_t r = 0;
-            uint32_t g = 0;
-            uint32_t b = 0;
-            for (uint32_t sy = 0; sy < scale; ++sy) {
-                const uint16_t* row = px + static_cast<size_t>(y * scale + sy) * w + static_cast<size_t>(x) * scale;
-                for (uint32_t sx = 0; sx < scale; ++sx) {
-                    const uint16_t p = row[sx];
-                    r += (p >> 11) & 0x1Fu;
-                    g += (p >> 5) & 0x3Fu;
-                    b += p & 0x1Fu;
-                }
-            }
-            px[static_cast<size_t>(y) * new_w + x] =
-                static_cast<uint16_t>((((r + half) / samples) << 11) |
-                                      (((g + half) / samples) << 5) |
-                                      ((b + half) / samples));
-        }
+    if (g_delta_buf != nullptr) {
+        heap_caps_free(g_delta_buf);
+        g_delta_buf = nullptr;
+        g_delta_capacity = 0;
     }
+    g_delta_buf = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
+    g_delta_capacity = (g_delta_buf != nullptr) ? bytes : 0;
+    return g_delta_buf != nullptr;
+}
 
-    *out_w = new_w;
-    *out_h = new_h;
+/** Grows the region JPEG output buffer to `need` bytes. Null when it could not. */
+uint8_t* ensureRegionJpegCapacity(size_t need) {
+    if (g_region_jpeg_capacity >= need && g_region_jpeg_buf != nullptr) {
+        return g_region_jpeg_buf;
+    }
+    if (g_region_jpeg_buf != nullptr) {
+        heap_caps_free(g_region_jpeg_buf);
+        g_region_jpeg_buf = nullptr;
+        g_region_jpeg_capacity = 0;
+    }
+    g_region_jpeg_buf = static_cast<uint8_t*>(heap_caps_malloc(need, MALLOC_CAP_SPIRAM));
+    g_region_jpeg_capacity = (g_region_jpeg_buf != nullptr) ? need : 0;
+    return g_region_jpeg_buf;
+}
+
+/** Worst-case JPEG size for a region, using the same rule of thumb as the full-frame path: a JPEG
+ * never comes out larger than the raw pixels, and the encoder is always given a floor of 64 KB. */
+size_t regionJpegNeed(size_t rgb_bytes) {
+    return std::max<size_t>(rgb_bytes, 65536);
 }
 
 // Frame caps keep PSRAM bounded. MJPEG frames are small (~5 KB each, 15 frames). Uncompressed RGB
@@ -127,6 +131,128 @@ void bgr_swap_rgb565(uint8_t* data, size_t num_pixels) {
         const uint16_t p = px[num_pixels - 1];
         px[num_pixels - 1] = static_cast<uint16_t>(((p & 0x001Fu) << 11) | (p & 0x07E0u) | ((p & 0xF800u) >> 11));
     }
+}
+
+// Copies a region out of a strided source into a tight destination while exchanging red and blue
+// in every pixel - one pass instead of a copy pass followed by a swap pass.
+//
+// The exchange cannot happen where the pixels are produced (the display's shadow frame holds
+// LVGL's logical channel order, and other consumers depend on that), and as a separate pass it
+// costs a full extra read and write of the frame. On this hardware that is the expensive part:
+// both buffers live in PSRAM, where these loops move roughly 9 MB/s, so a 480x320 frame costs
+// ~68 ms to copy and another ~46 ms to swap it in place. Fused it is a single ~68 ms pass.
+//
+// 0xF800 = red, 0x07E0 = green, 0x001F = blue. Two pixels per 32-bit access, because on PSRAM the
+// number of accesses is what costs, not the bit math.
+static void copy_swap_rgb565(uint8_t* dst, const uint8_t* src, uint32_t src_stride, uint32_t w, uint32_t h) {
+    const size_t row_bytes = static_cast<size_t>(w) * 2;
+    // Rows are addressed individually, so the wide loop needs every row start 4-byte aligned.
+    const bool wide_ok = (((uintptr_t)src | (uintptr_t)dst | src_stride | row_bytes) & 3u) == 0 && (w & 1u) == 0;
+
+    for (uint32_t y = 0; y < h; ++y) {
+        const uint8_t* src_row = src + static_cast<size_t>(y) * src_stride;
+        uint8_t* dst_row = dst + static_cast<size_t>(y) * row_bytes;
+
+        if (!wide_ok) {
+            const uint16_t* in = reinterpret_cast<const uint16_t*>(src_row);
+            uint16_t* out = reinterpret_cast<uint16_t*>(dst_row);
+            for (uint32_t x = 0; x < w; ++x) {
+                const uint16_t p = in[x];
+                out[x] = static_cast<uint16_t>(((p & 0x001Fu) << 11) | (p & 0x07E0u) | ((p & 0xF800u) >> 11));
+            }
+            continue;
+        }
+
+        const uint32_t* in = reinterpret_cast<const uint32_t*>(src_row);
+        uint32_t* out = reinterpret_cast<uint32_t*>(dst_row);
+        const uint32_t pairs = w / 2;
+        for (uint32_t i = 0; i < pairs; ++i) {
+            const uint32_t p = in[i];
+            const uint32_t lo = ((p & 0x0000001Fu) << 11) | (p & 0x000007E0u) | ((p & 0x0000F800u) >> 11);
+            const uint32_t hi = ((p & 0x001F0000u) << 11) | (p & 0x07E00000u) | ((p & 0xF8000000u) >> 11);
+            out[i] = (hi & 0xFFFF0000u) | (lo & 0x0000FFFFu);
+        }
+    }
+}
+
+// copy_swap_rgb565, but box-averaging `scale`x`scale` blocks into one pixel on the way, so a
+// downscaled frame never materialises a full-resolution intermediate to average afterwards.
+// Returns the output size through out_w/out_h.
+//
+// Averaging is symmetric in red and blue, so the exchanged value is written directly and the
+// downsample costs nothing extra.
+static void copy_scale_swap_rgb565(uint8_t* dst, const uint8_t* src, uint32_t src_stride,
+                                   uint32_t w, uint32_t h, uint32_t scale,
+                                   uint32_t* out_w, uint32_t* out_h) {
+    const uint32_t new_w = w / scale;
+    const uint32_t new_h = h / scale;
+    if (scale <= 1 || new_w == 0 || new_h == 0) {
+        copy_swap_rgb565(dst, src, src_stride, w, h);
+        *out_w = w;
+        *out_h = h;
+        return;
+    }
+
+    const uint32_t samples = scale * scale;
+    const uint32_t half = samples / 2;
+    const size_t dst_row_bytes = static_cast<size_t>(new_w) * 2;
+
+    for (uint32_t y = 0; y < new_h; ++y) {
+        uint16_t* out = reinterpret_cast<uint16_t*>(dst + static_cast<size_t>(y) * dst_row_bytes);
+        for (uint32_t x = 0; x < new_w; ++x) {
+            uint32_t r = 0;
+            uint32_t g = 0;
+            uint32_t b = 0;
+            for (uint32_t sy = 0; sy < scale; ++sy) {
+                const uint16_t* row = reinterpret_cast<const uint16_t*>(
+                    src + static_cast<size_t>(y * scale + sy) * src_stride) + static_cast<size_t>(x) * scale;
+                for (uint32_t sx = 0; sx < scale; ++sx) {
+                    const uint16_t p = row[sx];
+                    r += (p >> 11) & 0x1Fu;
+                    g += (p >> 5) & 0x3Fu;
+                    b += p & 0x1Fu;
+                }
+            }
+            out[x] = static_cast<uint16_t>((((b + half) / samples) << 11) |
+                                           (((g + half) / samples) << 5) |
+                                           ((r + half) / samples));
+        }
+    }
+
+    *out_w = new_w;
+    *out_h = new_h;
+}
+
+// Encodes a standard-RGB565 buffer as JPEG. Returns the number of bytes produced, or 0 on failure.
+static size_t encode_jpeg_rgb565(const uint8_t* rgb565, uint32_t w, uint32_t h, int quality,
+                                 uint8_t* out, size_t out_capacity) {
+    jpeg_enc_config_t config = DEFAULT_JPEG_ENC_CONFIG();
+    config.width = static_cast<int>(w);
+    config.height = static_cast<int>(h);
+    config.src_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+    config.subsampling = JPEG_SUBSAMPLE_420;
+    config.quality = quality;
+    config.rotate = JPEG_ROTATE_0D;
+    config.task_enable = false;
+
+    const int in_size = static_cast<int>(static_cast<size_t>(w) * h * 2);
+    jpeg_enc_handle_t enc = nullptr;
+    if (jpeg_enc_open(&config, &enc) != JPEG_ERR_OK || enc == nullptr) {
+        return 0;
+    }
+
+    int produced = 0;
+    const jpeg_error_t result = jpeg_enc_process(
+        enc,
+        const_cast<uint8_t*>(rgb565),
+        in_size,
+        out,
+        static_cast<int>(out_capacity),
+        &produced
+    );
+    jpeg_enc_close(enc);
+
+    return (result == JPEG_ERR_OK && produced > 0) ? static_cast<size_t>(produced) : 0;
 }
 
 void captureTask(void* arg) {
@@ -731,13 +857,11 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
             }
 
             if (rgb565_buf != nullptr && jpeg_buf != nullptr) {
-                // Row by row: the source stride may be padded, the destination is tight.
-                const size_t row_bytes = static_cast<size_t>(w) * 2;
-                uint8_t* dst = rgb565_buf;
-                for (uint32_t y = 0; y < h; ++y) {
-                    std::memcpy(dst, source + static_cast<size_t>(y) * source_stride, row_bytes);
-                    dst += row_bytes;
-                }
+                // One pass out of the shadow frame: copy, exchange red/blue, and box-average down
+                // to the requested scale. w/h become the output size the encoder will see, and the
+                // buffer above is sized for the full frame, so it always fits.
+                copy_scale_swap_rgb565(rgb565_buf, source, source_stride, w, h,
+                                       (scale > 0) ? static_cast<uint32_t>(scale) : 1u, &w, &h);
                 captured = true;
             }
         }
@@ -751,48 +875,19 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
     }
 
     if (captured) {
-        // The panel is BGR-ordered, so the captured frame needs R and B exchanged to look right on
-        // an ordinary RGB display.
-        bgr_swap_rgb565(rgb565_buf, static_cast<size_t>(w) * h);
+        // The capture pass already exchanged red/blue and applied any downscale, so the encoder
+        // reads rgb565_buf as a finished standard-RGB565 frame at w x h.
         t_swap_done = esp_timer_get_time();
 
-        // Optional downscale, folded in before the encode so the encoder sees fewer pixels.
-        if (scale > 1) {
-            downscale_rgb565_in_place(rgb565_buf, w, h, scale, &w, &h);
-        }
-
-        jpeg_enc_config_t config = DEFAULT_JPEG_ENC_CONFIG();
-        config.width = static_cast<int>(w);
-        config.height = static_cast<int>(h);
-        config.src_type = JPEG_PIXEL_FORMAT_RGB565_LE;
-        config.subsampling = JPEG_SUBSAMPLE_420;
-        config.quality = quality;
-        config.rotate = JPEG_ROTATE_0D;
-        config.task_enable = false;
-
-        const int in_size = static_cast<int>(static_cast<size_t>(w) * h * 2);
-        jpeg_enc_handle_t enc = nullptr;
-        if (jpeg_enc_open(&config, &enc) == JPEG_ERR_OK && enc != nullptr) {
-            int produced = 0;
-            const jpeg_error_t res = jpeg_enc_process(
-                enc,
-                rgb565_buf,
-                in_size,
-                jpeg_buf,
-                static_cast<int>(jpeg_capacity),
-                &produced
-            );
-            jpeg_enc_close(enc);
-            if (res == JPEG_ERR_OK && produced > 0) {
-                if (out_data != nullptr) *out_data = jpeg_buf;
-                if (out_size != nullptr) *out_size = static_cast<size_t>(produced);
-                if (out_width != nullptr) *out_width = w;
-                if (out_height != nullptr) *out_height = h;
-                ok = true;
-            }
+        const size_t produced = encode_jpeg_rgb565(rgb565_buf, w, h, quality, jpeg_buf, jpeg_capacity);
+        if (produced > 0) {
+            if (out_data != nullptr) *out_data = jpeg_buf;
+            if (out_size != nullptr) *out_size = produced;
+            if (out_width != nullptr) *out_width = w;
+            if (out_height != nullptr) *out_height = h;
+            ok = true;
         }
     }
-
     // Publish the breakdown for /api/sysinfo instead of logging it: a per-frame LOG_I backs the
     // UART up under a slow reader, and a blocked log call can stall the very path being measured.
     {
@@ -803,7 +898,10 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
             ? static_cast<uint32_t>((t_lock_acquired - t_start) / 1000) : 0;
         g_grab_stats.copy_ms = (t_lock_acquired > 0 && t_copy_done > 0)
             ? static_cast<uint32_t>((t_copy_done - t_lock_acquired) / 1000) : 0;
-        g_grab_stats.swap_ms = static_cast<uint32_t>((t_swap_done - t_capture_done) / 1000);
+        // The channel exchange is folded into the copy, so it no longer has a phase of its own and
+        // this stays 0 for the paths that use it. It is kept in the struct so existing readers of
+        // /api/sysinfo do not have to change.
+        g_grab_stats.swap_ms = 0;
         g_grab_stats.encode_ms = static_cast<uint32_t>((t_end - t_swap_done) / 1000);
         g_grab_stats.used_shadow_frame = used_shadow_frame;
         g_grab_stats.quality = static_cast<uint32_t>(quality);
@@ -829,6 +927,10 @@ TtVideoFrameKind tt_video_grab_delta(const uint8_t** out_data, size_t* out_size,
     }
 
     TtVideoFrameKind kind = TT_VIDEO_FRAME_FULL;
+    uint32_t region_x = 0;
+    uint32_t region_y = 0;
+    uint32_t region_w = 0;
+    uint32_t region_h = 0;
 
     if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
         lv_display_t* display = lv_display_get_default();
@@ -852,43 +954,68 @@ TtVideoFrameKind tt_video_grab_delta(const uint8_t** out_data, size_t* out_size,
             const size_t bytes = static_cast<size_t>(w) * h * 2;
             const size_t frame_bytes = static_cast<size_t>(shadow_w) * shadow_h * 2;
 
-            // A change covering a large part of the screen is cheaper as one JPEG. Taking the area
-            // consumed it either way, which is correct: a full frame supersedes it.
-            if (bytes * DELTA_MAX_AREA_DIVISOR <= frame_bytes) {
-                if (g_delta_capacity < bytes) {
-                    if (g_delta_buf != nullptr) heap_caps_free(g_delta_buf);
-                    g_delta_buf = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
-                    g_delta_capacity = (g_delta_buf != nullptr) ? bytes : 0;
-                }
-                if (g_delta_buf != nullptr) {
-                    const size_t row_bytes = static_cast<size_t>(w) * 2;
-                    for (uint32_t row = 0; row < h; ++row) {
-                        std::memcpy(g_delta_buf + static_cast<size_t>(row) * row_bytes,
-                                    shadow + static_cast<size_t>(y + row) * shadow_stride + static_cast<size_t>(x) * 2,
-                                    row_bytes);
-                    }
-                    // Hand out standard RGB565: the shadow holds the panel's own channel order,
-                    // which needs the same red/blue exchange as the full-frame path.
-                    bgr_swap_rgb565(g_delta_buf, static_cast<size_t>(w) * h);
+            // A change that covers the whole screen is not a region at all: the caller's full-frame
+            // path already handles it, and going through a region copy first would just add a pass.
+            if (bytes < frame_bytes && ensureDeltaCapacity(bytes)) {
+                // Copy and exchange in one pass. The source is handed over already offset to the
+                // region's first pixel, so the alignment check inside covers the x offset too. The
+                // shadow holds the panel's channel order, so this also produces the standard RGB565
+                // the client expects - same as the full-frame path.
+                copy_swap_rgb565(g_delta_buf,
+                                 shadow + static_cast<size_t>(y) * shadow_stride + static_cast<size_t>(x) * 2,
+                                 shadow_stride,
+                                 w,
+                                 h);
 
-                    if (out_data != nullptr) *out_data = g_delta_buf;
-                    if (out_size != nullptr) *out_size = bytes;
-                    if (out_x != nullptr) *out_x = x;
-                    if (out_y != nullptr) *out_y = y;
-                    if (out_width != nullptr) *out_width = w;
-                    if (out_height != nullptr) *out_height = h;
-                    kind = TT_VIDEO_FRAME_DELTA;
-                }
+                region_x = x;
+                region_y = y;
+                region_w = w;
+                region_h = h;
+
+                // Small regions are cheaper raw: no encode at all, and the pixels cost less than
+                // the framing a JPEG would add. Anything bigger is compressed.
+                kind = (bytes * DELTA_MAX_AREA_DIVISOR <= frame_bytes)
+                    ? TT_VIDEO_FRAME_DELTA
+                    : TT_VIDEO_FRAME_DELTA_JPEG;
             }
         }
 
         lvgl_unlock();
     }
 
+    size_t payload_size = 0;
+    const uint8_t* payload = g_delta_buf;
+
     if (kind == TT_VIDEO_FRAME_DELTA) {
+        payload_size = static_cast<size_t>(region_w) * region_h * 2;
         g_grab_stats.delta_frames++;
+    } else if (kind == TT_VIDEO_FRAME_DELTA_JPEG) {
+        // Encoded after the LVGL lock is released: the encode is CPU-bound and takes long enough
+        // (tens of ms even for a part of the screen) that holding the UI lock across it would stall
+        // rendering - the same reason the full-frame path encodes outside the lock.
+        const size_t need = regionJpegNeed(static_cast<size_t>(region_w) * region_h * 2);
+        uint8_t* jpeg_out = ensureRegionJpegCapacity(need);
+        payload_size = (jpeg_out != nullptr)
+            ? encode_jpeg_rgb565(g_delta_buf, region_w, region_h, kRegionJpegQuality, jpeg_out, need)
+            : 0;
+        if (payload_size > 0) {
+            payload = jpeg_out;
+            g_grab_stats.region_jpeg_frames++;
+        } else {
+            // Encoding failed: let the caller fall back to a whole frame.
+            kind = TT_VIDEO_FRAME_FULL;
+        }
     } else if (kind == TT_VIDEO_FRAME_NONE) {
         g_grab_stats.same_frames++;
+    }
+
+    if (kind == TT_VIDEO_FRAME_DELTA || kind == TT_VIDEO_FRAME_DELTA_JPEG) {
+        if (out_data != nullptr) *out_data = payload;
+        if (out_size != nullptr) *out_size = payload_size;
+        if (out_x != nullptr) *out_x = region_x;
+        if (out_y != nullptr) *out_y = region_y;
+        if (out_width != nullptr) *out_width = region_w;
+        if (out_height != nullptr) *out_height = region_h;
     }
 
     xSemaphoreGive(g_grab_mutex);
