@@ -64,7 +64,8 @@ bool ensureDeltaCapacity(size_t bytes) {
         g_delta_buf = nullptr;
         g_delta_capacity = 0;
     }
-    g_delta_buf = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
+    // 16-byte aligned for the same reason as the full-frame buffer: it is encoder input.
+    g_delta_buf = static_cast<uint8_t*>(heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_SPIRAM));
     g_delta_capacity = (g_delta_buf != nullptr) ? bytes : 0;
     return g_delta_buf != nullptr;
 }
@@ -223,34 +224,85 @@ static void copy_scale_swap_rgb565(uint8_t* dst, const uint8_t* src, uint32_t sr
     *out_h = new_h;
 }
 
-// Encodes a standard-RGB565 buffer as JPEG. Returns the number of bytes produced, or 0 on failure.
-static size_t encode_jpeg_rgb565(const uint8_t* rgb565, uint32_t w, uint32_t h, int quality,
-                                 uint8_t* out, size_t out_capacity) {
+// Encoder handles are meant to be reused: jpeg_enc_open() builds the working buffers and the
+// quantization/Huffman tables for one image geometry and quality, and the library exposes
+// jpeg_enc_set_quality() precisely so a caller can keep a handle and vary the quality between
+// images. Opening one per frame pays that setup every time.
+//
+// Two slots, because the mirror alternates between a whole frame and a region of arbitrary size.
+// A request that matches a slot reuses it; only a third distinct geometry replaces anything, so
+// alternating between two shapes keeps both warm.
+constexpr size_t JPEG_ENC_SLOTS = 2;
+
+struct JpegEncoderSlot {
+    jpeg_enc_handle_t handle = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int quality = 0;
+};
+
+JpegEncoderSlot g_enc_slots[JPEG_ENC_SLOTS];
+size_t g_enc_next_victim = 0;
+// Time the last encode spent in setup (zero when a cached handle was reused). Published through
+// /api/sysinfo so the cost of opening is visible rather than assumed.
+uint32_t g_last_encode_open_us = 0;
+
+/** Returns an encoder for this geometry, opening one only when no slot already matches. */
+jpeg_enc_handle_t acquireEncoder(uint32_t w, uint32_t h, int quality) {
+    for (auto& slot : g_enc_slots) {
+        if (slot.handle != nullptr && slot.width == w && slot.height == h && slot.quality == quality) {
+            return slot.handle;
+        }
+    }
+
+    JpegEncoderSlot& slot = g_enc_slots[g_enc_next_victim];
+    g_enc_next_victim = (g_enc_next_victim + 1) % JPEG_ENC_SLOTS;
+
+    if (slot.handle != nullptr) {
+        jpeg_enc_close(slot.handle);
+        slot.handle = nullptr;
+    }
+
     jpeg_enc_config_t config = DEFAULT_JPEG_ENC_CONFIG();
     config.width = static_cast<int>(w);
     config.height = static_cast<int>(h);
     config.src_type = JPEG_PIXEL_FORMAT_RGB565_LE;
     config.subsampling = JPEG_SUBSAMPLE_420;
-    config.quality = quality;
+    config.quality = static_cast<uint8_t>(quality);
     config.rotate = JPEG_ROTATE_0D;
     config.task_enable = false;
 
-    const int in_size = static_cast<int>(static_cast<size_t>(w) * h * 2);
-    jpeg_enc_handle_t enc = nullptr;
-    if (jpeg_enc_open(&config, &enc) != JPEG_ERR_OK || enc == nullptr) {
+    jpeg_enc_handle_t handle = nullptr;
+    if (jpeg_enc_open(&config, &handle) != JPEG_ERR_OK || handle == nullptr) {
+        return nullptr;
+    }
+
+    slot.handle = handle;
+    slot.width = w;
+    slot.height = h;
+    slot.quality = quality;
+    return handle;
+}
+
+// Encodes a standard-RGB565 buffer as JPEG. Returns the number of bytes produced, or 0 on failure.
+static size_t encode_jpeg_rgb565(const uint8_t* rgb565, uint32_t w, uint32_t h, int quality,
+                                 uint8_t* out, size_t out_capacity) {
+    const int64_t open_start = esp_timer_get_time();
+    jpeg_enc_handle_t enc = acquireEncoder(w, h, quality);
+    g_last_encode_open_us = static_cast<uint32_t>(esp_timer_get_time() - open_start);
+    if (enc == nullptr) {
         return 0;
     }
 
     int produced = 0;
     const jpeg_error_t result = jpeg_enc_process(
         enc,
-        const_cast<uint8_t*>(rgb565),
-        in_size,
+        rgb565,
+        static_cast<int>(static_cast<size_t>(w) * h * 2),
         out,
         static_cast<int>(out_capacity),
         &produced
     );
-    jpeg_enc_close(enc);
 
     return (result == JPEG_ERR_OK && produced > 0) ? static_cast<size_t>(produced) : 0;
 }
@@ -847,7 +899,10 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
 
             if (rgb565_capacity < rgb_size) {
                 if (rgb565_buf != nullptr) heap_caps_free(rgb565_buf);
-                rgb565_buf = static_cast<uint8_t*>(heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM));
+                // 16-byte aligned: the encoder documents its input buffer as needing that, and this
+                // is the buffer it reads.
+                rgb565_buf = static_cast<uint8_t*>(
+                    heap_caps_aligned_alloc(16, rgb_size, MALLOC_CAP_SPIRAM));
                 rgb565_capacity = (rgb565_buf != nullptr) ? rgb_size : 0;
             }
             if (jpeg_capacity < jpeg_need) {
@@ -903,6 +958,7 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
         // /api/sysinfo do not have to change.
         g_grab_stats.swap_ms = 0;
         g_grab_stats.encode_ms = static_cast<uint32_t>((t_end - t_swap_done) / 1000);
+        g_grab_stats.encode_open_ms = g_last_encode_open_us / 1000;
         g_grab_stats.used_shadow_frame = used_shadow_frame;
         g_grab_stats.quality = static_cast<uint32_t>(quality);
         g_grab_stats.scale = static_cast<uint32_t>(scale);

@@ -1412,6 +1412,7 @@ esp_err_t WebServerService::handleApiSysinfo(httpd_req_t* request) {
              << "\"copy_ms\":" << stats.copy_ms << ","
              << "\"swap_ms\":" << stats.swap_ms << ","
              << "\"encode_ms\":" << stats.encode_ms << ","
+             << "\"encode_open_ms\":" << stats.encode_open_ms << ","
              << "\"shadow_frame\":" << (stats.used_shadow_frame ? "true" : "false") << ","
              << "\"resolution_w\":" << stats.resolution_w << ","
              << "\"resolution_h\":" << stats.resolution_h << ","
