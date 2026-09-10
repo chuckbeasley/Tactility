@@ -646,6 +646,8 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
     }
 
     const int64_t t_start = esp_timer_get_time();
+    int64_t t_lock_acquired = 0;
+    int64_t t_copy_done = 0;
     int64_t t_capture_done = 0;
     int64_t t_swap_done = 0;
     bool ok = false;
@@ -654,14 +656,17 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
     uint32_t w = 0;
     uint32_t h = 0;
 
-    // Capture under the LVGL lock.
+    // Capture under the LVGL lock. The display maintains a complete shadow frame as it flushes
+    // regions (see lvgl_display_get_shadow_frame), so this copies a finished frame instead of
+    // re-rendering the widget tree with lv_snapshot_take() - the difference between ~70 ms and
+    // ~350 ms at 480x320.
     //
-    // The display keeps a full-frame draw buffer, so read that instead of calling
-    // lv_snapshot_take(): the latter re-renders the whole widget tree, measured at ~290 ms against
-    // ~10 ms for copying the buffer out, and it dominated the mirror's frame time. The display
-    // buffer is reused by the next refresh, so it is copied while still locked; the channel swap
-    // and JPEG encode are left for after the unlock to keep the UI's stall as short as possible.
+    // The shadow is written by flushes on the LVGL task, so the copy happens under the lock; the
+    // channel swap and JPEG encode are deliberately left for after the unlock to keep the UI's
+    // stall short. The elapsed time is split into lock wait and copy (see TtVideoGrabStats) because
+    // they call for completely different optimizations.
     if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
+        t_lock_acquired = esp_timer_get_time();
         lv_display_t* display = lv_display_get_default();
         const uint32_t display_w = (display != nullptr) ? lv_display_get_horizontal_resolution(display) : 0;
         const uint32_t display_h = (display != nullptr) ? lv_display_get_vertical_resolution(display) : 0;
@@ -723,6 +728,7 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
                 captured = true;
             }
         }
+        t_copy_done = esp_timer_get_time();
 
         if (snapshot != nullptr) {
             lv_draw_buf_destroy(snapshot);
@@ -779,6 +785,11 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
     {
         const int64_t t_end = esp_timer_get_time();
         g_grab_stats.capture_ms = static_cast<uint32_t>((t_capture_done - t_start) / 1000);
+        // Only meaningful when the lock was actually taken (otherwise both stamps are still 0).
+        g_grab_stats.lock_wait_ms = (t_lock_acquired > 0)
+            ? static_cast<uint32_t>((t_lock_acquired - t_start) / 1000) : 0;
+        g_grab_stats.copy_ms = (t_lock_acquired > 0 && t_copy_done > 0)
+            ? static_cast<uint32_t>((t_copy_done - t_lock_acquired) / 1000) : 0;
         g_grab_stats.swap_ms = static_cast<uint32_t>((t_swap_done - t_capture_done) / 1000);
         g_grab_stats.encode_ms = static_cast<uint32_t>((t_end - t_swap_done) / 1000);
         g_grab_stats.used_shadow_frame = used_shadow_frame;

@@ -1358,6 +1358,8 @@ esp_err_t WebServerService::handleApiSysinfo(httpd_req_t* request) {
         json << "\"mirror\":{"
              << "\"frames\":" << stats.frames << ","
              << "\"capture_ms\":" << stats.capture_ms << ","
+             << "\"lock_wait_ms\":" << stats.lock_wait_ms << ","
+             << "\"copy_ms\":" << stats.copy_ms << ","
              << "\"swap_ms\":" << stats.swap_ms << ","
              << "\"encode_ms\":" << stats.encode_ms << ","
              << "\"shadow_frame\":" << (stats.used_shadow_frame ? "true" : "false") << ","

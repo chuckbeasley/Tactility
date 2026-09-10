@@ -59,6 +59,8 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
 /** Diagnostics for the most recent tt_video_grab_jpeg() call. All times are milliseconds. */
 struct TtVideoGrabStats {
     uint32_t capture_ms;       /**< Frame acquisition: LVGL lock wait plus copy out of the source. */
+    uint32_t lock_wait_ms;     /**< Part of capture_ms spent waiting for the LVGL lock. */
+    uint32_t copy_ms;          /**< Part of capture_ms spent copying the source (and allocating buffers). */
     uint32_t swap_ms;          /**< BGR/RGB channel swap. */
     uint32_t encode_ms;        /**< JPEG encode. */
     uint32_t frames;           /**< Number of successful grabs since boot. */
