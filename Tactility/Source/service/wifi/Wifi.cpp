@@ -23,6 +23,10 @@
 #include <algorithm>
 #include <atomic>
 
+#ifdef ESP_PLATFORM
+#include <esp_wifi.h>
+#endif
+
 namespace tt::service::wifi {
 
 constexpr auto* TAG = "WifiService";
@@ -457,6 +461,25 @@ void disconnect() {
 
 void setAutoScanPaused(bool paused) {
     autoScanSetPaused(paused);
+}
+
+void setPowerSaveEnabled(bool enabled) {
+#ifdef ESP_PLATFORM
+    // Only meaningful while the station is up; the driver rejects the call before that, and a
+    // failed call here is logged rather than asserted because it is a latency optimisation, not
+    // something the caller can do anything about.
+    if (!isRadioOn()) {
+        return;
+    }
+
+    const wifi_ps_type_t mode = enabled ? WIFI_PS_MIN_MODEM : WIFI_PS_NONE;
+    const esp_err_t result = esp_wifi_set_ps(mode);
+    if (result != ESP_OK) {
+        LOG_W(TAG, "esp_wifi_set_ps(%d) failed: %s", (int)mode, esp_err_to_name(result));
+    }
+#else
+    (void)enabled;
+#endif
 }
 
 void setScanRecords(uint16_t records) {

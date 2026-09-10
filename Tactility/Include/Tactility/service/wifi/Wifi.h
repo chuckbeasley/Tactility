@@ -88,6 +88,21 @@ bool isConnectionSecure();
  */
 void setAutoScanPaused(bool paused);
 
+/**
+ * @brief Enable or disable WiFi power save.
+ * @param[in] enabled true to let the radio sleep between AP beacons (the IDF default,
+ * WIFI_PS_MIN_MODEM); false to keep it awake (WIFI_PS_NONE).
+ *
+ * Power save is the right trade for battery life, but it puts up to a full beacon interval of
+ * latency on every round trip, because the radio only wakes to hear the access point once per
+ * beacon. Measured on the screen mirror: a WebSocket reply that did no work at all still took
+ * ~103 ms, matching the 102.4 ms beacon interval this AP logs at boot - far above the cost of
+ * producing a frame. Callers that need low latency disable it for the duration of their session
+ * and re-enable it afterwards; nothing is persisted, and the state is not restored on reboot.
+ * Does nothing when the radio is off.
+ */
+void setPowerSaveEnabled(bool enabled);
+
 /** @return the RSSI value (negative number) or return 1 when not connected. */
 int getRssi();
 

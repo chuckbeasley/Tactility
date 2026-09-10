@@ -18,12 +18,14 @@
 #include <Tactility/lvgl/Lvgl.h>
 #include <Tactility/network/HttpdReq.h>
 #include <Tactility/network/Url.h>
+#include <Tactility/Timer.h>
 #include <Tactility/service/wifi/Wifi.h>
 #include <Tactility/service/ServiceRegistration.h>
 
 #include <tactility/check.h>
 #include <tactility/filesystem/file_system.h>
 #include <tactility/log.h>
+#include <tactility/time.h>
 
 #include <lvgl/lvgl.h>
 #include <lvgl/icons/statusbar.h>
@@ -53,6 +55,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <iomanip>
+#include <memory>
 #include <lwip/ip4_addr.h>
 #include <mbedtls/base64.h>
 #include <ranges>
@@ -265,6 +268,53 @@ RemoteSession* remoteSessionForFd(int fd) {
         }
     }
     return nullptr;  // Table full: further connections stay unauthenticated.
+}
+
+// --- Mirror latency: WiFi power save ------------------------------------------------------------
+//
+// Power save parks the radio between access point beacons, so a client only gets heard once per
+// beacon interval. Measured on the mirror: a reply that did no frame work at all ("same") still
+// took ~103 ms, matching the 102.4 ms beacon interval this AP logs at boot - a latency floor well
+// above what producing a frame costs, and paid on every round trip.
+//
+// The station therefore stays awake while a client is actually asking for frames. There is no
+// "viewer went away" callback to hang this on (a closed socket does not reliably reach the
+// handler), so the window is kept alive by the frame requests themselves and lapses on its own a
+// few seconds after the last one - which also covers a client that just backgrounds the page.
+// Re-enabling is idempotent, so a lapsed window that is then re-requested is harmless.
+constexpr uint32_t MIRROR_LOW_LATENCY_TIMEOUT_MS = 4000;
+bool mirrorLowLatencyActive = false;
+std::unique_ptr<Timer> mirrorLowLatencyTimer;
+
+void mirrorEndLowLatency() {
+    if (!mirrorLowLatencyActive) {
+        return;
+    }
+    mirrorLowLatencyActive = false;
+    tt::service::wifi::setPowerSaveEnabled(true);
+    LOG_I(TAG, "/ws/remote: no frames for %u ms, WiFi power save restored",
+        (unsigned)MIRROR_LOW_LATENCY_TIMEOUT_MS);
+}
+
+/** Marks a frame request: keeps WiFi awake and restarts the idle window. */
+void mirrorRequestLowLatency() {
+    if (mirrorLowLatencyTimer == nullptr) {
+        // Created lazily: most devices never open a mirror, and a timer costs a daemon slot.
+        mirrorLowLatencyTimer = std::make_unique<Timer>(
+            Timer::Type::Once,
+            millis_to_ticks(MIRROR_LOW_LATENCY_TIMEOUT_MS),
+            mirrorEndLowLatency
+        );
+    }
+
+    if (!mirrorLowLatencyActive) {
+        mirrorLowLatencyActive = true;
+        tt::service::wifi::setPowerSaveEnabled(false);
+        LOG_I(TAG, "/ws/remote: frame requested, WiFi power save disabled");
+    }
+
+    // reset() also (re)starts a timer that already fired, which is what extends the window.
+    mirrorLowLatencyTimer->reset(millis_to_ticks(MIRROR_LOW_LATENCY_TIMEOUT_MS));
 }
 
 bool webServerAuthEnabled() {
@@ -1860,6 +1910,9 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
         }
 
         if (frame.len >= 1 && payload[0] == 'f') {
+            // A client asking for frames is a mirror in use: keep the radio awake for it.
+            mirrorRequestLowLatency();
+
             // "f" optionally carries the JPEG quality and/or a downscale factor: "f", "f40", "f40,2".
             // Zero means "use the default", so the client only sends what it wants to override.
             int quality = 0;
