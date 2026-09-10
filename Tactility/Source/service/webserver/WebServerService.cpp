@@ -57,6 +57,7 @@
 #include <iomanip>
 #include <memory>
 #include <lwip/ip4_addr.h>
+#include <lwip/sockets.h>
 #include <mbedtls/base64.h>
 #include <ranges>
 #include <sstream>
@@ -247,6 +248,30 @@ RemoteSession remoteSessions[REMOTE_SESSION_CAPACITY];
 // control over ("last authenticator wins"), and every other authenticated client is view-only.
 int remoteControllerFd = -1;
 
+// Turn Nagle off on a mirror socket.
+//
+// WebSocket replies are written as two separate sends - the 2-byte frame header, then the payload -
+// and httpd_ws_send_frame_async() issues them through the session's raw send_fn. That is the one
+// path in httpd that does not go through httpd_send()/httpd_send_all(), which is where httpd
+// temporarily enables TCP_NODELAY around every write. So a WebSocket reply inherits whatever the
+// socket's options are, and with Nagle left on the payload is held back until the client's delayed
+// ACK for the header arrives.
+//
+// Measured on this device, one round trip while the WiFi low-latency window was armed:
+//   ICMP                          5-9 ms   (not TCP at all)
+//   HTTP GET, same instant        16.8 ms  (httpd_send_all toggles TCP_NODELAY)
+//   WebSocket ping -> pong        62 ms    (raw send_fn, Nagle applies)
+//   WebSocket whole-frame JPEG    34 ms of overhead over the device's own 193 ms
+// The last line is the tell: a large payload is not delayed, because LWIP still pushes full MSS
+// segments while Nagle holds only the trailing short one. Only the small replies suffered - and
+// "same", the reply the mirror sends most often, is the smallest of them.
+static void remoteSetNoDelay(int fd) {
+    const int enabled = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) < 0) {
+        LOG_W(TAG, "/ws/remote: could not disable Nagle on fd %d (errno %d)", fd, errno);
+    }
+}
+
 RemoteSession* remoteFindSession(int fd) {
     for (auto& session : remoteSessions) {
         if (session.fd == fd) {
@@ -257,6 +282,12 @@ RemoteSession* remoteFindSession(int fd) {
 }
 
 RemoteSession* remoteSessionForFd(int fd) {
+    // Applied on every message rather than once per connection, and idempotently, because the
+    // session table keeps its entries after a client goes away: a new connection can be handed an
+    // fd that a stale entry still owns, in which case this is the only place that would set it.
+    // One small syscall per frame is nothing next to producing the frame.
+    remoteSetNoDelay(fd);
+
     if (RemoteSession* existing = remoteFindSession(fd); existing != nullptr) {
         return existing;
     }
