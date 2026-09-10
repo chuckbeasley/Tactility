@@ -54,3 +54,11 @@ remote screen viewer/controller connects to. Without it the httpd WebSocket API
 ```properties
 CONFIG_HTTPD_WS_SUPPORT=y
 ```
+
+A mirror session holds one socket open for its whole duration, on top of whatever
+keep-alive sockets the browser already has, so the socket pool also needs a little
+headroom (the web server asks httpd for 6).
+
+```properties
+CONFIG_LWIP_MAX_SOCKETS=16
+```

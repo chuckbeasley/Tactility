@@ -37,6 +37,22 @@ bool tt_video_stop(std::vector<uint8_t>* avi_out, uint32_t* out_frames);
 /** @return true while the recorder is capturing. */
 bool tt_video_is_recording(void);
 
+/**
+ * Capture the active LVGL screen and JPEG-encode it as a single frame.
+ *
+ * Unlike the recorder above, this is meant for streaming (e.g. one frame per client request):
+ * the scratch buffers are allocated once, in PSRAM, on first use and then reused, so repeated
+ * calls don't churn the heap. Calls are serialized internally and the returned pointer stays
+ * valid only until the next call, so a single consumer must finish with it first.
+ *
+ * @param[out] out_data   receives the JPEG bytes (not null-terminated). May be null.
+ * @param[out] out_size   receives the JPEG length in bytes. May be null.
+ * @param[out] out_width  receives the captured width in pixels. May be null.
+ * @param[out] out_height receives the captured height in pixels. May be null.
+ * @return true on success; false if the LVGL lock couldn't be taken or capture/encode failed.
+ */
+bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* out_width, uint32_t* out_height);
+
 #ifdef __cplusplus
 }
 #endif

@@ -9,6 +9,7 @@
 #include <lvgl/lvgl.h>
 
 #include <esp_jpeg_enc.h>
+#include <esp_heap_caps.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -559,4 +560,106 @@ bool tt_video_is_recording(void) {
     const bool recording = rec.recording;
     xSemaphoreGive(rec.mutex);
     return recording;
+}
+
+bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* out_width, uint32_t* out_height) {
+    // Scratch buffers live for the process lifetime once allocated: streaming asks for frames
+    // continuously, so re-allocating ~300 KB per frame would fragment the heap for no benefit.
+    static SemaphoreHandle_t grab_mutex = nullptr;
+    static uint8_t* rgb565_buf = nullptr;
+    static size_t rgb565_capacity = 0;
+    static uint8_t* jpeg_buf = nullptr;
+    static size_t jpeg_capacity = 0;
+
+    if (grab_mutex == nullptr) {
+        grab_mutex = xSemaphoreCreateMutex();
+        if (grab_mutex == nullptr) {
+            return false;
+        }
+    }
+    if (xSemaphoreTake(grab_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+
+    bool ok = false;
+    lv_draw_buf_t* draw_buf = nullptr;
+    uint32_t w = 0;
+    uint32_t h = 0;
+
+    // Snapshot under the LVGL lock. lv_snapshot_take() returns a buffer we own, which stays valid
+    // after unlocking, so the copy and JPEG encode below don't hold up the UI.
+    if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
+        draw_buf = lv_snapshot_take(lv_scr_act(), LV_COLOR_FORMAT_RGB565);
+        if (draw_buf != nullptr) {
+            w = draw_buf->header.w;
+            h = draw_buf->header.h;
+        }
+        lvgl_unlock();
+    }
+
+    if (draw_buf != nullptr && w != 0 && h != 0) {
+        const size_t rgb_size = static_cast<size_t>(w) * h * 2;
+        // Generous output capacity, matching encode_jpeg()'s rule of thumb.
+        const size_t jpeg_need = std::max<size_t>(rgb_size, 65536);
+
+        if (rgb565_capacity < rgb_size) {
+            if (rgb565_buf != nullptr) heap_caps_free(rgb565_buf);
+            rgb565_buf = static_cast<uint8_t*>(heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM));
+            rgb565_capacity = (rgb565_buf != nullptr) ? rgb_size : 0;
+        }
+        if (jpeg_capacity < jpeg_need) {
+            if (jpeg_buf != nullptr) heap_caps_free(jpeg_buf);
+            jpeg_buf = static_cast<uint8_t*>(heap_caps_malloc(jpeg_need, MALLOC_CAP_SPIRAM));
+            jpeg_capacity = (jpeg_buf != nullptr) ? jpeg_need : 0;
+        }
+
+        if (rgb565_buf != nullptr && jpeg_buf != nullptr) {
+            // Row by row (stride may be padded) so the frame is tightly packed, then BGR-swap to
+            // match the physical panel.
+            const uint32_t stride = draw_buf->header.stride;
+            uint8_t* dst = rgb565_buf;
+            for (uint32_t y = 0; y < h; ++y) {
+                std::memcpy(dst, draw_buf->data + static_cast<size_t>(y) * stride, static_cast<size_t>(w) * 2);
+                dst += static_cast<size_t>(w) * 2;
+            }
+            bgr_swap_rgb565(rgb565_buf, static_cast<size_t>(w) * h);
+
+            jpeg_enc_config_t config = DEFAULT_JPEG_ENC_CONFIG();
+            config.width = static_cast<int>(w);
+            config.height = static_cast<int>(h);
+            config.src_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+            config.subsampling = JPEG_SUBSAMPLE_420;
+            config.quality = 60;
+            config.rotate = JPEG_ROTATE_0D;
+            config.task_enable = false;
+
+            jpeg_enc_handle_t enc = nullptr;
+            if (jpeg_enc_open(&config, &enc) == JPEG_ERR_OK && enc != nullptr) {
+                int produced = 0;
+                const jpeg_error_t res = jpeg_enc_process(
+                    enc,
+                    rgb565_buf,
+                    static_cast<int>(rgb_size),
+                    jpeg_buf,
+                    static_cast<int>(jpeg_capacity),
+                    &produced
+                );
+                jpeg_enc_close(enc);
+                if (res == JPEG_ERR_OK && produced > 0) {
+                    if (out_data != nullptr) *out_data = jpeg_buf;
+                    if (out_size != nullptr) *out_size = static_cast<size_t>(produced);
+                    if (out_width != nullptr) *out_width = w;
+                    if (out_height != nullptr) *out_height = h;
+                    ok = true;
+                }
+            }
+        }
+    }
+
+    if (draw_buf != nullptr) {
+        lv_draw_buf_destroy(draw_buf);
+    }
+
+    xSemaphoreGive(grab_mutex);
+    return ok;
 }

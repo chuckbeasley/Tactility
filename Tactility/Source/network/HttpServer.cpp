@@ -22,9 +22,12 @@ bool HttpServer::startInternal() {
     config.ctrl_port = (uint16_t)(port + 1);
     config.uri_match_fn = matchUri;
     config.max_uri_handlers = handlers.size() + INTERNAL_URI_HANDLER_COUNT;
-    // HTTPD_DEFAULT_CONFIG() sets max_open_sockets to 7, which exceeds what
-    // low-memory targets allow (LWIP_MAX_SOCKETS=6 on ESP32-C5 leaves only 3).
-    config.max_open_sockets = 3;
+    // HTTPD_DEFAULT_CONFIG() sets max_open_sockets to 7. This was lowered to 3 for low-memory
+    // targets, but a long-lived connection (e.g. the /ws/remote WebSocket used for remote screen
+    // interaction) holds one socket for its whole session, and a browser keeps keep-alive sockets
+    // open alongside it - 3 left too little room for concurrent API requests. 6 fits comfortably
+    // within CONFIG_LWIP_MAX_SOCKETS (12), including the second server on the development port.
+    config.max_open_sockets = 6;
 
     if (httpd_start(&server, &config) != ESP_OK) {
         LOG_E(TAG, "Failed to start http server on port %u", (unsigned)port);

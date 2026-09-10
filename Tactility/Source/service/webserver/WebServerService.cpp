@@ -1608,8 +1608,8 @@ esp_err_t WebServerService::handleApiVideoStop(httpd_req_t* request) {
 // frame. Control frames (ping/pong/close) are handled inside httpd because the handler is
 // registered without handle_ws_control_frames.
 //
-// Phase 1 is transport only: every frame is echoed straight back, so a client can prove the
-// bidirectional path works before the frame/input pipeline is built on top of it.
+// Phase 2 serves screen frames: a client sends the text command "f" and gets one JPEG back as a
+// binary frame. Frame requests (phase 2) and, later, input events (phase 3) share this endpoint.
 esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
     if (request->method == HTTP_GET) {
         // The upgrade handshake is performed by httpd itself (is_websocket = true); there is
@@ -1647,7 +1647,48 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
 
     LOG_I(TAG, "/ws/remote: received %u byte(s)", (unsigned)frame.len);
 
-    // Phase 1: echo the frame back on the same connection.
+    // Text commands. "f" asks for one screen frame: the client requests the next only after it has
+    // displayed the previous one, so pacing (and back-pressure) live on the client side. "ping" is
+    // a liveness check. Anything else falls through to the echo below.
+    if (frame.type == HTTPD_WS_TYPE_TEXT) {
+        if (frame.len == 1 && payload[0] == 'f') {
+            const uint8_t* jpeg = nullptr;
+            size_t jpeg_size = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            if (!tt_video_grab_jpeg(&jpeg, &jpeg_size, &width, &height)) {
+                // Capture failed (commonly: the LVGL lock was busy). Answer so the client can retry
+                // instead of blocking forever waiting for a frame that isn't coming.
+                static const char busy[] = "err";
+                httpd_ws_frame_t reply = {};
+                reply.type = HTTPD_WS_TYPE_TEXT;
+                reply.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(busy));
+                reply.len = sizeof(busy) - 1;
+                return httpd_ws_send_frame(request, &reply);
+            }
+
+            httpd_ws_frame_t reply = {};
+            reply.type = HTTPD_WS_TYPE_BINARY;
+            reply.payload = const_cast<uint8_t*>(jpeg);
+            reply.len = jpeg_size;
+            const esp_err_t send_result = httpd_ws_send_frame(request, &reply);
+            if (send_result != ESP_OK) {
+                LOG_W(TAG, "/ws/remote: frame send failed (client disconnected?)");
+            }
+            return send_result;
+        }
+
+        if (frame.len == 4 && std::memcmp(payload.data(), "ping", 4) == 0) {
+            static const char pong[] = "pong";
+            httpd_ws_frame_t reply = {};
+            reply.type = HTTPD_WS_TYPE_TEXT;
+            reply.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(pong));
+            reply.len = sizeof(pong) - 1;
+            return httpd_ws_send_frame(request, &reply);
+        }
+    }
+
+    // Default: echo the frame back on the same connection.
     return httpd_ws_send_frame(request, &frame);
 }
 
