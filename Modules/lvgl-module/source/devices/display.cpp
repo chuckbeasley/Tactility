@@ -16,9 +16,21 @@
 
 #ifdef ESP_PLATFORM
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 #endif
 
 constexpr auto* TAG = "lvgl_display";
+
+// Microsecond monotonic clock for the dirty rectangle's timestamp. LVGL's own tick is only
+// millisecond resolution, which is too coarse to order a capture against a change that may have
+// happened in the same millisecond.
+static int64_t lvgl_now_us() {
+#ifdef ESP_PLATFORM
+    return esp_timer_get_time();
+#else
+    return (int64_t)lv_tick_get() * 1000;
+#endif
+}
 
 struct LvglDisplayCtx {
     void* buf1;
@@ -95,6 +107,10 @@ struct LvglDisplayCtx {
     int32_t dirty_y1;
     int32_t dirty_x2;
     int32_t dirty_y2;
+    // When the rectangle was last widened. A consumer that serves a frame captured *before* this
+    // must not consume the rectangle, or a change made after that capture would be reported to
+    // nobody. See lvgl_display_peek_dirty_area().
+    int64_t dirty_last_update_us;
 };
 
 // A spinlock, not a mutex, because the sections it guards are a few comparisons: the cost of a
@@ -330,6 +346,10 @@ static void lvgl_display_shadow_update(struct LvglDisplayCtx* ctx, lv_display_t*
     // patch until something else changed. They are therefore updated inside a spinlock, but a very
     // short one: this is a handful of comparisons, nothing like the LVGL lock.
     lvgl_shadow_lock(ctx);
+
+    // Stamp the widening, so a consumer that serves a frame captured before this moment knows the
+    // rectangle is newer than its frame.
+    ctx->dirty_last_update_us = lvgl_now_us();
 
     // Widen the dirty rectangle to cover this region.
     if (ctx->dirty_empty) {
@@ -663,6 +683,37 @@ uint32_t lvgl_display_shadow_sequence(lv_display_t* display) {
     }
     struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
     return ctx->shadow_seq.load(std::memory_order_acquire);
+}
+
+bool lvgl_display_peek_dirty_area(lv_display_t* display, lv_area_t* out_area, int64_t* out_last_update_us) {
+    if (display == NULL) {
+        return false;
+    }
+    struct LvglDeviceContext* wrapper = (struct LvglDeviceContext*)lv_display_get_driver_data(display);
+    if (wrapper == NULL || wrapper->context == NULL) {
+        return false;
+    }
+    struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
+    if (ctx->shadow_frame == NULL) {
+        return false;
+    }
+
+    lvgl_shadow_lock(ctx);
+    const bool have_area = !ctx->dirty_empty;
+    if (have_area) {
+        if (out_area != NULL) {
+            out_area->x1 = ctx->dirty_x1;
+            out_area->y1 = ctx->dirty_y1;
+            out_area->x2 = ctx->dirty_x2;
+            out_area->y2 = ctx->dirty_y2;
+        }
+        if (out_last_update_us != NULL) {
+            *out_last_update_us = ctx->dirty_last_update_us;
+        }
+    }
+    lvgl_shadow_unlock(ctx);
+
+    return have_area;
 }
 
 bool lvgl_display_take_dirty_area(lv_display_t* display, lv_area_t* out_area) {

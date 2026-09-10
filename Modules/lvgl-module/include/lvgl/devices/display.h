@@ -140,6 +140,27 @@ uint32_t lvgl_display_shadow_sequence(lv_display_t* display);
 bool lvgl_display_take_dirty_area(lv_display_t* display, lv_area_t* out_area);
 
 /**
+ * The same rectangle lvgl_display_take_dirty_area() would return, but without clearing it.
+ *
+ * This exists so a consumer can decide whether it is able to serve the change before committing to
+ * it. A consumer that sends a frame captured earlier than the change - the mirror's look-ahead
+ * capture - must not clear the rectangle in that case, because nothing else would ever report the
+ * change and the client would keep showing stale pixels. Peeking makes that decision possible:
+ *
+ *   if (peek(&area, &last_update_us) && capture_us >= last_update_us) {
+ *       take(&area);   // the frame provably covers the change, so it is safe to consume
+ *   } else {
+ *       // serve the frame and leave the rectangle alone; it will be reported on the next request
+ *   }
+ *
+ * @param[out] out_area           receives the unchanged rectangle. May be null.
+ * @param[out] out_last_update_us receives when the rectangle was last widened, in microseconds.
+ *                                May be null.
+ * @return true when something has changed and the rectangle is valid.
+ */
+bool lvgl_display_peek_dirty_area(lv_display_t* display, lv_area_t* out_area, int64_t* out_last_update_us);
+
+/**
  * @brief Removes a display previously created with lvgl_display_add(), freeing any buffers it owns.
  * @warning Caller must hold the LVGL lock.
  */
