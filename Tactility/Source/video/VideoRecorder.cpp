@@ -43,10 +43,6 @@ size_t g_region_jpeg_capacity = 0;
 // cheaper than the pixels.
 constexpr size_t DELTA_MAX_AREA_DIVISOR = 8;
 
-// The region encoder uses the same default quality as a full frame, so a region and a whole frame
-// look alike on the client.
-constexpr int kRegionJpegQuality = 60;
-
 bool ensureGrabMutex() {
     if (g_grab_mutex == nullptr) {
         g_grab_mutex = xSemaphoreCreateMutex();
@@ -1011,7 +1007,16 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
     return ok;
 }
 
-TtVideoFrameKind tt_video_grab_delta(const uint8_t** out_data, size_t* out_size, uint32_t* out_x, uint32_t* out_y, uint32_t* out_width, uint32_t* out_height) {
+TtVideoFrameKind tt_video_grab_delta(int quality, int scale, const uint8_t** out_data, size_t* out_size, uint32_t* out_x, uint32_t* out_y, uint32_t* out_width, uint32_t* out_height) {
+    // Clamped exactly like the full-frame path, so the same request produces the same geometry
+    // whichever kind of frame comes back.
+    if (quality < 1 || quality > 100) {
+        quality = 60;
+    }
+    if (scale < 1 || scale > 4) {
+        scale = 1;
+    }
+
     if (!ensureGrabMutex()) {
         return TT_VIDEO_FRAME_FULL;
     }
@@ -1044,32 +1049,59 @@ TtVideoFrameKind tt_video_grab_delta(const uint8_t** out_data, size_t* out_size,
             const uint32_t y = static_cast<uint32_t>(area.y1);
             const uint32_t w = static_cast<uint32_t>(area.x2 - area.x1 + 1);
             const uint32_t h = static_cast<uint32_t>(area.y2 - area.y1 + 1);
-            const size_t bytes = static_cast<size_t>(w) * h * 2;
-            const size_t frame_bytes = static_cast<size_t>(shadow_w) * shadow_h * 2;
 
-            // A change that covers the whole screen is not a region at all: the caller's full-frame
-            // path already handles it, and going through a region copy first would just add a pass.
-            if (bytes < frame_bytes && ensureDeltaCapacity(bytes)) {
-                // Copy and exchange in one pass. The source is handed over already offset to the
-                // region's first pixel, so the alignment check inside covers the x offset too. The
-                // shadow holds the panel's channel order, so this also produces the standard RGB565
-                // the client expects - same as the full-frame path.
-                copy_swap_rgb565(g_delta_buf,
-                                 shadow + static_cast<size_t>(y) * shadow_stride + static_cast<size_t>(x) * 2,
-                                 shadow_stride,
-                                 w,
-                                 h);
+            // Everything a client receives is in the scale's coordinate space, regions included, so
+            // a client never has to know which scale a reply happened to use. The region is snapped
+            // outward to the scale grid for that, which also means it always covers at least the
+            // pixels that changed.
+            const uint32_t grid = static_cast<uint32_t>(scale);
+            const uint32_t scaled_w = shadow_w / grid;
+            const uint32_t scaled_h = shadow_h / grid;
 
-                region_x = x;
-                region_y = y;
-                region_w = w;
-                region_h = h;
+            // A change confined to the rows or columns past the last whole scale block has nothing to
+            // report at this scale. A whole frame cannot show them either - shadow_h % scale, i.e.
+            // the bottom two rows at scale 3, simply have no scaled pixel.
+            if (scaled_w == 0 || scaled_h == 0 || x >= scaled_w * grid || y >= scaled_h * grid) {
+                kind = TT_VIDEO_FRAME_NONE;
+            } else {
+                const uint32_t sx = (x / grid) * grid;
+                const uint32_t sy = (y / grid) * grid;
+                const uint32_t ex = std::min(shadow_w, ((x + w + grid - 1) / grid) * grid);
+                const uint32_t ey = std::min(shadow_h, ((y + h + grid - 1) / grid) * grid);
 
-                // Small regions are cheaper raw: no encode at all, and the pixels cost less than
-                // the framing a JPEG would add. Anything bigger is compressed.
-                kind = (bytes * DELTA_MAX_AREA_DIVISOR <= frame_bytes)
-                    ? TT_VIDEO_FRAME_DELTA
-                    : TT_VIDEO_FRAME_DELTA_JPEG;
+                // Both ends are grid-aligned, so these divide exactly.
+                const uint32_t region_w_scaled = (ex - sx) / grid;
+                const uint32_t region_h_scaled = (ey - sy) / grid;
+                const size_t bytes = static_cast<size_t>(region_w_scaled) * region_h_scaled * 2;
+                const size_t frame_bytes = static_cast<size_t>(scaled_w) * scaled_h * 2;
+
+                // A change covering the whole scaled frame is not a region at all: the caller's
+                // full-frame path already produces exactly that, and going through a region copy
+                // first would just add a pass.
+                if (bytes < frame_bytes && ensureDeltaCapacity(bytes)) {
+                    // Copy, exchange red/blue and box-average down to the requested scale in one
+                    // pass, straight into the scaled region - so a downscaled frame never
+                    // materialises a full-resolution intermediate. The source is handed over already
+                    // offset to the region's first pixel, so the alignment check inside covers that
+                    // offset too, and the result is standard RGB565 like the full-frame path.
+                    copy_scale_swap_rgb565(g_delta_buf,
+                                           shadow + static_cast<size_t>(sy) * shadow_stride + static_cast<size_t>(sx) * 2,
+                                           shadow_stride,
+                                           ex - sx,
+                                           ey - sy,
+                                           grid,
+                                           &region_w,
+                                           &region_h);
+
+                    region_x = sx / grid;
+                    region_y = sy / grid;
+
+                    // Small regions are cheaper raw: no encode at all, and the pixels cost less than
+                    // the framing a JPEG would add. Anything bigger is compressed.
+                    kind = (bytes * DELTA_MAX_AREA_DIVISOR <= frame_bytes)
+                        ? TT_VIDEO_FRAME_DELTA
+                        : TT_VIDEO_FRAME_DELTA_JPEG;
+                }
             }
         }
 
@@ -1089,7 +1121,7 @@ TtVideoFrameKind tt_video_grab_delta(const uint8_t** out_data, size_t* out_size,
         const size_t need = regionJpegNeed(static_cast<size_t>(region_w) * region_h * 2);
         uint8_t* jpeg_out = ensureRegionJpegCapacity(need);
         payload_size = (jpeg_out != nullptr)
-            ? encode_jpeg_rgb565(g_delta_buf, region_w, region_h, kRegionJpegQuality, jpeg_out, need)
+            ? encode_jpeg_rgb565(g_delta_buf, region_w, region_h, quality, jpeg_out, need)
             : 0;
         if (payload_size > 0) {
             payload = jpeg_out;

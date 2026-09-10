@@ -84,14 +84,22 @@ typedef enum {
  *
  * The returned pointer stays valid until the next call.
  *
+ * Everything is expressed in the requested scale's coordinate space: the region coordinates, the
+ * payload dimensions and the payload itself are all in scaled pixels, exactly as a whole frame is
+ * from tt_video_grab_jpeg(). A client therefore renders either kind the same way, without knowing
+ * which scale a particular reply used. The region is snapped outward to the scale grid so it always
+ * covers at least the pixels that changed.
+ *
+ * @param[in]  quality    JPEG quality 1-100; anything outside that range means 60.
+ * @param[in]  scale      integer downscale 1-4; anything outside that range means 1.
  * @param[out] out_data   receives the pixels (raw RGB565) or the JPEG depending on the return value.
  * @param[out] out_size   receives the payload length in bytes. May be null.
- * @param[out] out_x      receives the region's left edge. May be null.
- * @param[out] out_y      receives the region's top edge. May be null.
- * @param[out] out_width  receives the region width. May be null.
- * @param[out] out_height receives the region height. May be null.
+ * @param[out] out_x      receives the region's left edge, in scaled pixels. May be null.
+ * @param[out] out_y      receives the region's top edge, in scaled pixels. May be null.
+ * @param[out] out_width  receives the region width, in scaled pixels. May be null.
+ * @param[out] out_height receives the region height, in scaled pixels. May be null.
  */
-TtVideoFrameKind tt_video_grab_delta(const uint8_t** out_data, size_t* out_size, uint32_t* out_x, uint32_t* out_y, uint32_t* out_width, uint32_t* out_height);
+TtVideoFrameKind tt_video_grab_delta(int quality, int scale, const uint8_t** out_data, size_t* out_size, uint32_t* out_x, uint32_t* out_y, uint32_t* out_width, uint32_t* out_height);
 
 /** Diagnostics for the most recent tt_video_grab_jpeg() call. All times are milliseconds. */
 struct TtVideoGrabStats {

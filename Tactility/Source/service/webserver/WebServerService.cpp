@@ -2027,7 +2027,7 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
             uint32_t delta_h = 0;
             const TtVideoFrameKind kind = (force_full != 0)
                 ? TT_VIDEO_FRAME_FULL
-                : tt_video_grab_delta(&delta, &delta_size, &delta_x, &delta_y, &delta_w, &delta_h);
+                : tt_video_grab_delta(quality, scale, &delta, &delta_size, &delta_x, &delta_y, &delta_w, &delta_h);
             if (kind == TT_VIDEO_FRAME_NONE) {
                 return remoteReplyText(request, "same");
             }

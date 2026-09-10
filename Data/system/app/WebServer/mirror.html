@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tactility Mirror</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+        }
+        .container { max-width: 1000px; margin: 0 auto; padding: 20px; }
+        header { padding: 20px 0; }
+        header h1 { font-size: 1.8em; color: #fff; margin-bottom: 5px; }
+        header .subtitle { color: #7f8c8d; font-size: 0.9em; }
+        .panel {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 16px;
+        }
+        .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+        label { font-size: 0.85em; color: #9aa4ad; display: block; margin-bottom: 4px; }
+        input, select, button {
+            font: inherit;
+            color: #e0e0e0;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            padding: 8px 10px;
+        }
+        input:focus, select:focus { outline: 1px solid #4a9eff; }
+        button { cursor: pointer; transition: background 0.2s; }
+        button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.18); }
+        button:disabled { opacity: 0.45; cursor: default; }
+        button.primary { background: #2d6cdf; border-color: #2d6cdf; color: #fff; }
+        button.primary:hover:not(:disabled) { background: #3a7cf0; }
+        .screen-wrap {
+            background: #0d0d16;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 12px;
+            display: flex;
+            justify-content: center;
+        }
+        canvas {
+            width: 100%;
+            max-width: 960px;
+            height: auto;
+            image-rendering: pixelated;
+            background: #000;
+            border-radius: 6px;
+            touch-action: none;
+            cursor: crosshair;
+        }
+        .status { display: flex; flex-wrap: wrap; gap: 18px; font-size: 0.85em; color: #9aa4ad; }
+        .status b { color: #e0e0e0; font-weight: 600; }
+        .ok { color: #4ade80; }
+        .warn { color: #fbbf24; }
+        .bad { color: #f87171; }
+        .hint { font-size: 0.8em; color: #7f8c8d; margin-top: 8px; line-height: 1.5; }
+        .keys { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.8em; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>Screen Mirror</h1>
+        <div class="subtitle">Live view of the device screen, and control of it.</div>
+    </header>
+
+    <div class="panel">
+        <div class="row">
+            <div>
+                <label for="user">Username</label>
+                <input id="user" autocomplete="username" size="12">
+            </div>
+            <div>
+                <label for="pass">Password</label>
+                <input id="pass" type="password" autocomplete="current-password" size="12">
+            </div>
+            <div>
+                <label for="quality">JPEG quality</label>
+                <select id="quality">
+                    <option value="40">40</option>
+                    <option value="60" selected>60</option>
+                    <option value="80">80</option>
+                </select>
+            </div>
+            <div>
+                <label for="scale">Scale</label>
+                <select id="scale">
+                    <option value="1">1x (full, ~5 fps)</option>
+                    <option value="2" selected>2x (240x160, ~14 fps)</option>
+                    <option value="3">3x (160x106)</option>
+                    <option value="4">4x (120x80, ~24 fps)</option>
+                </select>
+            </div>
+            <div style="align-self: flex-end;">
+                <button id="connect" class="primary">Connect</button>
+            </div>
+        </div>
+        <div class="hint">
+            Requires authentication to be enabled in Settings &gt; Web Server: watching and driving
+            someone's screen is deliberately opt-in. Click the screen to tap it, drag to move the
+            pointer. Keyboard events go to the device while the screen is focused.
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="status">
+            <span>State: <b id="state">idle</b></span>
+            <span>Frame: <b id="frames">0</b></span>
+            <span>Rate: <b id="fps">-</b></span>
+            <span>Last reply: <b id="last">-</b></span>
+            <span>Bytes recv: <b id="bytes">0</b></span>
+        </div>
+    </div>
+
+    <div class="screen-wrap">
+        <!-- Sized by the scale selector: everything the device sends is already in this space. -->
+        <canvas id="screen" width="240" height="160" tabindex="0"></canvas>
+    </div>
+</div>
+
+<script>
+(function () {
+    'use strict';
+
+    var canvas = document.getElementById('screen');
+    var ctx = canvas.getContext('2d', { alpha: false });
+    var el = function (id) { return document.getElementById(id); };
+
+    var socket = null;
+    var running = false;
+    var frames = 0;
+    var bytes = 0;
+    var rateWindow = [];
+    var lastFullFrameAt = 0;
+    var expecting = null;   // 'D' or 'J' - a text header arrived, its binary payload is next.
+
+    // The device reports the screen as 480x320 in the protocol's own units; the scale selector
+    // divides that. Requests carry the scale, and every reply is already expressed in it.
+    var DEVICE_W = 480;
+    var DEVICE_H = 320;
+
+    function scale() { return parseInt(el('scale').value, 10) || 1; }
+    function quality() { return parseInt(el('quality').value, 10) || 60; }
+
+    function setState(text, cls) {
+        var node = el('state');
+        node.textContent = text;
+        node.className = cls || '';
+    }
+
+    function applyScaleToCanvas() {
+        var s = scale();
+        var w = Math.floor(DEVICE_W / s);
+        var h = Math.floor(DEVICE_H / s);
+        if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w;
+            canvas.height = h;
+            ctx.imageSmoothingEnabled = false;
+            // Whatever is on screen is now the wrong size, so start from a clean full frame.
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, w, h);
+            lastFullFrameAt = 0;
+        }
+    }
+
+    function sendText(text) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(text);
+    }
+
+    function requestFrame() {
+        if (!running) return;
+        sendText('f' + quality() + ',' + scale());
+    }
+
+    function b64(str) {
+        // btoa() needs Latin-1; encode as UTF-8 first so non-ASCII passwords survive.
+        return btoa(unescape(encodeURIComponent(str)));
+    }
+
+    // --- frame handling ---------------------------------------------------------------------
+
+    function countBytes(n) {
+        bytes += n;
+        el('bytes').textContent = String(bytes);
+    }
+
+    function markFrame() {
+        frames++;
+        el('frames').textContent = String(frames);
+        var now = performance.now();
+        rateWindow.push(now);
+        while (rateWindow.length > 0 && now - rateWindow[0] > 2000) rateWindow.shift();
+        if (rateWindow.length > 1) {
+            var span = (now - rateWindow[0]) / 1000;
+            el('fps').textContent = (rateWindow.length / span).toFixed(1);
+        }
+    }
+
+    function drawFull(bitmap) {
+        // A whole frame replaces everything, at the canvas's own size.
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        lastFullFrameAt = performance.now();
+    }
+
+    function drawRegion(bitmap, x, y, w, h) {
+        ctx.drawImage(bitmap, x, y, w, h);
+    }
+
+    function drawRaw(pixels, x, y, w, h) {
+        // Raw payload is RGB565 little-endian, tightly packed, already in canvas space.
+        var view = new DataView(pixels.buffer, pixels.byteOffset, pixels.byteLength);
+        var image = ctx.createImageData(w, h);
+        var out = image.data;
+        for (var i = 0, p = 0; i < w * h; i++, p += 2) {
+            var value = view.getUint16(p, true);
+            var o = i * 4;
+            out[o] = ((value >> 11) & 0x1f) * 255 / 31;
+            out[o + 1] = ((value >> 5) & 0x3f) * 255 / 63;
+            out[o + 2] = (value & 0x1f) * 255 / 31;
+            out[o + 3] = 255;
+        }
+        ctx.putImageData(image, x, y);
+    }
+
+    function decodeAndDraw(buffer, x, y, w, h, isFull) {
+        var blob = new Blob([buffer], { type: 'image/jpeg' });
+        // createImageBitmap keeps this off the main thread where available.
+        if (window.createImageBitmap) {
+            createImageBitmap(blob).then(function (bitmap) {
+                if (isFull) drawFull(bitmap); else drawRegion(bitmap, x, y, w, h);
+                bitmap.close && bitmap.close();
+                markFrame();
+            }).catch(function () { requestFrame(); });
+            return;
+        }
+        var url = URL.createObjectURL(blob);
+        var img = new Image();
+        img.onload = function () {
+            if (isFull) drawFull(img); else drawRegion(img, x, y, w, h);
+            URL.revokeObjectURL(url);
+            markFrame();
+        };
+        img.onerror = function () { URL.revokeObjectURL(url); requestFrame(); };
+        img.src = url;
+    }
+
+    function handleText(text) {
+        el('last').textContent = text.length > 24 ? text.slice(0, 24) + '...' : text;
+
+        if (text === 'same') {
+            // Nothing changed. Ask again immediately: the device answers this in ~12 ms, so an idle
+            // screen costs one tiny round trip rather than any frame work at all.
+            requestFrame();
+            return;
+        }
+        if (text === 'ok') { setState('connected', 'ok'); requestFrame(); return; }
+        if (text === 'auth') { setState('authentication failed', 'bad'); stop(); return; }
+        if (text === 'disabled') {
+            setState('mirror disabled', 'warn');
+            el('last').textContent = 'enable authentication in Settings > Web Server';
+            stop();
+            return;
+        }
+        if (text === 'err') {
+            // The device could not capture this one (the UI lock was busy). Try again at once.
+            setState('connected (retrying)', 'warn');
+            requestFrame();
+            return;
+        }
+        if (text.charAt(0) === 'D' || text.charAt(0) === 'J') {
+            var parts = text.split(' ');
+            if (parts.length === 5) {
+                expecting = { kind: parts[0], x: +parts[1], y: +parts[2], w: +parts[3], h: +parts[4] };
+                return;
+            }
+        }
+        // Anything else (an echo, or a message this page does not know) is ignored on purpose.
+        requestFrame();
+    }
+
+    function handleBinary(data) {
+        if (expecting) {
+            var e = expecting;
+            expecting = null;
+            countBytes(data.byteLength !== undefined ? data.byteLength : data.length);
+            if (e.kind === 'D') {
+                var bytesArr = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+                if (bytesArr.length === e.w * e.h * 2) {
+                    drawRaw(bytesArr, e.x, e.y, e.w, e.h);
+                    markFrame();
+                }
+            } else {
+                decodeAndDraw(data, e.x, e.y, e.w, e.h, false);
+            }
+            requestFrame();
+            return;
+        }
+        // No header: a whole-frame JPEG.
+        countBytes(data.byteLength !== undefined ? data.byteLength : data.length);
+        decodeAndDraw(data, 0, 0, canvas.width, canvas.height, true);
+        requestFrame();
+    }
+
+    // --- connection -------------------------------------------------------------------------
+
+    function stop() {
+        running = false;
+        if (socket) {
+            try { socket.close(); } catch (err) { /* already gone */ }
+            socket = null;
+        }
+        el('connect').textContent = 'Connect';
+        el('connect').disabled = false;
+        el('user').disabled = false;
+        el('pass').disabled = false;
+        if (el('state').className !== 'bad' && el('state').className !== 'warn') setState('idle');
+    }
+
+    function start() {
+        if (running) { stop(); return; }
+        var user = el('user').value;
+        var pass = el('pass').value;
+        if (!user) { setState('enter a username', 'warn'); return; }
+
+        applyScaleToCanvas();
+        try {
+            localStorage.setItem('mirror.user', user);
+        } catch (err) { /* private mode */ }
+
+        setState('connecting...');
+        el('connect').disabled = true;
+        el('user').disabled = true;
+        el('pass').disabled = true;
+
+        var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        try {
+            socket = new WebSocket(proto + location.host + '/ws/remote');
+        } catch (err) {
+            setState('cannot open socket', 'bad');
+            stop();
+            return;
+        }
+        socket.binaryType = 'arraybuffer';
+
+        socket.onopen = function () {
+            running = true;
+            frames = 0; bytes = 0; rateWindow = []; expecting = null;
+            el('frames').textContent = '0';
+            el('bytes').textContent = '0';
+            el('fps').textContent = '-';
+            el('connect').textContent = 'Disconnect';
+            el('connect').disabled = false;
+            setState('authenticating...');
+            sendText('a' + b64(user + ':' + pass));
+        };
+
+        socket.onmessage = function (event) {
+            if (typeof event.data === 'string') handleText(event.data);
+            else handleBinary(event.data);
+        };
+
+        socket.onerror = function () {
+            if (running) setState('socket error', 'bad');
+        };
+
+        socket.onclose = function () {
+            var wasRunning = running;
+            stop();
+            if (wasRunning) setState('disconnected', 'warn');
+        };
+    }
+
+    // --- input ------------------------------------------------------------------------------
+
+    // Pointer coordinates travel in device pixels, not canvas pixels, because the device maps them
+    // onto its own screen. The canvas is the scaled size, so convert through its CSS box.
+    function toDevice(event) {
+        var rect = canvas.getBoundingClientRect();
+        var x = Math.round((event.clientX - rect.left) * DEVICE_W / rect.width);
+        var y = Math.round((event.clientY - rect.top) * DEVICE_H / rect.height);
+        return {
+            x: Math.max(0, Math.min(DEVICE_W - 1, x)),
+            y: Math.max(0, Math.min(DEVICE_H - 1, y))
+        };
+    }
+
+    var pressed = false;
+
+    function pointerEvent(kind, event) {
+        if (!running) return;
+        var point = toDevice(event);
+        sendText(kind + point.x + ',' + point.y);
+    }
+
+    canvas.addEventListener('pointerdown', function (event) {
+        event.preventDefault();
+        canvas.focus();
+        pressed = true;
+        canvas.setPointerCapture && canvas.setPointerCapture(event.pointerId);
+        pointerEvent('p', event);
+    });
+    canvas.addEventListener('pointermove', function (event) {
+        if (!pressed) return;
+        event.preventDefault();
+        pointerEvent('m', event);
+    });
+    canvas.addEventListener('pointerup', function (event) {
+        if (!pressed) return;
+        event.preventDefault();
+        pressed = false;
+        pointerEvent('r', event);
+    });
+    canvas.addEventListener('pointercancel', function () {
+        if (!pressed) return;
+        pressed = false;
+        sendText('r0,0');
+    });
+
+    // Key codes the device understands: printable ASCII as-is, and LVGL's own values for the rest.
+    var SPECIAL = {
+        Backspace: 8, Enter: 10, Escape: 27, Delete: 127,
+        ArrowLeft: 17, ArrowRight: 18, ArrowUp: 19, ArrowDown: 20
+    };
+
+    canvas.addEventListener('keydown', function (event) {
+        if (!running) return;
+        var code = SPECIAL[event.key];
+        if (code === undefined && event.key.length === 1) {
+            code = event.key.charCodeAt(0);
+            if (code < 32 || code > 126) return;
+        }
+        if (code === undefined) return;
+        event.preventDefault();
+        sendText('k' + code);
+    });
+
+    // --- wiring -----------------------------------------------------------------------------
+
+    el('connect').addEventListener('click', start);
+    el('scale').addEventListener('change', function () {
+        applyScaleToCanvas();
+        if (running) requestFrame();
+    });
+    el('quality').addEventListener('change', function () {
+        if (running) requestFrame();
+    });
+    el('pass').addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') start();
+    });
+
+    try {
+        var saved = localStorage.getItem('mirror.user');
+        if (saved) el('user').value = saved;
+    } catch (err) { /* private mode */ }
+
+    applyScaleToCanvas();
+    window.addEventListener('beforeunload', function () { running = false; });
+}());
+</script>
+</body>
+</html>
