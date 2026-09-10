@@ -240,6 +240,10 @@ constexpr size_t REMOTE_SESSION_CAPACITY = 4;
 
 struct RemoteSession {
     int fd = -1;
+    // The client's address and ephemeral port. Together with the fd these identify the connection:
+    // see remoteSessionForFd() for why the fd alone is not enough.
+    uint32_t peer_addr = 0;
+    uint16_t peer_port = 0;
     bool authenticated = false;
 };
 
@@ -272,28 +276,70 @@ static void remoteSetNoDelay(int fd) {
     }
 }
 
-RemoteSession* remoteFindSession(int fd) {
+/** Frees the entry holding `fd`, if any, and drops it as the input controller. */
+void remoteDropSession(int fd) {
     for (auto& session : remoteSessions) {
         if (session.fd == fd) {
-            return &session;
+            session.fd = -1;
+            session.peer_addr = 0;
+            session.peer_port = 0;
+            session.authenticated = false;
+            break;
         }
     }
-    return nullptr;
+    if (remoteControllerFd == fd) {
+        remoteControllerFd = -1;
+    }
+}
+
+/** Reads the socket's peer address. False when the connection is already gone. */
+bool remotePeerIdentity(int fd, uint32_t& addr, uint16_t& port) {
+    struct sockaddr_in peer = {};
+    socklen_t length = sizeof(peer);
+    if (getpeername(fd, reinterpret_cast<struct sockaddr*>(&peer), &length) != 0) {
+        return false;
+    }
+    addr = peer.sin_addr.s_addr;
+    port = peer.sin_port;
+    return true;
 }
 
 RemoteSession* remoteSessionForFd(int fd) {
-    // Applied on every message rather than once per connection, and idempotently, because the
-    // session table keeps its entries after a client goes away: a new connection can be handed an
-    // fd that a stale entry still owns, in which case this is the only place that would set it.
-    // One small syscall per frame is nothing next to producing the frame.
+    // Applied on every message rather than once per connection, idempotently. One small syscall per
+    // frame is nothing next to producing the frame, and doing it here means it cannot be missed by
+    // any of the paths below.
     remoteSetNoDelay(fd);
 
-    if (RemoteSession* existing = remoteFindSession(fd); existing != nullptr) {
-        return existing;
+    uint32_t peer_addr = 0;
+    uint16_t peer_port = 0;
+    const bool have_peer = remotePeerIdentity(fd, peer_addr, peer_port);
+
+    // A socket fd is not a connection. The stack hands out the lowest free number, so a client that
+    // reconnects - a page refresh, a tab reopened - very often gets the fd the previous client just
+    // released. Looking a session up by fd alone therefore finds the *old* connection's entry and,
+    // with it, its authenticated flag: the new client would be served without credentials and would
+    // inherit control of the device. Verified before this fix existed: a second connection that sent
+    // no credentials received a frame, where an unauthenticated one should have been told "auth".
+    //
+    // The peer address and port are what actually distinguish connections, so an entry whose peer
+    // does not match the socket belongs to somebody who has gone.
+    for (auto& session : remoteSessions) {
+        if (session.fd != fd) {
+            continue;
+        }
+        if (have_peer && session.peer_addr == peer_addr && session.peer_port == peer_port) {
+            return &session;
+        }
+        LOG_I(TAG, "/ws/remote: fd %d belongs to a new connection, dropping the old session", fd);
+        remoteDropSession(fd);
+        break;
     }
+
     for (auto& session : remoteSessions) {
         if (session.fd == -1) {
             session.fd = fd;
+            session.peer_addr = peer_addr;
+            session.peer_port = peer_port;
             session.authenticated = false;
             return &session;
         }
@@ -405,7 +451,13 @@ esp_err_t remoteReplyText(httpd_req_t* request, const char* text) {
     reply.type = HTTPD_WS_TYPE_TEXT;
     reply.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(text));
     reply.len = std::strlen(text);
-    return httpd_ws_send_frame(request, &reply);
+    const esp_err_t result = httpd_ws_send_frame(request, &reply);
+    if (result != ESP_OK) {
+        // A reply that could not be delivered means the client is gone: release its slot now
+        // instead of leaving the entry to be reclaimed by whoever reuses the fd.
+        remoteDropSession(httpd_req_to_sockfd(request));
+    }
+    return result;
 }
 
 bool WebServerService::onStart(ServiceContext& service) {
