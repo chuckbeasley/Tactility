@@ -11,6 +11,7 @@
 #include <lvgl/devices/device_context.h>
 
 #include <stdlib.h>
+#include <cstring>
 
 #ifdef ESP_PLATFORM
 #include <esp_heap_caps.h>
@@ -57,6 +58,23 @@ struct LvglDisplayCtx {
     // Mirrors LvglDisplayConfig::swap_bytes: the panel is big endian while the OS is little endian,
     // so we fix it in software. In the future, the driver should probably expose endianness requirements instead.
     bool byte_swap;
+    // Shadow frame: a complete copy of the logical screen, kept up to date by copying each region
+    // LVGL flushes into it (see lvgl_display_shadow_update()). It exists so a consumer - the
+    // remote-screen mirror - can read a whole frame cheaply instead of re-rendering the entire
+    // widget tree with lv_snapshot_take() (~350 ms at 480x320).
+    //
+    // The alternative, putting the display into full-frame render mode, also makes the buffer a
+    // complete frame, but it costs the UI a full redraw on every update: the JPEG encode alone
+    // nearly doubled (128 ms -> 247 ms) even on a completely static screen. Keeping the shadow
+    // instead leaves the display in partial mode: a static screen copies nothing, and a small
+    // update copies only its own rectangle.
+    //
+    // Allocated lazily on the first RGB565 flush. shadow_rows marks which rows have been written at
+    // least once, so a consumer can tell whether the frame is complete yet.
+    uint8_t* shadow_frame;
+    size_t shadow_stride;
+    uint8_t* shadow_rows;
+    bool shadow_complete;
 };
 
 static void* lvgl_display_alloc_buffer(size_t size_bytes, bool prefer_external_ram) {
@@ -220,10 +238,77 @@ static void* lvgl_display_try_ppa_rotate(struct LvglDisplayCtx* ctx, const uint8
     return lvgl_ppa_rotate(ctx->ppa_handle, in_buff, w, h, rotation, color_format, false);
 }
 
+// Copies a freshly rendered region into the shadow frame (see LvglDisplayCtx::shadow_frame).
+// Called from the flush callback, so it runs on the LVGL task with the LVGL lock held, and works in
+// logical screen coordinates - before the rotation/byte-swap handling below rewrites them.
+static void lvgl_display_shadow_update(struct LvglDisplayCtx* ctx, lv_display_t* disp, const lv_area_t* area, const uint8_t* color_map) {
+    if (lv_display_get_color_format(disp) != LV_COLOR_FORMAT_RGB565) {
+        return; // Only RGB565 has a layout that can be copied straight through.
+    }
+
+    const uint32_t hres = (uint32_t)lv_display_get_horizontal_resolution(disp);
+    const uint32_t vres = (uint32_t)lv_display_get_vertical_resolution(disp);
+    if (hres == 0 || vres == 0) {
+        return;
+    }
+
+    const int32_t x1 = area->x1;
+    const int32_t y1 = area->y1;
+    const int32_t x2 = area->x2;
+    const int32_t y2 = area->y2;
+    if (x1 < 0 || y1 < 0 || x2 < x1 || y2 < y1 || (uint32_t)x2 >= hres || (uint32_t)y2 >= vres) {
+        return;
+    }
+
+    const size_t row_bitmap_bytes = ((size_t)vres + 7) / 8;
+
+    if (ctx->shadow_frame == NULL) {
+        ctx->shadow_frame = (uint8_t*)lvgl_display_alloc_buffer((size_t)hres * vres * 2, true);
+        ctx->shadow_rows = (uint8_t*)lvgl_display_alloc_buffer(row_bitmap_bytes, true);
+        if (ctx->shadow_frame == NULL || ctx->shadow_rows == NULL) {
+            if (ctx->shadow_frame != NULL) { lvgl_display_free_buffer(ctx->shadow_frame); ctx->shadow_frame = NULL; }
+            if (ctx->shadow_rows != NULL) { lvgl_display_free_buffer(ctx->shadow_rows); ctx->shadow_rows = NULL; }
+            return;
+        }
+        memset(ctx->shadow_rows, 0, row_bitmap_bytes);
+        ctx->shadow_stride = (size_t)hres * 2;
+        ctx->shadow_complete = false;
+    }
+
+    // The area's pixels are tightly packed, with a stride derived from the area's width.
+    const size_t row_bytes = (size_t)(x2 - x1 + 1) * 2;
+    const uint32_t src_stride = lv_draw_buf_width_to_stride(x2 - x1 + 1, LV_COLOR_FORMAT_RGB565);
+    for (int32_t y = y1; y <= y2; ++y) {
+        memcpy(ctx->shadow_frame + (size_t)y * ctx->shadow_stride + (size_t)x1 * 2,
+               color_map + (size_t)(y - y1) * src_stride,
+               row_bytes);
+        ctx->shadow_rows[(size_t)y >> 3] |= (uint8_t)(1u << ((size_t)y & 7u));
+    }
+
+    // Once every row has been written at least once the frame is complete - which is the case after
+    // the first full refresh, since a fresh screen invalidates everything.
+    if (!ctx->shadow_complete) {
+        const uint8_t last_mask = (vres % 8 == 0) ? 0xFF : (uint8_t)((1u << (vres % 8)) - 1u);
+        bool all = true;
+        for (size_t i = 0; i < row_bitmap_bytes; ++i) {
+            const uint8_t mask = (i + 1 == row_bitmap_bytes) ? last_mask : 0xFF;
+            if ((ctx->shadow_rows[i] & mask) != mask) {
+                all = false;
+                break;
+            }
+        }
+        ctx->shadow_complete = all;
+    }
+}
+
 static void lvgl_display_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* color_map) {
     struct LvglDeviceContext* wrapper = (struct LvglDeviceContext*)lv_display_get_driver_data(disp);
     struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
     bool is_i1 = lv_display_get_color_format(disp) == LV_COLOR_FORMAT_I1;
+
+    // Keep the shadow frame current, from the logical (unrotated, unswapped) pixels that LVGL just
+    // rendered for this region.
+    lvgl_display_shadow_update(ctx, disp, area, color_map);
 
     int32_t x1 = area->x1;
     int32_t y1 = area->y1;
@@ -484,6 +569,26 @@ error_t lvgl_display_add(struct Device* device, const struct LvglDisplayConfig* 
     return ERROR_NONE;
 }
 
+bool lvgl_display_get_shadow_frame(lv_display_t* display, uint8_t** out_data, uint32_t* out_width, uint32_t* out_height, size_t* out_stride) {
+    if (display == NULL) {
+        return false;
+    }
+    struct LvglDeviceContext* wrapper = (struct LvglDeviceContext*)lv_display_get_driver_data(display);
+    if (wrapper == NULL || wrapper->context == NULL) {
+        return false;
+    }
+    struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
+    if (ctx->shadow_frame == NULL || !ctx->shadow_complete) {
+        return false;
+    }
+
+    if (out_data != NULL) *out_data = ctx->shadow_frame;
+    if (out_width != NULL) *out_width = (uint32_t)lv_display_get_horizontal_resolution(display);
+    if (out_height != NULL) *out_height = (uint32_t)lv_display_get_vertical_resolution(display);
+    if (out_stride != NULL) *out_stride = ctx->shadow_stride;
+    return true;
+}
+
 void lvgl_display_remove(lv_display_t* display) {
     if (display == NULL) {
         return;
@@ -504,6 +609,12 @@ void lvgl_display_remove(lv_display_t* display) {
         }
         if (ctx->rotate_buf != NULL) {
             lvgl_display_free_buffer(ctx->rotate_buf);
+        }
+        if (ctx->shadow_frame != NULL) {
+            lvgl_display_free_buffer(ctx->shadow_frame);
+        }
+        if (ctx->shadow_rows != NULL) {
+            lvgl_display_free_buffer(ctx->shadow_rows);
         }
         if (ctx->ppa_handle != NULL) {
             lvgl_ppa_delete(ctx->ppa_handle);

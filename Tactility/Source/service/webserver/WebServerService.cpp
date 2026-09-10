@@ -1360,9 +1360,7 @@ esp_err_t WebServerService::handleApiSysinfo(httpd_req_t* request) {
              << "\"capture_ms\":" << stats.capture_ms << ","
              << "\"swap_ms\":" << stats.swap_ms << ","
              << "\"encode_ms\":" << stats.encode_ms << ","
-             << "\"display_buffer\":" << (stats.used_display_buffer ? "true" : "false") << ","
-             << "\"active_w\":" << stats.active_w << ","
-             << "\"active_h\":" << stats.active_h << ","
+             << "\"shadow_frame\":" << (stats.used_shadow_frame ? "true" : "false") << ","
              << "\"resolution_w\":" << stats.resolution_w << ","
              << "\"resolution_h\":" << stats.resolution_h
              << "}";

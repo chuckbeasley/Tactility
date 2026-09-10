@@ -6,6 +6,7 @@
 #include <Tactility/video/VideoRecorder.h>
 
 #include <Tactility/lvgl/Lvgl.h>
+#include <lvgl/devices/display.h>
 #include <lvgl/lvgl.h>
 
 #include <esp_jpeg_enc.h>
@@ -600,7 +601,7 @@ bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* ou
     int64_t t_swap_done = 0;
     bool ok = false;
     bool captured = false;
-    bool used_display_buffer = false;
+    bool used_shadow_frame = false;
     uint32_t w = 0;
     uint32_t h = 0;
 
@@ -620,20 +621,26 @@ bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* ou
         uint32_t source_stride = 0;
         lv_draw_buf_t* snapshot = nullptr;
 
-        lv_draw_buf_t* active = (display != nullptr) ? lv_display_get_buf_active(display) : nullptr;
+        uint8_t* shadow = nullptr;
+        uint32_t shadow_w = 0;
+        uint32_t shadow_h = 0;
+        size_t shadow_stride = 0;
+
         g_grab_stats.resolution_w = display_w;
         g_grab_stats.resolution_h = display_h;
-        g_grab_stats.active_w = (active != nullptr) ? active->header.w : 0;
-        g_grab_stats.active_h = (active != nullptr) ? active->header.h : 0;
-        if (active != nullptr && active->data != nullptr && display_w != 0 && display_h != 0 &&
-            active->header.w == display_w && active->header.h == display_h) {
-            w = display_w;
-            h = display_h;
-            source = active->data;
-            source_stride = active->header.stride;
-            used_display_buffer = true;
+
+        if (display != nullptr &&
+            lvgl_display_get_shadow_frame(display, &shadow, &shadow_w, &shadow_h, &shadow_stride)) {
+            // Preferred path: the display keeps a complete frame up to date as it flushes regions,
+            // so this is a copy rather than a widget-tree re-render (the difference between ~70 ms
+            // and ~350 ms at 480x320).
+            w = shadow_w;
+            h = shadow_h;
+            source = shadow;
+            source_stride = static_cast<uint32_t>(shadow_stride);
+            used_shadow_frame = true;
         } else if ((snapshot = lv_snapshot_take(lv_scr_act(), LV_COLOR_FORMAT_RGB565)) != nullptr) {
-            // Fall back when the display isn't holding a full frame (e.g. partial render mode).
+            // Fallback until the shadow frame is complete (or on displays it isn't kept for).
             w = snapshot->header.w;
             h = snapshot->header.h;
             source = snapshot->data;
@@ -720,7 +727,7 @@ bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* ou
         g_grab_stats.capture_ms = static_cast<uint32_t>((t_capture_done - t_start) / 1000);
         g_grab_stats.swap_ms = static_cast<uint32_t>((t_swap_done - t_capture_done) / 1000);
         g_grab_stats.encode_ms = static_cast<uint32_t>((t_end - t_swap_done) / 1000);
-        g_grab_stats.used_display_buffer = used_display_buffer;
+        g_grab_stats.used_shadow_frame = used_shadow_frame;
         if (ok) {
             g_grab_stats.frames++;
         }

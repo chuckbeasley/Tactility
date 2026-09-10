@@ -83,6 +83,28 @@ struct LvglDisplayConfig {
 error_t lvgl_display_add(struct Device* device, const struct LvglDisplayConfig* config, lv_display_t** out_display);
 
 /**
+ * @brief Returns the display's shadow frame: a complete copy of the logical screen, kept up to date
+ * by copying every region LVGL flushes.
+ *
+ * This exists for consumers that need whole frames cheaply - in practice the remote-screen mirror -
+ * without re-rendering the widget tree with lv_snapshot_take() (~350 ms at 480x320) and without
+ * putting the display into full-frame render mode, which would make the UI redraw everything on
+ * every update.
+ *
+ * @warning Caller must hold the LVGL lock (see lvgl_lock()). The returned pointer is only valid
+ *          until the next flush, so consume or copy it before returning to the LVGL task.
+ *
+ * @param[in]  display    a display created by lvgl_display_add()
+ * @param[out] out_data   receives the frame pixels (tightly packed RGB565, top to bottom). May be null.
+ * @param[out] out_width  receives the frame width. May be null.
+ * @param[out] out_height receives the frame height. May be null.
+ * @param[out] out_stride receives the row stride in bytes. May be null.
+ * @return true when a complete frame is available; false when the display has no shadow frame
+ *         (not RGB565, or nothing flushed yet) or no refresh has covered the whole screen yet.
+ */
+bool lvgl_display_get_shadow_frame(lv_display_t* display, uint8_t** out_data, uint32_t* out_width, uint32_t* out_height, size_t* out_stride);
+
+/**
  * @brief Removes a display previously created with lvgl_display_add(), freeing any buffers it owns.
  * @warning Caller must hold the LVGL lock.
  */
