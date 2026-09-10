@@ -878,87 +878,106 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
     uint32_t w = 0;
     uint32_t h = 0;
 
-    // Capture under the LVGL lock. The display maintains a complete shadow frame as it flushes
-    // regions (see lvgl_display_get_shadow_frame), so this copies a finished frame instead of
-    // re-rendering the widget tree with lv_snapshot_take() - the difference between ~70 ms and
-    // ~350 ms at 480x320.
+    // Capture without the LVGL lock where the shadow frame can serve it.
     //
-    // The shadow is written by flushes on the LVGL task, so the copy happens under the lock; the
-    // channel swap and JPEG encode are deliberately left for after the unlock to keep the UI's
-    // stall short. The elapsed time is split into lock wait and copy (see TtVideoGrabStats) because
-    // they call for completely different optimizations.
-    if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
-        t_lock_acquired = esp_timer_get_time();
-        lv_display_t* display = lv_display_get_default();
-        const uint32_t display_w = (display != nullptr) ? lv_display_get_horizontal_resolution(display) : 0;
-        const uint32_t display_h = (display != nullptr) ? lv_display_get_vertical_resolution(display) : 0;
+    // The display keeps a complete shadow frame up to date as it flushes regions (see
+    // lvgl_display_get_shadow_frame), so this is a copy rather than a widget-tree re-render - the
+    // difference between ~70 ms and ~350 ms at 480x320. That copy does not need the lock: the
+    // shadow's bookkeeping is atomic, and a copy that overlaps a flush is detected by the sequence
+    // counter and simply taken again. Waiting for the lock instead meant waiting for the UI to stop
+    // rendering, which measured at up to 754 ms with the screen busy - longer than any of the frame
+    // work it was protecting.
+    //
+    // The lock is still taken for the fallback, lv_snapshot_take(), which walks the widget tree and
+    // genuinely requires it.
+    lv_display_t* display = lv_display_get_default();
+    if (display != nullptr) {
+        g_grab_stats.resolution_w = lv_display_get_horizontal_resolution(display);
+        g_grab_stats.resolution_h = lv_display_get_vertical_resolution(display);
+    }
 
-        const uint8_t* source = nullptr;
-        uint32_t source_stride = 0;
-        lv_draw_buf_t* snapshot = nullptr;
+    const uint8_t* source = nullptr;
+    uint32_t source_stride = 0;
+    lv_draw_buf_t* snapshot = nullptr;
+    bool holding_lock = false;
 
-        uint8_t* shadow = nullptr;
-        uint32_t shadow_w = 0;
-        uint32_t shadow_h = 0;
-        size_t shadow_stride = 0;
+    uint8_t* shadow = nullptr;
+    uint32_t shadow_w = 0;
+    uint32_t shadow_h = 0;
+    size_t shadow_stride = 0;
 
-        g_grab_stats.resolution_w = display_w;
-        g_grab_stats.resolution_h = display_h;
-
-        if (display != nullptr &&
-            lvgl_display_get_shadow_frame(display, &shadow, &shadow_w, &shadow_h, &shadow_stride)) {
-            // Preferred path: the display keeps a complete frame up to date as it flushes regions,
-            // so this is a copy rather than a widget-tree re-render (the difference between ~70 ms
-            // and ~350 ms at 480x320).
-            w = shadow_w;
-            h = shadow_h;
-            source = shadow;
-            source_stride = static_cast<uint32_t>(shadow_stride);
-            used_shadow_frame = true;
-        } else if ((snapshot = lv_snapshot_take(lv_scr_act(), LV_COLOR_FORMAT_RGB565)) != nullptr) {
-            // Fallback until the shadow frame is complete (or on displays it isn't kept for).
+    if (display != nullptr &&
+        lvgl_display_get_shadow_frame(display, &shadow, &shadow_w, &shadow_h, &shadow_stride)) {
+        w = shadow_w;
+        h = shadow_h;
+        source = shadow;
+        source_stride = static_cast<uint32_t>(shadow_stride);
+        used_shadow_frame = true;
+    } else if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
+        holding_lock = true;
+        // Until the shadow frame is complete (nothing has been rendered yet) there is nothing to
+        // copy, so the widget tree has to be rendered into a buffer instead.
+        if ((snapshot = lv_snapshot_take(lv_scr_act(), LV_COLOR_FORMAT_RGB565)) != nullptr) {
             w = snapshot->header.w;
             h = snapshot->header.h;
             source = snapshot->data;
             source_stride = snapshot->header.stride;
         }
-
-        if (source != nullptr && w != 0 && h != 0) {
-            const size_t rgb_size = static_cast<size_t>(w) * h * 2;
-            // Generous output capacity, matching encode_jpeg()'s rule of thumb.
-            const size_t jpeg_need = std::max<size_t>(rgb_size, 65536);
-
-            if (rgb565_capacity < rgb_size) {
-                if (rgb565_buf != nullptr) heap_caps_free(rgb565_buf);
-                // 16-byte aligned: the encoder documents its input buffer as needing that, and this
-                // is the buffer it reads.
-                rgb565_buf = static_cast<uint8_t*>(
-                    heap_caps_aligned_alloc(16, rgb_size, MALLOC_CAP_SPIRAM));
-                rgb565_capacity = (rgb565_buf != nullptr) ? rgb_size : 0;
-            }
-            if (jpeg_capacity < jpeg_need) {
-                if (jpeg_buf != nullptr) heap_caps_free(jpeg_buf);
-                jpeg_buf = static_cast<uint8_t*>(heap_caps_malloc(jpeg_need, MALLOC_CAP_SPIRAM));
-                jpeg_capacity = (jpeg_buf != nullptr) ? jpeg_need : 0;
-            }
-
-            if (rgb565_buf != nullptr && jpeg_buf != nullptr) {
-                // One pass out of the shadow frame: copy, exchange red/blue, and box-average down
-                // to the requested scale. w/h become the output size the encoder will see, and the
-                // buffer above is sized for the full frame, so it always fits.
-                copy_scale_swap_rgb565(rgb565_buf, source, source_stride, w, h,
-                                       (scale > 0) ? static_cast<uint32_t>(scale) : 1u, &w, &h);
-                captured = true;
-            }
-        }
-        t_copy_done = esp_timer_get_time();
-
-        if (snapshot != nullptr) {
-            lv_draw_buf_destroy(snapshot);
-        }
-        lvgl_unlock();
-        t_capture_done = esp_timer_get_time();
     }
+
+    if (source != nullptr && w != 0 && h != 0) {
+        const size_t rgb_size = static_cast<size_t>(w) * h * 2;
+        // Generous output capacity, matching encode_jpeg()'s rule of thumb.
+        const size_t jpeg_need = std::max<size_t>(rgb_size, 65536);
+
+        if (rgb565_capacity < rgb_size) {
+            if (rgb565_buf != nullptr) heap_caps_free(rgb565_buf);
+            // 16-byte aligned: the encoder documents its input buffer as needing that, and this is
+            // the buffer it reads.
+            rgb565_buf = static_cast<uint8_t*>(
+                heap_caps_aligned_alloc(16, rgb_size, MALLOC_CAP_SPIRAM));
+            rgb565_capacity = (rgb565_buf != nullptr) ? rgb_size : 0;
+        }
+        if (jpeg_capacity < jpeg_need) {
+            if (jpeg_buf != nullptr) heap_caps_free(jpeg_buf);
+            jpeg_buf = static_cast<uint8_t*>(heap_caps_malloc(jpeg_need, MALLOC_CAP_SPIRAM));
+            jpeg_capacity = (jpeg_buf != nullptr) ? jpeg_need : 0;
+        }
+
+        if (rgb565_buf != nullptr && jpeg_buf != nullptr) {
+            // One pass out of the shadow frame: copy, exchange red/blue, and box-average down to the
+            // requested scale. w/h become the output size the encoder will see, and the buffer above
+            // is sized for the full frame, so it always fits. Timed from here, so lock_wait_ms stays
+            // the wait it always meant and copy_ms stays the copy.
+            t_lock_acquired = esp_timer_get_time();
+
+            uint32_t out_w = w;
+            uint32_t out_h = h;
+            const uint32_t scale_u = (scale > 0) ? static_cast<uint32_t>(scale) : 1u;
+
+            const uint32_t seq_before = used_shadow_frame ? lvgl_display_shadow_sequence(display) : 0;
+            copy_scale_swap_rgb565(rgb565_buf, source, source_stride, w, h, scale_u, &out_w, &out_h);
+            if (used_shadow_frame && lvgl_display_shadow_sequence(display) != seq_before) {
+                // A flush wrote into the shadow while we were copying, so the frame may mix two UI
+                // states. Take it again rather than sending a frame with a seam in it. One retry is
+                // enough in practice, and the copy is cheap next to waiting for the lock.
+                copy_scale_swap_rgb565(rgb565_buf, source, source_stride, w, h, scale_u, &out_w, &out_h);
+            }
+
+            w = out_w;
+            h = out_h;
+            captured = true;
+        }
+    }
+    t_copy_done = esp_timer_get_time();
+
+    if (snapshot != nullptr) {
+        lv_draw_buf_destroy(snapshot);
+    }
+    if (holding_lock) {
+        lvgl_unlock();
+    }
+    t_capture_done = esp_timer_get_time();
 
     if (captured) {
         // The capture pass already exchanged red/blue and applied any downscale, so the encoder
@@ -1084,6 +1103,7 @@ TtVideoFrameKind tt_video_grab_delta(int quality, int scale, const uint8_t** out
                     // materialises a full-resolution intermediate. The source is handed over already
                     // offset to the region's first pixel, so the alignment check inside covers that
                     // offset too, and the result is standard RGB565 like the full-frame path.
+                    const uint32_t seq_before = lvgl_display_shadow_sequence(display);
                     copy_scale_swap_rgb565(g_delta_buf,
                                            shadow + static_cast<size_t>(sy) * shadow_stride + static_cast<size_t>(sx) * 2,
                                            shadow_stride,
@@ -1092,6 +1112,18 @@ TtVideoFrameKind tt_video_grab_delta(int quality, int scale, const uint8_t** out
                                            grid,
                                            &region_w,
                                            &region_h);
+                    if (lvgl_display_shadow_sequence(display) != seq_before) {
+                        // A flush wrote into the shadow mid-copy: take the region again so the
+                        // pixels are all from one UI state.
+                        copy_scale_swap_rgb565(g_delta_buf,
+                                               shadow + static_cast<size_t>(sy) * shadow_stride + static_cast<size_t>(sx) * 2,
+                                               shadow_stride,
+                                               ex - sx,
+                                               ey - sy,
+                                               grid,
+                                               &region_w,
+                                               &region_h);
+                    }
 
                     region_x = sx / grid;
                     region_y = sy / grid;

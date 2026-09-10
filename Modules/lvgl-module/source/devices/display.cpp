@@ -11,6 +11,7 @@
 #include <lvgl/devices/device_context.h>
 
 #include <stdlib.h>
+#include <atomic>
 #include <cstring>
 
 #ifdef ESP_PLATFORM
@@ -74,7 +75,18 @@ struct LvglDisplayCtx {
     uint8_t* shadow_frame;
     size_t shadow_stride;
     uint8_t* shadow_rows;
-    bool shadow_complete;
+    // Set once every row has been written at least once. atomic so a consumer can test it without
+    // taking the LVGL lock.
+    std::atomic<bool> shadow_complete {false};
+    // Bumped twice around every write into the shadow pixels. A consumer copies those pixels without
+    // any lock, so this is how it finds out that its copy overlapped a flush and may be torn - and
+    // can simply copy again. It makes no attempt to serialise the two: an occasional torn frame that
+    // the next one corrects is a far better trade than a mirror that waits for the UI to stop
+    // rendering (measured: up to 754 ms waiting for the LVGL lock while the screen was busy).
+    std::atomic<uint32_t> shadow_seq {0};
+    // Guards the dirty rectangle and the completeness flag below, which must not lose an update.
+    // Held for a handful of instructions, never across a pixel copy.
+    std::atomic_flag dirty_lock = ATOMIC_FLAG_INIT;
     // Union of the regions changed since a consumer last took it (lvgl_display_take_dirty_area).
     // This is what lets the mirror send only what moved instead of a whole frame: for a typical UI
     // update (a keystroke, a clock tick, a highlight) the rectangle is tiny.
@@ -84,6 +96,19 @@ struct LvglDisplayCtx {
     int32_t dirty_x2;
     int32_t dirty_y2;
 };
+
+// A spinlock, not a mutex, because the sections it guards are a few comparisons: the cost of a
+// syscall or a scheduler round trip would dwarf the work. Only these two functions use it.
+static void lvgl_shadow_lock(struct LvglDisplayCtx* ctx) {
+    while (ctx->dirty_lock.test_and_set(std::memory_order_acquire)) {
+        // Spin. The holder is the LVGL task doing a few compares, and it cannot be preempted
+        // inside the section on the single-core targets this runs on.
+    }
+}
+
+static void lvgl_shadow_unlock(struct LvglDisplayCtx* ctx) {
+    ctx->dirty_lock.clear(std::memory_order_release);
+}
 
 static void* lvgl_display_alloc_buffer(size_t size_bytes, bool prefer_external_ram) {
 #ifdef ESP_PLATFORM
@@ -287,12 +312,24 @@ static void lvgl_display_shadow_update(struct LvglDisplayCtx* ctx, lv_display_t*
     // The area's pixels are tightly packed, with a stride derived from the area's width.
     const size_t row_bytes = (size_t)(x2 - x1 + 1) * 2;
     const uint32_t src_stride = lv_draw_buf_width_to_stride(x2 - x1 + 1, LV_COLOR_FORMAT_RGB565);
+    // Bracket the copy with the sequence counter, so a reader copying at the same time can see that
+    // its copy overlapped a write and is not trustworthy. The copy itself is deliberately not under
+    // any lock: it is the long part (tens of ms for a large region), and holding anything across it
+    // is exactly what used to make the mirror wait for the UI to finish rendering.
+    ctx->shadow_seq.fetch_add(1, std::memory_order_acq_rel);
     for (int32_t y = y1; y <= y2; ++y) {
         memcpy(ctx->shadow_frame + (size_t)y * ctx->shadow_stride + (size_t)x1 * 2,
                color_map + (size_t)(y - y1) * src_stride,
                row_bytes);
         ctx->shadow_rows[(size_t)y >> 3] |= (uint8_t)(1u << ((size_t)y & 7u));
     }
+    ctx->shadow_seq.fetch_add(1, std::memory_order_acq_rel);
+
+    // The dirty rectangle and the completeness flag are bookkeeping rather than pixels, and losing
+    // an update to a race would mean a change the mirror never hears about - it would show a stale
+    // patch until something else changed. They are therefore updated inside a spinlock, but a very
+    // short one: this is a handful of comparisons, nothing like the LVGL lock.
+    lvgl_shadow_lock(ctx);
 
     // Widen the dirty rectangle to cover this region.
     if (ctx->dirty_empty) {
@@ -322,6 +359,8 @@ static void lvgl_display_shadow_update(struct LvglDisplayCtx* ctx, lv_display_t*
         }
         ctx->shadow_complete = all;
     }
+
+    lvgl_shadow_unlock(ctx);
 }
 
 static void lvgl_display_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* color_map) {
@@ -601,7 +640,9 @@ bool lvgl_display_get_shadow_frame(lv_display_t* display, uint8_t** out_data, ui
         return false;
     }
     struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
-    if (ctx->shadow_frame == NULL || !ctx->shadow_complete) {
+    // Safe without the LVGL lock: shadow_frame and shadow_stride are written once, on the first
+    // flush, and shadow_complete only ever goes from false to true.
+    if (ctx->shadow_frame == NULL || !ctx->shadow_complete.load(std::memory_order_acquire)) {
         return false;
     }
 
@@ -610,6 +651,18 @@ bool lvgl_display_get_shadow_frame(lv_display_t* display, uint8_t** out_data, ui
     if (out_height != NULL) *out_height = (uint32_t)lv_display_get_vertical_resolution(display);
     if (out_stride != NULL) *out_stride = ctx->shadow_stride;
     return true;
+}
+
+uint32_t lvgl_display_shadow_sequence(lv_display_t* display) {
+    if (display == NULL) {
+        return 0;
+    }
+    struct LvglDeviceContext* wrapper = (struct LvglDeviceContext*)lv_display_get_driver_data(display);
+    if (wrapper == NULL || wrapper->context == NULL) {
+        return 0;
+    }
+    struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
+    return ctx->shadow_seq.load(std::memory_order_acquire);
 }
 
 bool lvgl_display_take_dirty_area(lv_display_t* display, lv_area_t* out_area) {
@@ -621,18 +674,24 @@ bool lvgl_display_take_dirty_area(lv_display_t* display, lv_area_t* out_area) {
         return false;
     }
     struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
-    if (ctx->shadow_frame == NULL || ctx->dirty_empty) {
+    if (ctx->shadow_frame == NULL) {
         return false;
     }
 
-    if (out_area != NULL) {
-        out_area->x1 = ctx->dirty_x1;
-        out_area->y1 = ctx->dirty_y1;
-        out_area->x2 = ctx->dirty_x2;
-        out_area->y2 = ctx->dirty_y2;
+    lvgl_shadow_lock(ctx);
+    const bool have_area = !ctx->dirty_empty;
+    if (have_area) {
+        if (out_area != NULL) {
+            out_area->x1 = ctx->dirty_x1;
+            out_area->y1 = ctx->dirty_y1;
+            out_area->x2 = ctx->dirty_x2;
+            out_area->y2 = ctx->dirty_y2;
+        }
+        ctx->dirty_empty = true;
     }
-    ctx->dirty_empty = true;
-    return true;
+    lvgl_shadow_unlock(ctx);
+
+    return have_area;
 }
 
 void lvgl_display_remove(lv_display_t* display) {

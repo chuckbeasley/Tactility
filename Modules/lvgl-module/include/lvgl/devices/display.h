@@ -105,6 +105,25 @@ error_t lvgl_display_add(struct Device* device, const struct LvglDisplayConfig* 
 bool lvgl_display_get_shadow_frame(lv_display_t* display, uint8_t** out_data, uint32_t* out_width, uint32_t* out_height, size_t* out_stride);
 
 /**
+ * A counter that changes whenever the shadow frame's pixels are written.
+ *
+ * The shadow frame is written by the LVGL task as it flushes regions, and read by consumers that do
+ * not take the LVGL lock - deliberately, because waiting for that lock means waiting for rendering
+ * to stop (measured: up to 754 ms with the screen busy). A consumer therefore copies without a lock
+ * and uses this counter to find out whether a write overlapped its copy:
+ *
+ *     uint32_t before = lvgl_display_shadow_sequence(display);
+ *     ... copy the pixels ...
+ *     if (lvgl_display_shadow_sequence(display) != before) { ... copy again ... }
+ *
+ * A single retry is enough in practice. Tearing is not an error condition: a frame that overlaps a
+ * flush is merely a frame that may mix two UI states, and the next one corrects it.
+ *
+ * @return the current sequence value; 0 when the display has no shadow frame.
+ */
+uint32_t lvgl_display_shadow_sequence(lv_display_t* display);
+
+/**
  * @brief Takes the region of the screen that has changed since this was last called, and clears it.
  *
  * Together with lvgl_display_get_shadow_frame() this lets a consumer send only what moved: for a
