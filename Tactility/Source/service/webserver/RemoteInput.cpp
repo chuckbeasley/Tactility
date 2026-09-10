@@ -19,6 +19,8 @@
 
 #include <tactility/log.h>
 
+#include <atomic>
+
 namespace tt::service::webserver {
 
 namespace {
@@ -76,6 +78,33 @@ constexpr uint32_t BADGE_TIMEOUT_MS = 3000;
 lv_obj_t* badge = nullptr;
 bool badge_visible = false;
 uint32_t last_remote_activity_ms = 0;
+
+// Set whenever a remote event is actually queued, and consumed when a mirror session ends. It gates
+// closing the on-screen keyboard: a client that only ever watched must not have a keyboard closed
+// underneath the person holding the device, whose keyboard it may well be.
+std::atomic<bool> remote_input_used {false};
+
+// Set when a session ended but the LVGL lock could not be taken at that moment. The pointer indev's
+// read callback runs on the LVGL task, so it can finish the job without taking the lock at all.
+std::atomic<bool> keyboard_close_pending {false};
+
+/**
+ * Hides the on-screen keyboard. Must be called with the LVGL lock held, or from the LVGL task.
+ *
+ * A remote client taps a text field, LVGL focuses it, and the keyboard opens as it would for a local
+ * tap - there is no separate "remote keyboard" state. So if the client then disappears, the keyboard
+ * is left sitting over the screen, which is what this undoes. lvgl_software_keyboard_hide() is
+ * idempotent and also drops the keyboard's pointer to the textarea, so calling it when the keyboard
+ * is already hidden is harmless.
+ */
+void closeSoftwareKeyboard() {
+    LvglSoftwareKeyboard* keyboard = lvgl_software_keyboard_get_last();
+    if (keyboard == nullptr || keyboard->object == nullptr) {
+        return; // This build has no on-screen keyboard, or it has already been torn down.
+    }
+    lvgl_software_keyboard_hide(keyboard);
+    LOG_I(TAG, "Mirror session ended; on-screen keyboard closed");
+}
 
 uint32_t nowMs() {
     return static_cast<uint32_t>(xTaskGetTickCount()) * portTICK_PERIOD_MS;
@@ -136,6 +165,13 @@ void readCallback(lv_indev_t* /*indev*/, lv_indev_data_t* data) {
             }
             badge_visible = active;
         }
+    }
+
+    // A session that ended while the LVGL lock was busy is finished here instead: this callback runs
+    // on the LVGL task, so widgets can be touched with no lock at all. No mutex is held at this
+    // point either.
+    if (keyboard_close_pending.exchange(false)) {
+        closeSoftwareKeyboard();
     }
 
     data->point.x = current_x;
@@ -199,6 +235,7 @@ void remoteInputPush(RemoteInputType type, int32_t x, int32_t y) {
     const size_t tail = (queue_head + queue_count) % QUEUE_CAPACITY;
     queue[tail] = Event { type, static_cast<int16_t>(x), static_cast<int16_t>(y) };
     queue_count++;
+    remote_input_used.store(true, std::memory_order_relaxed);
 
     xSemaphoreGive(mutex);
 }
@@ -220,6 +257,7 @@ void remoteInputPushKey(uint32_t key) {
     const size_t tail = (key_head + key_count) % KEY_QUEUE_CAPACITY;
     key_queue[tail] = key;
     key_count++;
+    remote_input_used.store(true, std::memory_order_relaxed);
 
     xSemaphoreGive(mutex);
 }
@@ -295,6 +333,25 @@ void remoteInputEnsureIndev() {
         }
     }
 
+    lvgl_unlock();
+}
+
+void remoteInputNotifyMirrorStopped() {
+    // Only act if this session actually injected input. A client that merely watched never caused
+    // the keyboard to open, so closing it would be closing someone else's.
+    if (!remote_input_used.exchange(false)) {
+        return;
+    }
+
+    if (!lvgl_try_lock(pdMS_TO_TICKS(500))) {
+        // The LVGL task is mid-render. Leave it to the read callback rather than blocking here: this
+        // runs on the timer task, and the session-end notification is one-shot.
+        LOG_W(TAG, "LVGL busy; on-screen keyboard will be closed on the next indev read");
+        keyboard_close_pending.store(true);
+        return;
+    }
+
+    closeSoftwareKeyboard();
     lvgl_unlock();
 }
 

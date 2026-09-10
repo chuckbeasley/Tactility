@@ -39,4 +39,18 @@ void remoteInputPushKey(uint32_t key);
  */
 void remoteInputEnsureIndev();
 
+/**
+ * Reports that a mirror session has ended, so the input it injected can be cleaned up.
+ *
+ * The one thing that needs undoing is the on-screen keyboard: a remote tap on a text field opens it
+ * exactly as a local tap would, and a client that then disappears leaves it sitting over the screen.
+ *
+ * Only acts if this session actually injected input - a client that only ever watched must not have
+ * a keyboard closed underneath whoever is holding the device, since that keyboard may be theirs.
+ *
+ * Safe to call from any task, including a timer callback: widget work is done under the LVGL lock,
+ * or handed to the LVGL task if that lock is busy at the time.
+ */
+void remoteInputNotifyMirrorStopped();
+
 } // namespace tt::service::webserver

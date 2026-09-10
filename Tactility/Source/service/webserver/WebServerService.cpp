@@ -369,6 +369,10 @@ void mirrorEndLowLatency() {
     }
     mirrorLowLatencyActive = false;
     tt::service::wifi::setPowerSaveEnabled(true);
+    // The client has stopped asking for frames, so as far as the device is concerned the session is
+    // over. Close what its input left open on screen - notably the on-screen keyboard, which a
+    // remote tap on a text field opens exactly as a local tap would.
+    remoteInputNotifyMirrorStopped();
     LOG_I(TAG, "/ws/remote: no frames for %u ms, WiFi power save restored",
         (unsigned)MIRROR_LOW_LATENCY_TIMEOUT_MS);
 }
