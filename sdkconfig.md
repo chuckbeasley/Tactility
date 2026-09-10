@@ -62,3 +62,35 @@ headroom (the web server asks httpd for 6).
 ```properties
 CONFIG_LWIP_MAX_SOCKETS=16
 ```
+
+## PSRAM speed
+
+The remote screen mirror's capture pass is bound by PSRAM bandwidth, not by its own
+loop: it moves 614 KB per 480x320 frame (read 307 KB out of the display's shadow
+frame, write 307 KB), and at the 40 MHz default that took 67 ms, i.e. ~9 MB/s for
+interleaved read and write against a 20 MB/s bus. Quad SPI at 80 MHz halves that
+pass:
+
+```properties
+CONFIG_SPIRAM_SPEED_80M=y
+```
+
+Measured on the ESP32-C5 device: the capture pass went 67 ms -> 38 ms, and a
+240x160 whole frame went 45 ms -> 37 ms of device time. `CONFIG_SPIRAM_MEMTEST`
+runs at boot and passes at this speed, which is a useful sanity check that the
+part is happy with it.
+
+What it does *not* help is the JPEG encode: that measured 125-133 ms at 40 MHz and
+121-129 ms at 80 MHz, i.e. unchanged. The encoder is CPU-bound (colour conversion
+plus DCT on a single 240 MHz core), so a faster bus does nothing for it. Anything
+that only reduces encode time has to reduce the number of pixels, which is what the
+mirror's scale setting does.
+
+This depends on the module's PSRAM being rated for 80 MHz. If it is not, the
+device fails during PSRAM initialisation and will not boot - the symptom is no
+serial output after the ROM banner - so keep the ability to set it back:
+
+```properties
+CONFIG_SPIRAM_SPEED_40M=y
+```
+
