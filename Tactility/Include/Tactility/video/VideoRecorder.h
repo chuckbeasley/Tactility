@@ -53,6 +53,22 @@ bool tt_video_is_recording(void);
  */
 bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* out_width, uint32_t* out_height);
 
+/** Diagnostics for the most recent tt_video_grab_jpeg() call. All times are milliseconds. */
+struct TtVideoGrabStats {
+    uint32_t capture_ms;      /**< Frame acquisition: LVGL lock wait plus copy out of the source. */
+    uint32_t swap_ms;         /**< BGR/RGB channel swap. */
+    uint32_t encode_ms;       /**< JPEG encode. */
+    uint32_t frames;          /**< Number of successful grabs since boot. */
+    bool used_display_buffer; /**< false when it had to fall back to lv_snapshot_take(). */
+    uint32_t active_w;        /**< lv_display_get_buf_active() width, 0 when it returned null. */
+    uint32_t active_h;        /**< lv_display_get_buf_active() height, 0 when it returned null. */
+    uint32_t resolution_w;    /**< Display resolution at capture time. */
+    uint32_t resolution_h;    /**< Display resolution at capture time. */
+};
+
+/** Copies the timings of the most recent tt_video_grab_jpeg() call into @a out. */
+void tt_video_get_grab_stats(struct TtVideoGrabStats* out);
+
 #ifdef __cplusplus
 }
 #endif

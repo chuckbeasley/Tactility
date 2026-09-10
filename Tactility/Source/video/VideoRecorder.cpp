@@ -10,6 +10,7 @@
 
 #include <esp_jpeg_enc.h>
 #include <esp_heap_caps.h>
+#include <esp_timer.h>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -20,6 +21,11 @@
 #include <vector>
 
 namespace {
+
+// Timings of the most recent single-frame grab, surfaced through /api/sysinfo (see
+// tt_video_get_grab_stats). Kept in RAM rather than logged per frame: a per-frame LOG_I backs the
+// UART up under a slow reader, and a blocked log call stalls the very path being measured.
+TtVideoGrabStats g_grab_stats = {};
 
 // Frame caps keep PSRAM bounded. MJPEG frames are small (~5 KB each, 15 frames). Uncompressed RGB
 // expands to w*h*3 bytes/frame, so it is capped lower to keep peak memory under the 8 MB PSRAM.
@@ -46,13 +52,21 @@ Recorder& recorder() {
 // The ST7796 panel senses BGR; swap red/blue in each RGB565 pixel so the recording matches the
 // physical panel (same as /api/screenshot). 0xF800 = red, 0x07E0 = green, 0x001F = blue.
 void bgr_swap_rgb565(uint8_t* data, size_t num_pixels) {
-    uint16_t* px = reinterpret_cast<uint16_t*>(data);
-    for (size_t i = 0; i < num_pixels; ++i) {
-        const uint16_t p = px[i];
-        const uint16_t r = p & 0xF800u;
-        const uint16_t g = p & 0x07E0u;
-        const uint16_t b = p & 0x001Fu;
-        px[i] = static_cast<uint16_t>((b << 11) | g | (r >> 11));
+    // Two pixels per iteration through a single 32-bit load/store. The buffer usually lives in
+    // PSRAM, where the per-pixel read-modify-write round trip - not the arithmetic - is what makes
+    // this loop expensive, so halving the number of accesses matters more than the bit math.
+    uint32_t* pairs = reinterpret_cast<uint32_t*>(data);
+    const size_t pair_count = num_pixels / 2;
+    for (size_t i = 0; i < pair_count; ++i) {
+        const uint32_t p = pairs[i];
+        const uint32_t lo = ((p & 0x0000001Fu) << 11) | (p & 0x000007E0u) | ((p & 0x0000F800u) >> 11);
+        const uint32_t hi = ((p & 0x001F0000u) << 11) | (p & 0x07E00000u) | ((p & 0xF8000000u) >> 11);
+        pairs[i] = (hi & 0xFFFF0000u) | (lo & 0x0000FFFFu);
+    }
+    if ((num_pixels & 1) != 0) {
+        uint16_t* px = reinterpret_cast<uint16_t*>(data);
+        const uint16_t p = px[num_pixels - 1];
+        px[num_pixels - 1] = static_cast<uint16_t>(((p & 0x001Fu) << 11) | (p & 0x07E0u) | ((p & 0xF800u) >> 11));
     }
 }
 
@@ -581,85 +595,143 @@ bool tt_video_grab_jpeg(const uint8_t** out_data, size_t* out_size, uint32_t* ou
         return false;
     }
 
+    const int64_t t_start = esp_timer_get_time();
+    int64_t t_capture_done = 0;
+    int64_t t_swap_done = 0;
     bool ok = false;
-    lv_draw_buf_t* draw_buf = nullptr;
+    bool captured = false;
+    bool used_display_buffer = false;
     uint32_t w = 0;
     uint32_t h = 0;
 
-    // Snapshot under the LVGL lock. lv_snapshot_take() returns a buffer we own, which stays valid
-    // after unlocking, so the copy and JPEG encode below don't hold up the UI.
+    // Capture under the LVGL lock.
+    //
+    // The display keeps a full-frame draw buffer, so read that instead of calling
+    // lv_snapshot_take(): the latter re-renders the whole widget tree, measured at ~290 ms against
+    // ~10 ms for copying the buffer out, and it dominated the mirror's frame time. The display
+    // buffer is reused by the next refresh, so it is copied while still locked; the channel swap
+    // and JPEG encode are left for after the unlock to keep the UI's stall as short as possible.
     if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
-        draw_buf = lv_snapshot_take(lv_scr_act(), LV_COLOR_FORMAT_RGB565);
-        if (draw_buf != nullptr) {
-            w = draw_buf->header.w;
-            h = draw_buf->header.h;
+        lv_display_t* display = lv_display_get_default();
+        const uint32_t display_w = (display != nullptr) ? lv_display_get_horizontal_resolution(display) : 0;
+        const uint32_t display_h = (display != nullptr) ? lv_display_get_vertical_resolution(display) : 0;
+
+        const uint8_t* source = nullptr;
+        uint32_t source_stride = 0;
+        lv_draw_buf_t* snapshot = nullptr;
+
+        lv_draw_buf_t* active = (display != nullptr) ? lv_display_get_buf_active(display) : nullptr;
+        g_grab_stats.resolution_w = display_w;
+        g_grab_stats.resolution_h = display_h;
+        g_grab_stats.active_w = (active != nullptr) ? active->header.w : 0;
+        g_grab_stats.active_h = (active != nullptr) ? active->header.h : 0;
+        if (active != nullptr && active->data != nullptr && display_w != 0 && display_h != 0 &&
+            active->header.w == display_w && active->header.h == display_h) {
+            w = display_w;
+            h = display_h;
+            source = active->data;
+            source_stride = active->header.stride;
+            used_display_buffer = true;
+        } else if ((snapshot = lv_snapshot_take(lv_scr_act(), LV_COLOR_FORMAT_RGB565)) != nullptr) {
+            // Fall back when the display isn't holding a full frame (e.g. partial render mode).
+            w = snapshot->header.w;
+            h = snapshot->header.h;
+            source = snapshot->data;
+            source_stride = snapshot->header.stride;
+        }
+
+        if (source != nullptr && w != 0 && h != 0) {
+            const size_t rgb_size = static_cast<size_t>(w) * h * 2;
+            // Generous output capacity, matching encode_jpeg()'s rule of thumb.
+            const size_t jpeg_need = std::max<size_t>(rgb_size, 65536);
+
+            if (rgb565_capacity < rgb_size) {
+                if (rgb565_buf != nullptr) heap_caps_free(rgb565_buf);
+                rgb565_buf = static_cast<uint8_t*>(heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM));
+                rgb565_capacity = (rgb565_buf != nullptr) ? rgb_size : 0;
+            }
+            if (jpeg_capacity < jpeg_need) {
+                if (jpeg_buf != nullptr) heap_caps_free(jpeg_buf);
+                jpeg_buf = static_cast<uint8_t*>(heap_caps_malloc(jpeg_need, MALLOC_CAP_SPIRAM));
+                jpeg_capacity = (jpeg_buf != nullptr) ? jpeg_need : 0;
+            }
+
+            if (rgb565_buf != nullptr && jpeg_buf != nullptr) {
+                // Row by row: the source stride may be padded, the destination is tight.
+                const size_t row_bytes = static_cast<size_t>(w) * 2;
+                uint8_t* dst = rgb565_buf;
+                for (uint32_t y = 0; y < h; ++y) {
+                    std::memcpy(dst, source + static_cast<size_t>(y) * source_stride, row_bytes);
+                    dst += row_bytes;
+                }
+                captured = true;
+            }
+        }
+
+        if (snapshot != nullptr) {
+            lv_draw_buf_destroy(snapshot);
         }
         lvgl_unlock();
+        t_capture_done = esp_timer_get_time();
     }
 
-    if (draw_buf != nullptr && w != 0 && h != 0) {
-        const size_t rgb_size = static_cast<size_t>(w) * h * 2;
-        // Generous output capacity, matching encode_jpeg()'s rule of thumb.
-        const size_t jpeg_need = std::max<size_t>(rgb_size, 65536);
+    if (captured) {
+        // The panel is BGR-ordered, so the captured frame needs R and B exchanged to look right on
+        // an ordinary RGB display.
+        bgr_swap_rgb565(rgb565_buf, static_cast<size_t>(w) * h);
+        t_swap_done = esp_timer_get_time();
 
-        if (rgb565_capacity < rgb_size) {
-            if (rgb565_buf != nullptr) heap_caps_free(rgb565_buf);
-            rgb565_buf = static_cast<uint8_t*>(heap_caps_malloc(rgb_size, MALLOC_CAP_SPIRAM));
-            rgb565_capacity = (rgb565_buf != nullptr) ? rgb_size : 0;
-        }
-        if (jpeg_capacity < jpeg_need) {
-            if (jpeg_buf != nullptr) heap_caps_free(jpeg_buf);
-            jpeg_buf = static_cast<uint8_t*>(heap_caps_malloc(jpeg_need, MALLOC_CAP_SPIRAM));
-            jpeg_capacity = (jpeg_buf != nullptr) ? jpeg_need : 0;
-        }
+        jpeg_enc_config_t config = DEFAULT_JPEG_ENC_CONFIG();
+        config.width = static_cast<int>(w);
+        config.height = static_cast<int>(h);
+        config.src_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+        config.subsampling = JPEG_SUBSAMPLE_420;
+        config.quality = 60;
+        config.rotate = JPEG_ROTATE_0D;
+        config.task_enable = false;
 
-        if (rgb565_buf != nullptr && jpeg_buf != nullptr) {
-            // Row by row (stride may be padded) so the frame is tightly packed, then BGR-swap to
-            // match the physical panel.
-            const uint32_t stride = draw_buf->header.stride;
-            uint8_t* dst = rgb565_buf;
-            for (uint32_t y = 0; y < h; ++y) {
-                std::memcpy(dst, draw_buf->data + static_cast<size_t>(y) * stride, static_cast<size_t>(w) * 2);
-                dst += static_cast<size_t>(w) * 2;
-            }
-            bgr_swap_rgb565(rgb565_buf, static_cast<size_t>(w) * h);
-
-            jpeg_enc_config_t config = DEFAULT_JPEG_ENC_CONFIG();
-            config.width = static_cast<int>(w);
-            config.height = static_cast<int>(h);
-            config.src_type = JPEG_PIXEL_FORMAT_RGB565_LE;
-            config.subsampling = JPEG_SUBSAMPLE_420;
-            config.quality = 60;
-            config.rotate = JPEG_ROTATE_0D;
-            config.task_enable = false;
-
-            jpeg_enc_handle_t enc = nullptr;
-            if (jpeg_enc_open(&config, &enc) == JPEG_ERR_OK && enc != nullptr) {
-                int produced = 0;
-                const jpeg_error_t res = jpeg_enc_process(
-                    enc,
-                    rgb565_buf,
-                    static_cast<int>(rgb_size),
-                    jpeg_buf,
-                    static_cast<int>(jpeg_capacity),
-                    &produced
-                );
-                jpeg_enc_close(enc);
-                if (res == JPEG_ERR_OK && produced > 0) {
-                    if (out_data != nullptr) *out_data = jpeg_buf;
-                    if (out_size != nullptr) *out_size = static_cast<size_t>(produced);
-                    if (out_width != nullptr) *out_width = w;
-                    if (out_height != nullptr) *out_height = h;
-                    ok = true;
-                }
+        const int in_size = static_cast<int>(static_cast<size_t>(w) * h * 2);
+        jpeg_enc_handle_t enc = nullptr;
+        if (jpeg_enc_open(&config, &enc) == JPEG_ERR_OK && enc != nullptr) {
+            int produced = 0;
+            const jpeg_error_t res = jpeg_enc_process(
+                enc,
+                rgb565_buf,
+                in_size,
+                jpeg_buf,
+                static_cast<int>(jpeg_capacity),
+                &produced
+            );
+            jpeg_enc_close(enc);
+            if (res == JPEG_ERR_OK && produced > 0) {
+                if (out_data != nullptr) *out_data = jpeg_buf;
+                if (out_size != nullptr) *out_size = static_cast<size_t>(produced);
+                if (out_width != nullptr) *out_width = w;
+                if (out_height != nullptr) *out_height = h;
+                ok = true;
             }
         }
     }
 
-    if (draw_buf != nullptr) {
-        lv_draw_buf_destroy(draw_buf);
+    // Publish the breakdown for /api/sysinfo instead of logging it: a per-frame LOG_I backs the
+    // UART up under a slow reader, and a blocked log call can stall the very path being measured.
+    {
+        const int64_t t_end = esp_timer_get_time();
+        g_grab_stats.capture_ms = static_cast<uint32_t>((t_capture_done - t_start) / 1000);
+        g_grab_stats.swap_ms = static_cast<uint32_t>((t_swap_done - t_capture_done) / 1000);
+        g_grab_stats.encode_ms = static_cast<uint32_t>((t_end - t_swap_done) / 1000);
+        g_grab_stats.used_display_buffer = used_display_buffer;
+        if (ok) {
+            g_grab_stats.frames++;
+        }
     }
 
     xSemaphoreGive(grab_mutex);
     return ok;
+}
+
+void tt_video_get_grab_stats(struct TtVideoGrabStats* out) {
+    if (out != nullptr) {
+        *out = g_grab_stats;
+    }
 }

@@ -1348,7 +1348,25 @@ esp_err_t WebServerService::handleApiSysinfo(httpd_req_t* request) {
 #else
     json << "\"screenshot\":false";
 #endif
-    json << "}";
+    json << "},";
+
+    // Remote-screen capture cost, so the mirror's frame time can be read without a serial console
+    // (a per-frame log backs the UART up and perturbs the very path being measured).
+    {
+        TtVideoGrabStats stats = {};
+        tt_video_get_grab_stats(&stats);
+        json << "\"mirror\":{"
+             << "\"frames\":" << stats.frames << ","
+             << "\"capture_ms\":" << stats.capture_ms << ","
+             << "\"swap_ms\":" << stats.swap_ms << ","
+             << "\"encode_ms\":" << stats.encode_ms << ","
+             << "\"display_buffer\":" << (stats.used_display_buffer ? "true" : "false") << ","
+             << "\"active_w\":" << stats.active_w << ","
+             << "\"active_h\":" << stats.active_h << ","
+             << "\"resolution_w\":" << stats.resolution_w << ","
+             << "\"resolution_h\":" << stats.resolution_h
+             << "}";
+    }
 
     json << "}";
 
