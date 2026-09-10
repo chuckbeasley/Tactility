@@ -1,6 +1,7 @@
 #ifdef ESP_PLATFORM
 
 #include <Tactility/service/webserver/WebServerService.h>
+#include <Tactility/service/webserver/RemoteInput.h>
 #include <Tactility/service/ServiceManifest.h>
 
 #include <app/start.h>
@@ -38,6 +39,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <esp_chip_info.h>
@@ -1608,12 +1610,18 @@ esp_err_t WebServerService::handleApiVideoStop(httpd_req_t* request) {
 // frame. Control frames (ping/pong/close) are handled inside httpd because the handler is
 // registered without handle_ws_control_frames.
 //
-// Phase 2 serves screen frames: a client sends the text command "f" and gets one JPEG back as a
-// binary frame. Frame requests (phase 2) and, later, input events (phase 3) share this endpoint.
+// The endpoint carries both directions: a client sends "f" and receives one JPEG back as a binary
+// frame (viewing), and sends pointer events that get injected into LVGL (interaction).
 esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
+    // Register the remote pointer indev here rather than only in the handshake branch below: this
+    // httpd does not appear to invoke the handler for the upgrade request itself (only for received
+    // frames), so the handshake branch never ran and the indev was never created. The call is
+    // idempotent and cheap once the indev exists.
+    remoteInputEnsureIndev();
+
     if (request->method == HTTP_GET) {
-        // The upgrade handshake is performed by httpd itself (is_websocket = true); there is
-        // nothing to send from here.
+        // Handshake, when httpd does route it here: httpd performs the upgrade itself
+        // (is_websocket = true), so there is nothing to send from this side.
         LOG_I(TAG, "GET /ws/remote (websocket handshake)");
         return ESP_OK;
     }
@@ -1651,6 +1659,19 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
     // displayed the previous one, so pacing (and back-pressure) live on the client side. "ping" is
     // a liveness check. Anything else falls through to the echo below.
     if (frame.type == HTTPD_WS_TYPE_TEXT) {
+        // Remote pointer events: "<kind><x>,<y>" - "p12,34" press, "m13,35" move, "r13,35" release.
+        // Fire-and-forget: the client sees the effect in the next frame it asks for.
+        if (frame.len >= 3 && (payload[0] == 'p' || payload[0] == 'm' || payload[0] == 'r')) {
+            int x = 0;
+            int y = 0;
+            if (std::sscanf(reinterpret_cast<const char*>(payload.data()) + 1, "%d,%d", &x, &y) == 2) {
+                const RemoteInputType type = (payload[0] == 'p') ? RemoteInputType::Press
+                    : ((payload[0] == 'm') ? RemoteInputType::Move : RemoteInputType::Release);
+                remoteInputPush(type, x, y);
+                return ESP_OK;
+            }
+        }
+
         if (frame.len == 1 && payload[0] == 'f') {
             const uint8_t* jpeg = nullptr;
             size_t jpeg_size = 0;
