@@ -75,6 +75,14 @@ struct LvglDisplayCtx {
     size_t shadow_stride;
     uint8_t* shadow_rows;
     bool shadow_complete;
+    // Union of the regions changed since a consumer last took it (lvgl_display_take_dirty_area).
+    // This is what lets the mirror send only what moved instead of a whole frame: for a typical UI
+    // update (a keystroke, a clock tick, a highlight) the rectangle is tiny.
+    bool dirty_empty;
+    int32_t dirty_x1;
+    int32_t dirty_y1;
+    int32_t dirty_x2;
+    int32_t dirty_y2;
 };
 
 static void* lvgl_display_alloc_buffer(size_t size_bytes, bool prefer_external_ram) {
@@ -273,6 +281,7 @@ static void lvgl_display_shadow_update(struct LvglDisplayCtx* ctx, lv_display_t*
         memset(ctx->shadow_rows, 0, row_bitmap_bytes);
         ctx->shadow_stride = (size_t)hres * 2;
         ctx->shadow_complete = false;
+        ctx->dirty_empty = true;
     }
 
     // The area's pixels are tightly packed, with a stride derived from the area's width.
@@ -283,6 +292,20 @@ static void lvgl_display_shadow_update(struct LvglDisplayCtx* ctx, lv_display_t*
                color_map + (size_t)(y - y1) * src_stride,
                row_bytes);
         ctx->shadow_rows[(size_t)y >> 3] |= (uint8_t)(1u << ((size_t)y & 7u));
+    }
+
+    // Widen the dirty rectangle to cover this region.
+    if (ctx->dirty_empty) {
+        ctx->dirty_x1 = x1;
+        ctx->dirty_y1 = y1;
+        ctx->dirty_x2 = x2;
+        ctx->dirty_y2 = y2;
+        ctx->dirty_empty = false;
+    } else {
+        if (x1 < ctx->dirty_x1) ctx->dirty_x1 = x1;
+        if (y1 < ctx->dirty_y1) ctx->dirty_y1 = y1;
+        if (x2 > ctx->dirty_x2) ctx->dirty_x2 = x2;
+        if (y2 > ctx->dirty_y2) ctx->dirty_y2 = y2;
     }
 
     // Once every row has been written at least once the frame is complete - which is the case after
@@ -586,6 +609,29 @@ bool lvgl_display_get_shadow_frame(lv_display_t* display, uint8_t** out_data, ui
     if (out_width != NULL) *out_width = (uint32_t)lv_display_get_horizontal_resolution(display);
     if (out_height != NULL) *out_height = (uint32_t)lv_display_get_vertical_resolution(display);
     if (out_stride != NULL) *out_stride = ctx->shadow_stride;
+    return true;
+}
+
+bool lvgl_display_take_dirty_area(lv_display_t* display, lv_area_t* out_area) {
+    if (display == NULL) {
+        return false;
+    }
+    struct LvglDeviceContext* wrapper = (struct LvglDeviceContext*)lv_display_get_driver_data(display);
+    if (wrapper == NULL || wrapper->context == NULL) {
+        return false;
+    }
+    struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
+    if (ctx->shadow_frame == NULL || ctx->dirty_empty) {
+        return false;
+    }
+
+    if (out_area != NULL) {
+        out_area->x1 = ctx->dirty_x1;
+        out_area->y1 = ctx->dirty_y1;
+        out_area->x2 = ctx->dirty_x2;
+        out_area->y2 = ctx->dirty_y2;
+    }
+    ctx->dirty_empty = true;
     return true;
 }
 

@@ -56,6 +56,34 @@ bool tt_video_is_recording(void);
  */
 bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t* out_size, uint32_t* out_width, uint32_t* out_height);
 
+/** Which kind of frame tt_video_grab_delta() produced. */
+typedef enum {
+    TT_VIDEO_FRAME_NONE,  /**< Nothing changed since the last delta was taken. */
+    TT_VIDEO_FRAME_DELTA, /**< A small changed region is available, as raw RGB565. */
+    TT_VIDEO_FRAME_FULL,  /**< No usable delta (nothing rendered yet, or the change is too large). */
+} TtVideoFrameKind;
+
+/**
+ * Tries to produce a change-only frame: just the region of the screen that changed since the
+ * previous call, as tightly packed RGB565 in standard channel order.
+ *
+ * Most UI updates touch a small part of the screen (a keystroke, a clock tick, a highlight), and
+ * sending that raw skips the share of a frame that dominates the pipeline - the full-frame copy,
+ * the channel swap and the JPEG encode all scale with the amount of data, so a small change costs
+ * a small fraction of a full frame. A change covering too much of the screen is not worth sending
+ * raw (it would dwarf the equivalent JPEG), and reports TT_VIDEO_FRAME_FULL instead.
+ *
+ * The returned pointer stays valid until the next call.
+ *
+ * @param[out] out_data   receives the RGB565 pixels. May be null.
+ * @param[out] out_size   receives the payload length in bytes. May be null.
+ * @param[out] out_x      receives the region's left edge. May be null.
+ * @param[out] out_y      receives the region's top edge. May be null.
+ * @param[out] out_width  receives the region width. May be null.
+ * @param[out] out_height receives the region height. May be null.
+ */
+TtVideoFrameKind tt_video_grab_delta(const uint8_t** out_data, size_t* out_size, uint32_t* out_x, uint32_t* out_y, uint32_t* out_width, uint32_t* out_height);
+
 /** Diagnostics for the most recent tt_video_grab_jpeg() call. All times are milliseconds. */
 struct TtVideoGrabStats {
     uint32_t capture_ms;       /**< Frame acquisition: LVGL lock wait plus copy out of the source. */
@@ -71,6 +99,9 @@ struct TtVideoGrabStats {
     uint32_t scale;            /**< Downscale factor actually used (1 = full resolution). */
     uint32_t output_w;         /**< Width of the encoded frame. */
     uint32_t output_h;         /**< Height of the encoded frame. */
+    uint32_t delta_frames;     /**< Frames sent as change-only regions since boot. */
+    uint32_t full_frames;      /**< Frames sent as full JPEGs since boot. */
+    uint32_t same_frames;      /**< Frame requests answered with "nothing changed" since boot. */
 };
 
 /** Copies the timings of the most recent tt_video_grab_jpeg() call into @a out. */

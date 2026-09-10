@@ -1368,7 +1368,10 @@ esp_err_t WebServerService::handleApiSysinfo(httpd_req_t* request) {
              << "\"quality\":" << stats.quality << ","
              << "\"scale\":" << stats.scale << ","
              << "\"output_w\":" << stats.output_w << ","
-             << "\"output_h\":" << stats.output_h
+             << "\"output_h\":" << stats.output_h << ","
+             << "\"delta_frames\":" << stats.delta_frames << ","
+             << "\"full_frames\":" << stats.full_frames << ","
+             << "\"same_frames\":" << stats.same_frames
              << "}";
     }
 
@@ -1866,6 +1869,37 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
                     quality = 0;
                     scale = 0;
                 }
+            }
+
+            // Change-only frame first: most UI updates touch a small part of the screen, and sending
+            // just that raw skips the full-frame copy, swap and encode entirely. "same" means
+            // nothing moved since the previous request.
+            const uint8_t* delta = nullptr;
+            size_t delta_size = 0;
+            uint32_t delta_x = 0;
+            uint32_t delta_y = 0;
+            uint32_t delta_w = 0;
+            uint32_t delta_h = 0;
+            const TtVideoFrameKind kind =
+                tt_video_grab_delta(&delta, &delta_size, &delta_x, &delta_y, &delta_w, &delta_h);
+            if (kind == TT_VIDEO_FRAME_NONE) {
+                return remoteReplyText(request, "same");
+            }
+            if (kind == TT_VIDEO_FRAME_DELTA) {
+                // The text header tells the client what the following binary frame covers; a binary
+                // frame with no preceding "D" is a whole JPEG.
+                char header[48];
+                std::snprintf(header, sizeof(header), "D %u %u %u %u",
+                    (unsigned)delta_x, (unsigned)delta_y, (unsigned)delta_w, (unsigned)delta_h);
+                const esp_err_t header_result = remoteReplyText(request, header);
+                if (header_result != ESP_OK) {
+                    return header_result;
+                }
+                httpd_ws_frame_t delta_reply = {};
+                delta_reply.type = HTTPD_WS_TYPE_BINARY;
+                delta_reply.payload = const_cast<uint8_t*>(delta);
+                delta_reply.len = delta_size;
+                return httpd_ws_send_frame(request, &delta_reply);
             }
 
             const uint8_t* jpeg = nullptr;

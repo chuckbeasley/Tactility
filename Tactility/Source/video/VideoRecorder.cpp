@@ -28,6 +28,23 @@ namespace {
 // UART up under a slow reader, and a blocked log call stalls the very path being measured.
 TtVideoGrabStats g_grab_stats = {};
 
+// Shared by the full-frame and delta paths: both read the display's shadow frame and use reusable
+// scratch buffers, so they must not run concurrently.
+SemaphoreHandle_t g_grab_mutex = nullptr;
+uint8_t* g_delta_buf = nullptr;
+size_t g_delta_capacity = 0;
+
+// How much of the screen a change may cover before it is cheaper to send one JPEG instead: 1/8 of
+// the frame is about 38 KB raw at 480x320, versus ~5 KB encoded.
+constexpr size_t DELTA_MAX_AREA_DIVISOR = 8;
+
+bool ensureGrabMutex() {
+    if (g_grab_mutex == nullptr) {
+        g_grab_mutex = xSemaphoreCreateMutex();
+    }
+    return g_grab_mutex != nullptr;
+}
+
 // Box-averages an RGB565 frame down by `scale` in place. Raster order makes this safe: an output
 // pixel is always written at or before the input pixels it reads, so the reads never see clobbered
 // data. Returns the new dimensions through out_w/out_h (unchanged when the image is too small).
@@ -629,19 +646,15 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
 
     // Scratch buffers live for the process lifetime once allocated: streaming asks for frames
     // continuously, so re-allocating ~300 KB per frame would fragment the heap for no benefit.
-    static SemaphoreHandle_t grab_mutex = nullptr;
     static uint8_t* rgb565_buf = nullptr;
     static size_t rgb565_capacity = 0;
     static uint8_t* jpeg_buf = nullptr;
     static size_t jpeg_capacity = 0;
 
-    if (grab_mutex == nullptr) {
-        grab_mutex = xSemaphoreCreateMutex();
-        if (grab_mutex == nullptr) {
-            return false;
-        }
+    if (!ensureGrabMutex()) {
+        return false;
     }
-    if (xSemaphoreTake(grab_mutex, portMAX_DELAY) != pdTRUE) {
+    if (xSemaphoreTake(g_grab_mutex, portMAX_DELAY) != pdTRUE) {
         return false;
     }
 
@@ -799,11 +812,87 @@ bool tt_video_grab_jpeg(int quality, int scale, const uint8_t** out_data, size_t
         g_grab_stats.output_h = h;
         if (ok) {
             g_grab_stats.frames++;
+            g_grab_stats.full_frames++;
         }
     }
 
-    xSemaphoreGive(grab_mutex);
+    xSemaphoreGive(g_grab_mutex);
     return ok;
+}
+
+TtVideoFrameKind tt_video_grab_delta(const uint8_t** out_data, size_t* out_size, uint32_t* out_x, uint32_t* out_y, uint32_t* out_width, uint32_t* out_height) {
+    if (!ensureGrabMutex()) {
+        return TT_VIDEO_FRAME_FULL;
+    }
+    if (xSemaphoreTake(g_grab_mutex, portMAX_DELAY) != pdTRUE) {
+        return TT_VIDEO_FRAME_FULL;
+    }
+
+    TtVideoFrameKind kind = TT_VIDEO_FRAME_FULL;
+
+    if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
+        lv_display_t* display = lv_display_get_default();
+        uint8_t* shadow = nullptr;
+        uint32_t shadow_w = 0;
+        uint32_t shadow_h = 0;
+        size_t shadow_stride = 0;
+        lv_area_t area = {};
+
+        if (display == nullptr ||
+            !lvgl_display_get_shadow_frame(display, &shadow, &shadow_w, &shadow_h, &shadow_stride)) {
+            // No complete frame to diff against: the caller sends a full JPEG.
+            kind = TT_VIDEO_FRAME_FULL;
+        } else if (!lvgl_display_take_dirty_area(display, &area)) {
+            kind = TT_VIDEO_FRAME_NONE;
+        } else {
+            const uint32_t x = static_cast<uint32_t>(area.x1);
+            const uint32_t y = static_cast<uint32_t>(area.y1);
+            const uint32_t w = static_cast<uint32_t>(area.x2 - area.x1 + 1);
+            const uint32_t h = static_cast<uint32_t>(area.y2 - area.y1 + 1);
+            const size_t bytes = static_cast<size_t>(w) * h * 2;
+            const size_t frame_bytes = static_cast<size_t>(shadow_w) * shadow_h * 2;
+
+            // A change covering a large part of the screen is cheaper as one JPEG. Taking the area
+            // consumed it either way, which is correct: a full frame supersedes it.
+            if (bytes * DELTA_MAX_AREA_DIVISOR <= frame_bytes) {
+                if (g_delta_capacity < bytes) {
+                    if (g_delta_buf != nullptr) heap_caps_free(g_delta_buf);
+                    g_delta_buf = static_cast<uint8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM));
+                    g_delta_capacity = (g_delta_buf != nullptr) ? bytes : 0;
+                }
+                if (g_delta_buf != nullptr) {
+                    const size_t row_bytes = static_cast<size_t>(w) * 2;
+                    for (uint32_t row = 0; row < h; ++row) {
+                        std::memcpy(g_delta_buf + static_cast<size_t>(row) * row_bytes,
+                                    shadow + static_cast<size_t>(y + row) * shadow_stride + static_cast<size_t>(x) * 2,
+                                    row_bytes);
+                    }
+                    // Hand out standard RGB565: the shadow holds the panel's own channel order,
+                    // which needs the same red/blue exchange as the full-frame path.
+                    bgr_swap_rgb565(g_delta_buf, static_cast<size_t>(w) * h);
+
+                    if (out_data != nullptr) *out_data = g_delta_buf;
+                    if (out_size != nullptr) *out_size = bytes;
+                    if (out_x != nullptr) *out_x = x;
+                    if (out_y != nullptr) *out_y = y;
+                    if (out_width != nullptr) *out_width = w;
+                    if (out_height != nullptr) *out_height = h;
+                    kind = TT_VIDEO_FRAME_DELTA;
+                }
+            }
+        }
+
+        lvgl_unlock();
+    }
+
+    if (kind == TT_VIDEO_FRAME_DELTA) {
+        g_grab_stats.delta_frames++;
+    } else if (kind == TT_VIDEO_FRAME_NONE) {
+        g_grab_stats.same_frames++;
+    }
+
+    xSemaphoreGive(g_grab_mutex);
+    return kind;
 }
 
 void tt_video_get_grab_stats(struct TtVideoGrabStats* out) {

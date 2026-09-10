@@ -105,6 +105,22 @@ error_t lvgl_display_add(struct Device* device, const struct LvglDisplayConfig* 
 bool lvgl_display_get_shadow_frame(lv_display_t* display, uint8_t** out_data, uint32_t* out_width, uint32_t* out_height, size_t* out_stride);
 
 /**
+ * @brief Takes the region of the screen that has changed since this was last called, and clears it.
+ *
+ * Together with lvgl_display_get_shadow_frame() this lets a consumer send only what moved: for a
+ * typical UI update the rectangle is tiny, while a full-screen change reports (approximately) the
+ * whole screen and the consumer can fall back to a full frame instead.
+ *
+ * @warning Caller must hold the LVGL lock (see lvgl_lock()).
+ *
+ * @param[in]  display  a display created by lvgl_display_add()
+ * @param[out] out_area receives the changed area (inclusive coordinates). May be null.
+ * @return true when something changed since the last call; false when nothing did, or when the
+ *         shadow frame doesn't exist yet (in which case send a full frame).
+ */
+bool lvgl_display_take_dirty_area(lv_display_t* display, lv_area_t* out_area);
+
+/**
  * @brief Removes a display previously created with lvgl_display_add(), freeing any buffers it owns.
  * @warning Caller must hold the LVGL lock.
  */
