@@ -21,18 +21,34 @@ constexpr auto* TAG = "BtManage";
 
 extern const ::AppManifest manifest;
 
+// The BT device's event queue only exists while the radio is on: the driver allocates its context
+// (and with it the subscription list) in start_device, and frees it on stop. An app opened with the
+// radio off therefore can't subscribe yet, so it retries at this cadence until the radio comes up.
+constexpr TickType_t EVENT_SUBSCRIBE_RETRY_TICKS = pdMS_TO_TICKS(250);
 
-static void onBtToggled(void* /*context*/, bool requestOn) {
+static void onBtToggled(void* context, bool requestOn) {
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
+    auto* ctx = static_cast<Context*>(context);
     Device* dev;
     if (device_get_first_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
         bool radio_on = bluetooth::isRadioOnOrPending(dev);
         if (requestOn && !radio_on) {
             LOG_I(TAG, "Turning on");
             bluetooth::start(dev);
+            // Show the transition immediately. The radio (and with it our BT event subscription)
+            // comes up asynchronously, so until then the view would redraw the switch from the
+            // still-"off" state and it would look like it flipped itself back off.
+            if (ctx != nullptr) {
+                ctx->state.setRadioState(bluetooth::RadioState::OnPending);
+                requestViewUpdate(ctx);
+            }
         } else if (!requestOn && radio_on) {
             LOG_I(TAG, "Turning off");
             bluetooth::stop(dev);
+            if (ctx != nullptr) {
+                ctx->state.setRadioState(bluetooth::RadioState::OffPending);
+                requestViewUpdate(ctx);
+            }
         }
         device_put(dev);
     } else {
@@ -197,7 +213,11 @@ int32_t appMain(int argc, char* argv[]) {
 
     bool shouldClose = false;
     while (!shouldClose) {
-        task_event_group_wait_any(&event_group, nullptr, portMAX_DELAY);
+        // While unsubscribed, wake on a timeout instead of blocking forever: the BT device only
+        // gains its event queue once the radio is enabled, so an app opened with the radio off has
+        // to keep retrying until then.
+        const TickType_t wait = (ctx.btDevice != nullptr) ? portMAX_DELAY : EVENT_SUBSCRIBE_RETRY_TICKS;
+        task_event_group_wait_any(&event_group, nullptr, wait);
 
         AppEvent event {};
         while (app_event_poll(&sub, &event) == ERROR_NONE) {
@@ -209,6 +229,34 @@ int32_t appMain(int argc, char* argv[]) {
                     break;
             }
             if (shouldClose) break;
+        }
+        if (shouldClose) break;
+
+        // The driver drops every subscription when the radio stops, so release ours and let the
+        // retry below re-subscribe on the next enable - otherwise the app would keep a dead
+        // subscription and never see events again.
+        const auto radio = bluetooth::getRadioState();
+        if (ctx.btDevice != nullptr && radio == bluetooth::RadioState::Off) {
+            bluetooth_event_unsubscribe(ctx.btDevice, &ctx.btEventSub);
+            ctx.btDevice = nullptr;
+        }
+
+        if (ctx.btDevice == nullptr && dev != nullptr) {
+            if (bluetooth_event_subscribe(dev, &ctx.btEventSub, &event_group) == ERROR_NONE) {
+                ctx.btDevice = dev;
+                LOG_I(TAG, "Subscribed to BT events (radio became available)");
+                // This transition's event fired before we could subscribe, so read the current
+                // values directly rather than wait for an event that will never arrive.
+                ctx.state.setScanning(bluetooth_is_scanning(dev));
+                ctx.state.updateScanResults();
+                ctx.state.updatePairedPeers();
+                // getRadioState() reports Off whenever no BT device is active, which is also true
+                // mid-enable, so don't let a transient Off overwrite the pending state.
+                if (radio != bluetooth::RadioState::Off) {
+                    ctx.state.setRadioState(radio);
+                }
+                requestViewUpdate(&ctx);
+            }
         }
 
         if (ctx.btDevice != nullptr) {
