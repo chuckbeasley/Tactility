@@ -75,7 +75,7 @@ std::string getTimeZoneName() {
             }
         }
     }
-    return "Europe/Amsterdam";
+    return "America/New_York";
 }
 
 bool hasTimeZone() {
@@ -105,7 +105,7 @@ std::string getTimeZoneCode() {
             }
         }
     }
-    return "CET-1CEST,M3.5.0,M10.5.0/3";  // Default: Europe/Amsterdam
+    return "EST5EDT,M3.2.0,M11.1.0";  // Default: America/New_York
 }
 
 bool isTimeFormat24Hour() {

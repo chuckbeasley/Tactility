@@ -229,7 +229,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_image_set_src(icon, LVGL_ICON_SHARED_SEARCH);
 
     auto* textarea = lv_textarea_create(search_wrapper);
-    lv_textarea_set_placeholder_text(textarea, "e.g. Europe/Amsterdam");
+    lv_textarea_set_placeholder_text(textarea, "e.g. America/New_York");
     lv_textarea_set_one_line(textarea, true);
     lv_obj_add_event_cb(textarea, onTextareaValueChanged, LV_EVENT_VALUE_CHANGED, ctx);
     ctx->filterTextareaWidget = textarea;
