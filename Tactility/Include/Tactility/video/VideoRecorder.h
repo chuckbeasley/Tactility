@@ -104,6 +104,10 @@ struct TtVideoGrabStats {
     uint32_t encode_ms;        /**< JPEG encode. */
     uint32_t encode_open_ms;   /**< Part of encode_ms spent setting the encoder up. Zero whenever a
                                     cached encoder was reused, which is the normal case. */
+    uint32_t encode_internal_b; /**< Internal RAM the encoder's working buffers took when it was
+                                     opened. Zero when a cached encoder was reused (nothing was
+                                     allocated), so read it together with encode_open_ms. */
+    uint32_t encode_psram_b;   /**< PSRAM the same open took. Both are 0 on a reused encoder. */
     uint32_t frames;           /**< Number of successful grabs since boot. */
     bool used_shadow_frame;    /**< true when the display's shadow frame was used instead of a snapshot. */
     uint32_t resolution_w;     /**< Display resolution at capture time. */
