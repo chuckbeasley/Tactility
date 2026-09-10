@@ -10,6 +10,7 @@
 #include <Tactility/service/webserver/RemoteInput.h>
 
 #include <Tactility/lvgl/Lvgl.h>
+#include <lvgl/devices/keyboard.h>
 #include <lvgl/lvgl.h>
 
 #include <freertos/FreeRTOS.h>
@@ -54,6 +55,18 @@ int16_t bound_x = 0;
 int16_t bound_y = 0;
 
 lv_indev_t* indev = nullptr;
+
+// Key presses use their own queue: a keypad indev reports one key per read, and the release of the
+// previous key has to be reported before the next press (see keyReadCallback).
+constexpr size_t KEY_QUEUE_CAPACITY = 16;
+
+uint32_t key_queue[KEY_QUEUE_CAPACITY];
+size_t key_head = 0;
+size_t key_count = 0;
+// Non-zero while a press has been reported but its matching release has not yet been.
+uint32_t pending_release_key = 0;
+
+lv_indev_t* key_indev = nullptr;
 
 uint32_t nowMs() {
     return static_cast<uint32_t>(xTaskGetTickCount()) * portTICK_PERIOD_MS;
@@ -109,6 +122,36 @@ void readCallback(lv_indev_t* /*indev*/, lv_indev_data_t* data) {
     data->continue_reading = remaining > 0;
 }
 
+void keyReadCallback(lv_indev_t* /*indev*/, lv_indev_data_t* data) {
+    uint32_t key = 0;
+    bool pressed = false;
+    size_t queued = 0;
+    bool more = false;
+
+    if (mutex != nullptr && xSemaphoreTake(mutex, portMAX_DELAY) == pdTRUE) {
+        if (pending_release_key != 0) {
+            // Second half of the previous key: the release must be reported before anything new,
+            // otherwise LVGL never sees a complete press/release pair and the key does nothing.
+            key = pending_release_key;
+            pending_release_key = 0;
+        } else if (key_count > 0) {
+            key = key_queue[key_head];
+            key_head = (key_head + 1) % KEY_QUEUE_CAPACITY;
+            key_count--;
+            pending_release_key = key;
+            pressed = true;
+        }
+        queued = key_count;
+        more = (pending_release_key != 0) || (queued > 0);
+        xSemaphoreGive(mutex);
+    }
+
+    data->key = key;
+    data->state = pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+    // Drain rather than one key per refresh period: a press and its release are two reads.
+    data->continue_reading = more;
+}
+
 } // namespace
 
 void remoteInputPush(RemoteInputType type, int32_t x, int32_t y) {
@@ -134,9 +177,30 @@ void remoteInputPush(RemoteInputType type, int32_t x, int32_t y) {
     xSemaphoreGive(mutex);
 }
 
-void remoteInputEnsureIndev() {
-    if (indev != nullptr) {
+void remoteInputPushKey(uint32_t key) {
+    if (mutex == nullptr) {
+        return; // Not registered yet: no WebSocket frame has arrived.
+    }
+    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) {
         return;
+    }
+
+    if (key_count == KEY_QUEUE_CAPACITY) {
+        // Typing faster than LVGL can drain: drop the oldest keystroke.
+        key_head = (key_head + 1) % KEY_QUEUE_CAPACITY;
+        key_count--;
+    }
+
+    const size_t tail = (key_head + key_count) % KEY_QUEUE_CAPACITY;
+    key_queue[tail] = key;
+    key_count++;
+
+    xSemaphoreGive(mutex);
+}
+
+void remoteInputEnsureIndev() {
+    if (indev != nullptr && key_indev != nullptr) {
+        return; // Both already registered.
     }
 
     if (mutex == nullptr) {
@@ -149,17 +213,17 @@ void remoteInputEnsureIndev() {
 
     // Every indev in this codebase is created under the LVGL lock.
     if (!lvgl_try_lock(pdMS_TO_TICKS(500))) {
-        LOG_W(TAG, "LVGL busy; the remote pointer indev will be registered on the next handshake");
+        LOG_W(TAG, "LVGL busy; the remote indevs will be registered on the next frame");
         return;
     }
 
-    if (indev == nullptr) {
-        lv_display_t* display = lv_display_get_default();
-        if (display != nullptr) {
-            bound_x = static_cast<int16_t>(lv_display_get_horizontal_resolution(display) - 1);
-            bound_y = static_cast<int16_t>(lv_display_get_vertical_resolution(display) - 1);
-        }
+    lv_display_t* display = lv_display_get_default();
+    if (display != nullptr && bound_x == 0) {
+        bound_x = static_cast<int16_t>(lv_display_get_horizontal_resolution(display) - 1);
+        bound_y = static_cast<int16_t>(lv_display_get_vertical_resolution(display) - 1);
+    }
 
+    if (indev == nullptr) {
         indev = lv_indev_create();
         if (indev != nullptr) {
             lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
@@ -168,6 +232,21 @@ void remoteInputEnsureIndev() {
             LOG_I(TAG, "Remote pointer indev registered (%dx%d)", bound_x + 1, bound_y + 1);
         } else {
             LOG_E(TAG, "Failed to create remote pointer indev");
+        }
+    }
+
+    if (key_indev == nullptr) {
+        key_indev = lv_indev_create();
+        if (key_indev != nullptr) {
+            lv_indev_set_type(key_indev, LV_INDEV_TYPE_KEYPAD);
+            lv_indev_set_read_cb(key_indev, keyReadCallback);
+            lv_indev_set_display(key_indev, display);
+            // Join the shared keyboard navigation group, so remote keys drive the focused widget
+            // (and the on-screen keyboard) exactly like a hardware keyboard would.
+            lvgl_hardware_keyboard_add_custom(key_indev);
+            LOG_I(TAG, "Remote keypad indev registered");
+        } else {
+            LOG_E(TAG, "Failed to create remote keypad indev");
         }
     }
 

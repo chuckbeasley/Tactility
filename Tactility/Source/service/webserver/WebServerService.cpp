@@ -1611,7 +1611,7 @@ esp_err_t WebServerService::handleApiVideoStop(httpd_req_t* request) {
 // registered without handle_ws_control_frames.
 //
 // The endpoint carries both directions: a client sends "f" and receives one JPEG back as a binary
-// frame (viewing), and sends pointer events that get injected into LVGL (interaction).
+// frame (viewing), and sends pointer/key events that get injected into LVGL (interaction).
 esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
     // Register the remote pointer indev here rather than only in the handshake branch below: this
     // httpd does not appear to invoke the handler for the upgrade request itself (only for received
@@ -1668,6 +1668,17 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
                 const RemoteInputType type = (payload[0] == 'p') ? RemoteInputType::Press
                     : ((payload[0] == 'm') ? RemoteInputType::Move : RemoteInputType::Release);
                 remoteInputPush(type, x, y);
+                return ESP_OK;
+            }
+        }
+
+        // Remote key events: "k<code>" carrying an LVGL key code - printable ASCII directly, and
+        // the LV_KEY_* values for the rest (8 backspace, 10 enter, 27 escape, 127 delete, and
+        // 17..20 for the arrow keys).
+        if (frame.len >= 2 && payload[0] == 'k') {
+            int code = 0;
+            if (std::sscanf(reinterpret_cast<const char*>(payload.data()) + 1, "%d", &code) == 1 && code > 0) {
+                remoteInputPushKey(static_cast<uint32_t>(code));
                 return ESP_OK;
             }
         }
