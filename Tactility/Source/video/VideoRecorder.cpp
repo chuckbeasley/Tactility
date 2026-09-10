@@ -38,10 +38,26 @@ size_t g_delta_capacity = 0;
 uint8_t* g_region_jpeg_buf = nullptr;
 size_t g_region_jpeg_capacity = 0;
 
-// How much of the screen a change may cover before it is compressed rather than sent raw: 1/8 of
-// the frame is about 38 KB raw at 480x320, versus a ~5 KB JPEG - past that point the encode is far
-// cheaper than the pixels.
-constexpr size_t DELTA_MAX_AREA_DIVISOR = 8;
+// How large a changed region may be before it is compressed rather than sent raw.
+//
+// This was 1/8 of the frame for a long time, which was a guess made before either cost had been
+// measured. Both are now, in milliseconds per 1000 changed pixels at 480x320:
+//
+//   raw RGB565     2 bytes per pixel on the wire. The mirror's own transport measures 368 KB/s
+//                  (derived by comparing two JPEG payload sizes over the WebSocket, so the fixed
+//                  round trip cancels), i.e. 2.72 ms per KB -> 5.31 ms per 1000 pixels.
+//   region JPEG    the encoder runs at 0.81 ms per 1000 pixels, and the JPEG is ~33 bytes per
+//                  1000 pixels -> 0.09 ms of transfer. So 0.90 ms per 1000 pixels, plus a fixed
+//                  3-10 ms whenever the region's geometry changes and the encoder is reopened.
+//
+// Raw therefore only wins while it is avoiding that fixed cost: the crossover is around 1100
+// pixels, about a 33x33 area. The old 1/8 threshold let raw run to 19200 pixels, where it cost
+// ~102 ms of transfer against ~22 ms for the same region as a JPEG - roughly 17x past the point
+// where compressing became the cheaper choice, on the most common size of update.
+//
+// The constant is in *scaled* pixels and so does not need adjusting per scale: both costs scale
+// with the number of scaled pixels, so the crossover moves with neither.
+constexpr size_t DELTA_MAX_RAW_PIXELS = 1100;
 
 bool ensureGrabMutex() {
     if (g_grab_mutex == nullptr) {
@@ -1361,8 +1377,9 @@ TtVideoFrameKind tt_video_grab_delta(int quality, int scale, const uint8_t** out
                     region_y = sy / grid;
 
                     // Small regions are cheaper raw: no encode at all, and the pixels cost less than
-                    // the framing a JPEG would add. Anything bigger is compressed.
-                    kind = (bytes * DELTA_MAX_AREA_DIVISOR <= frame_bytes)
+                    // the fixed cost of pointing the encoder at a new geometry. Anything bigger is
+                    // compressed - see DELTA_MAX_RAW_PIXELS for the measured crossover.
+                    kind = (static_cast<size_t>(region_w) * region_h <= DELTA_MAX_RAW_PIXELS)
                         ? TT_VIDEO_FRAME_DELTA
                         : TT_VIDEO_FRAME_DELTA_JPEG;
                 }
