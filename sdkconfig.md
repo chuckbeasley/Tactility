@@ -44,3 +44,13 @@ or:
 ```properties
 CONFIG_STACK_CHECK_ALL=y
 ```
+
+## Remote screen interaction (WebSocket)
+
+Required by the web server's `/ws/remote` endpoint, which the WebSocket-based
+remote screen viewer/controller connects to. Without it the httpd WebSocket API
+(`httpd_ws_recv_frame`/`httpd_ws_send_frame`) isn't compiled in.
+
+```properties
+CONFIG_HTTPD_WS_SUPPORT=y
+```

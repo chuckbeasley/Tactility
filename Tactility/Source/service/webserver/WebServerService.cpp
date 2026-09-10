@@ -507,6 +507,15 @@ bool WebServerService::startServer() {
             .handler   = handleApiPut,
             .user_ctx  = ctx
         },
+        // WebSocket for remote screen interaction. Registered before the "/*" catch-all below,
+        // which would otherwise claim this URI as a static asset.
+        {
+            .uri          = "/ws/remote",
+            .method       = HTTP_GET,
+            .handler      = handleRemoteWebSocket,
+            .user_ctx     = ctx,
+            .is_websocket = true
+        },
         {
             .uri       = "/*",  // Catch-all for dynamic assets
             .method    = HTTP_GET,
@@ -1591,6 +1600,55 @@ esp_err_t WebServerService::handleApiVideoStop(httpd_req_t* request) {
     httpd_resp_send_chunk(request, nullptr, 0);
     LOG_I(TAG, "[200] /api/video/stop %u frames (%u bytes)", frames, static_cast<unsigned>(avi.size()));
     return ESP_OK;
+}
+
+// GET /ws/remote - WebSocket endpoint for remote screen interaction.
+//
+// httpd calls this once for the upgrade request (method == HTTP_GET), then once per received data
+// frame. Control frames (ping/pong/close) are handled inside httpd because the handler is
+// registered without handle_ws_control_frames.
+//
+// Phase 1 is transport only: every frame is echoed straight back, so a client can prove the
+// bidirectional path works before the frame/input pipeline is built on top of it.
+esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
+    if (request->method == HTTP_GET) {
+        // The upgrade handshake is performed by httpd itself (is_websocket = true); there is
+        // nothing to send from here.
+        LOG_I(TAG, "GET /ws/remote (websocket handshake)");
+        return ESP_OK;
+    }
+
+    // Cap the payload we're willing to buffer: a control/hello message is tiny, and an unbounded
+    // frame would let a client exhaust heap.
+    constexpr size_t MAX_REMOTE_WS_FRAME = 4096;
+
+    // First call with len 0 only fills in the frame header (type + payload length).
+    httpd_ws_frame_t frame = {};
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    esp_err_t result = httpd_ws_recv_frame(request, &frame, 0);
+    if (result != ESP_OK) {
+        LOG_W(TAG, "/ws/remote: failed to read frame header");
+        return result;
+    }
+
+    if (frame.len > MAX_REMOTE_WS_FRAME) {
+        LOG_W(TAG, "/ws/remote: frame too large (%u bytes)", (unsigned)frame.len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // +1 so an empty frame still hands httpd a valid (non-null) buffer.
+    std::vector<uint8_t> payload(frame.len + 1);
+    frame.payload = payload.data();
+    result = httpd_ws_recv_frame(request, &frame, frame.len);
+    if (result != ESP_OK) {
+        LOG_W(TAG, "/ws/remote: failed to read frame payload");
+        return result;
+    }
+
+    LOG_I(TAG, "/ws/remote: received %u byte(s)", (unsigned)frame.len);
+
+    // Phase 1: echo the frame back on the same connection.
+    return httpd_ws_send_frame(request, &frame);
 }
 
 esp_err_t WebServerService::handleFsTree(httpd_req_t* request) {

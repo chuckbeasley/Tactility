@@ -82,6 +82,10 @@ private:
     // Dynamic asset serving
     static esp_err_t handleAssets(httpd_req_t* request);
 
+    // WebSocket endpoint for remote screen interaction (separate from the HTTP dispatch handlers
+    // above: httpd calls it for every frame once the upgrade handshake completes).
+    static esp_err_t handleRemoteWebSocket(httpd_req_t* request);
+
     bool startServer();
     void stopServer();
 
