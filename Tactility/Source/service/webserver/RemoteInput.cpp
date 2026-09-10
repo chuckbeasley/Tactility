@@ -68,6 +68,15 @@ uint32_t pending_release_key = 0;
 
 lv_indev_t* key_indev = nullptr;
 
+// On-device indicator: created with the indevs (under the LVGL lock) on the top layer, so it shows
+// over whatever screen or app is active. Shown/hidden from the read callback, which runs on the
+// LVGL task and can therefore touch widgets without taking the lock itself.
+constexpr uint32_t BADGE_TIMEOUT_MS = 3000;
+
+lv_obj_t* badge = nullptr;
+bool badge_visible = false;
+uint32_t last_remote_activity_ms = 0;
+
 uint32_t nowMs() {
     return static_cast<uint32_t>(xTaskGetTickCount()) * portTICK_PERIOD_MS;
 }
@@ -108,10 +117,25 @@ void readCallback(lv_indev_t* /*indev*/, lv_indev_data_t* data) {
             if (event.type == RemoteInputType::Press) pressed = true;
             else if (event.type == RemoteInputType::Release) pressed = false;
             last_event_ms = nowMs();
+            last_remote_activity_ms = last_event_ms;
         }
 
         remaining = queue_count;
         xSemaphoreGive(mutex);
+    }
+
+    // Keep the indicator up while remote input has been arriving, so whoever is holding the device
+    // can see that someone else is driving it.
+    if (badge != nullptr) {
+        const bool active = (nowMs() - last_remote_activity_ms) < BADGE_TIMEOUT_MS;
+        if (active != badge_visible) {
+            if (active) {
+                lv_obj_remove_flag(badge, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+            }
+            badge_visible = active;
+        }
     }
 
     data->point.x = current_x;
@@ -134,12 +158,14 @@ void keyReadCallback(lv_indev_t* /*indev*/, lv_indev_data_t* data) {
             // otherwise LVGL never sees a complete press/release pair and the key does nothing.
             key = pending_release_key;
             pending_release_key = 0;
+            last_remote_activity_ms = nowMs();
         } else if (key_count > 0) {
             key = key_queue[key_head];
             key_head = (key_head + 1) % KEY_QUEUE_CAPACITY;
             key_count--;
             pending_release_key = key;
             pressed = true;
+            last_remote_activity_ms = nowMs();
         }
         queued = key_count;
         more = (pending_release_key != 0) || (queued > 0);
@@ -247,6 +273,25 @@ void remoteInputEnsureIndev() {
             LOG_I(TAG, "Remote keypad indev registered");
         } else {
             LOG_E(TAG, "Failed to create remote keypad indev");
+        }
+    }
+
+    if (badge == nullptr) {
+        // Top layer, so it stays visible over every screen and app. Hidden until input arrives.
+        badge = lv_label_create(lv_layer_top());
+        if (badge != nullptr) {
+            lv_label_set_text(badge, LV_SYMBOL_EYE_OPEN " REMOTE INPUT");
+            lv_obj_set_style_bg_color(badge, lv_color_hex(0xB00020), LV_PART_MAIN);
+            lv_obj_set_style_bg_opa(badge, LV_OPA_90, LV_PART_MAIN);
+            lv_obj_set_style_text_color(badge, lv_color_white(), LV_PART_MAIN);
+            lv_obj_set_style_pad_all(badge, 4, LV_PART_MAIN);
+            lv_obj_set_style_radius(badge, 4, LV_PART_MAIN);
+            lv_obj_align(badge, LV_ALIGN_TOP_MID, 0, 24);
+            lv_obj_add_flag(badge, LV_OBJ_FLAG_HIDDEN);
+            badge_visible = false;
+            LOG_I(TAG, "On-device remote-input indicator created");
+        } else {
+            LOG_E(TAG, "Failed to create on-device remote-input indicator");
         }
     }
 

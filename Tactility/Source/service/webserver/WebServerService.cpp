@@ -218,6 +218,115 @@ static esp_err_t validateRequestAuth(httpd_req_t* request, bool& authPassed) {
     return ESP_OK;  // Auth successful
 }
 
+// ---- Remote screen interaction sessions ----------------------------------------------------------
+//
+// /ws/remote can't use validateRequestAuth(): httpd does not route the WebSocket upgrade request to
+// the handler (verified - the handler only ever sees received frames), so there is no Authorization
+// header to inspect, and WebSocket frames don't carry one either. The client therefore authenticates
+// with its first message, "a<base64(username:password)>", and the connection is remembered by socket
+// fd here.
+//
+// Only the httpd task runs the handler, so this table needs no lock.
+//
+// Remote interaction is refused outright while the web server has no authentication configured.
+// Watching someone's screen and driving it is far more sensitive than the read-only endpoints, so it
+// stays explicitly opt-in (enable "Require Authentication" in Settings > Web Server) rather than
+// being open to anyone who can reach the port.
+constexpr size_t REMOTE_SESSION_CAPACITY = 4;
+
+struct RemoteSession {
+    int fd = -1;
+    bool authenticated = false;
+};
+
+RemoteSession remoteSessions[REMOTE_SESSION_CAPACITY];
+// The authenticated connection currently allowed to inject input. A newer authentication takes
+// control over ("last authenticator wins"), and every other authenticated client is view-only.
+int remoteControllerFd = -1;
+
+RemoteSession* remoteFindSession(int fd) {
+    for (auto& session : remoteSessions) {
+        if (session.fd == fd) {
+            return &session;
+        }
+    }
+    return nullptr;
+}
+
+RemoteSession* remoteSessionForFd(int fd) {
+    if (RemoteSession* existing = remoteFindSession(fd); existing != nullptr) {
+        return existing;
+    }
+    for (auto& session : remoteSessions) {
+        if (session.fd == -1) {
+            session.fd = fd;
+            session.authenticated = false;
+            return &session;
+        }
+    }
+    return nullptr;  // Table full: further connections stay unauthenticated.
+}
+
+bool webServerAuthEnabled() {
+    auto lock = g_settingsMutex.asScopedLock();
+    lock.lock();
+    return g_cachedSettings.webServerAuthEnabled;
+}
+
+// Validate a decoded username:password pair against the configured web server credentials.
+bool validateCredentials(const std::string& username, const std::string& password) {
+    settings::webserver::WebServerSettings settings;
+    {
+        auto lock = g_settingsMutex.asScopedLock();
+        lock.lock();
+        settings = g_cachedSettings;
+    }
+    return secureCompare(username, settings.webServerUsername) &&
+        secureCompare(password, settings.webServerPassword);
+}
+
+// Decodes the "a<base64(username:password)>" payload. Returns false when it is malformed.
+bool decodeRemoteCredentials(const uint8_t* payload, size_t len, std::string& username, std::string& password) {
+    if (len < 2) {
+        return false;
+    }
+    const std::string base64(reinterpret_cast<const char*>(payload + 1), len - 1);
+
+    size_t decoded_len = 0;
+    mbedtls_base64_decode(nullptr, 0, &decoded_len,
+                          reinterpret_cast<const unsigned char*>(base64.c_str()),
+                          base64.length());
+    if (decoded_len == 0) {
+        return false;
+    }
+
+    std::string decoded(decoded_len, '\0');
+    size_t actual_len = 0;
+    if (mbedtls_base64_decode(reinterpret_cast<unsigned char*>(decoded.data()), decoded_len, &actual_len,
+                              reinterpret_cast<const unsigned char*>(base64.c_str()),
+                              base64.length()) != 0) {
+        return false;
+    }
+    decoded.resize(actual_len);
+
+    const size_t colon = decoded.find(':');
+    if (colon == std::string::npos) {
+        return false;
+    }
+    username = decoded.substr(0, colon);
+    password = decoded.substr(colon + 1);
+    return true;
+}
+
+// Sends a short text reply on the WebSocket.
+esp_err_t remoteReplyText(httpd_req_t* request, const char* text) {
+    httpd_ws_frame_t reply = {};
+    reply.type = HTTPD_WS_TYPE_TEXT;
+    reply.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(text));
+    reply.len = std::strlen(text);
+    return httpd_ws_send_frame(request, &reply);
+}
+
 bool WebServerService::onStart(ServiceContext& service) {
     LOG_I(TAG, "Starting WebServer service...");
 
@@ -1655,6 +1764,42 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
 
     LOG_I(TAG, "/ws/remote: received %u byte(s)", (unsigned)frame.len);
 
+    const int fd = httpd_req_to_sockfd(request);
+    RemoteSession* session = remoteSessionForFd(fd);
+
+    // The upgrade request never reaches this handler (see the session notes above), so the first
+    // message is what authenticates: "a<base64(username:password)>".
+    if (frame.type == HTTPD_WS_TYPE_TEXT && frame.len >= 1 && payload[0] == 'a') {
+        if (!webServerAuthEnabled()) {
+            LOG_W(TAG, "/ws/remote: refusing interaction - web server authentication is disabled");
+            return remoteReplyText(request, "disabled");
+        }
+
+        std::string username;
+        std::string password;
+        if (session != nullptr &&
+            decodeRemoteCredentials(payload.data(), frame.len, username, password) &&
+            validateCredentials(username, password)) {
+            session->authenticated = true;
+            remoteControllerFd = fd;  // Newest authenticated client takes control.
+            LOG_I(TAG, "/ws/remote: client authenticated and now controls the device");
+            return remoteReplyText(request, "ok");
+        }
+
+        LOG_W(TAG, "/ws/remote: authentication failed");
+        return remoteReplyText(request, "auth");
+    }
+
+    // Everything else needs an authenticated session. Answering "auth" (rather than dropping the
+    // frame) lets a client tell "not authenticated" apart from "no reply at all".
+    if (session == nullptr || !session->authenticated) {
+        return remoteReplyText(request, "auth");
+    }
+
+    // Pointers and keys are only honoured from the controlling client; other authenticated clients
+    // stay view-only. Their input is dropped silently - it is not an error.
+    const bool isController = (fd == remoteControllerFd);
+
     // Text commands. "f" asks for one screen frame: the client requests the next only after it has
     // displayed the previous one, so pacing (and back-pressure) live on the client side. "ping" is
     // a liveness check. Anything else falls through to the echo below.
@@ -1662,6 +1807,9 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
         // Remote pointer events: "<kind><x>,<y>" - "p12,34" press, "m13,35" move, "r13,35" release.
         // Fire-and-forget: the client sees the effect in the next frame it asks for.
         if (frame.len >= 3 && (payload[0] == 'p' || payload[0] == 'm' || payload[0] == 'r')) {
+            if (!isController) {
+                return ESP_OK;
+            }
             int x = 0;
             int y = 0;
             if (std::sscanf(reinterpret_cast<const char*>(payload.data()) + 1, "%d,%d", &x, &y) == 2) {
@@ -1676,6 +1824,9 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
         // the LV_KEY_* values for the rest (8 backspace, 10 enter, 27 escape, 127 delete, and
         // 17..20 for the arrow keys).
         if (frame.len >= 2 && payload[0] == 'k') {
+            if (!isController) {
+                return ESP_OK;
+            }
             int code = 0;
             if (std::sscanf(reinterpret_cast<const char*>(payload.data()) + 1, "%d", &code) == 1 && code > 0) {
                 remoteInputPushKey(static_cast<uint32_t>(code));
@@ -1691,12 +1842,7 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
             if (!tt_video_grab_jpeg(&jpeg, &jpeg_size, &width, &height)) {
                 // Capture failed (commonly: the LVGL lock was busy). Answer so the client can retry
                 // instead of blocking forever waiting for a frame that isn't coming.
-                static const char busy[] = "err";
-                httpd_ws_frame_t reply = {};
-                reply.type = HTTPD_WS_TYPE_TEXT;
-                reply.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(busy));
-                reply.len = sizeof(busy) - 1;
-                return httpd_ws_send_frame(request, &reply);
+                return remoteReplyText(request, "err");
             }
 
             httpd_ws_frame_t reply = {};
@@ -1711,12 +1857,7 @@ esp_err_t WebServerService::handleRemoteWebSocket(httpd_req_t* request) {
         }
 
         if (frame.len == 4 && std::memcmp(payload.data(), "ping", 4) == 0) {
-            static const char pong[] = "pong";
-            httpd_ws_frame_t reply = {};
-            reply.type = HTTPD_WS_TYPE_TEXT;
-            reply.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(pong));
-            reply.len = sizeof(pong) - 1;
-            return httpd_ws_send_frame(request, &reply);
+            return remoteReplyText(request, "pong");
         }
     }
 
