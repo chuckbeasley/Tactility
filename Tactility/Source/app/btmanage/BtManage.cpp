@@ -26,6 +26,13 @@ extern const ::AppManifest manifest;
 // radio off therefore can't subscribe yet, so it retries at this cadence until the radio comes up.
 constexpr TickType_t EVENT_SUBSCRIBE_RETRY_TICKS = pdMS_TO_TICKS(250);
 
+// How often the state is re-read and the view rebuilt while events are arriving. A scan delivers a
+// burst of BT_EVENT_PEER_FOUND events, and each one used to trigger a full peer-list copy plus an
+// LVGL lock - enough work to keep this task runnable continuously and starve the idle task, which is
+// what tripped the task watchdog when Scan was pressed. Ten refreshes a second is imperceptible in
+// the list and leaves the CPU to everything else.
+constexpr TickType_t VIEW_REFRESH_INTERVAL_TICKS = pdMS_TO_TICKS(100);
+
 static void onBtToggled(void* context, bool requestOn) {
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
     auto* ctx = static_cast<Context*>(context);
@@ -108,30 +115,37 @@ void requestViewUpdate(Context* ctx) {
 
 void onBtEvent(Context* ctx, const BtEvent& event) {
     auto radio_state = bluetooth::getRadioState();
-    LOG_I(TAG, "Update with state %s", bluetooth::radioStateToString(radio_state));
     ctx->state.setRadioState(radio_state);
+
+    // Deliberately cheap. The expensive parts - reading the scan results (a deep copy of every
+    // record) and rendering - are left to the app loop, which does them at most once per
+    // VIEW_REFRESH_INTERVAL_TICKS. Doing them here meant once per event, and a scan delivers a burst
+    // of events: the task then never blocked, the idle task never ran, and the task watchdog fired.
+    //
+    // The per-event LOG_I that used to be here is gone for the same reason: at 115200 baud each line
+    // blocks this task for ~4 ms, which under a peer storm is far more than the work it describes.
     switch (event.type) {
         case BT_EVENT_SCAN_STARTED:
             ctx->state.setScanning(true);
             break;
         case BT_EVENT_SCAN_FINISHED:
             ctx->state.setScanning(false);
-            ctx->state.updateScanResults();
-            ctx->state.updatePairedPeers();
+            ctx->scan_results_dirty = true;
+            ctx->paired_peers_dirty = true;
             break;
         case BT_EVENT_PEER_FOUND:
-            ctx->state.updateScanResults();
+            ctx->scan_results_dirty = true;
             break;
         case BT_EVENT_PAIR_RESULT:
-            ctx->state.updatePairedPeers();
+            ctx->paired_peers_dirty = true;
             break;
         case BT_EVENT_PROFILE_STATE_CHANGED:
-            ctx->state.updateScanResults();
-            ctx->state.updatePairedPeers();
+            ctx->scan_results_dirty = true;
+            ctx->paired_peers_dirty = true;
             break;
         case BT_EVENT_RADIO_STATE_CHANGED:
             if (event.radio_state == BT_RADIO_STATE_ON) {
-                ctx->state.updatePairedPeers();
+                ctx->paired_peers_dirty = true;
                 Device* dev = nullptr;
                 if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE && !bluetooth_is_scanning(dev)) {
                     bluetooth_scan_start(dev);
@@ -144,8 +158,6 @@ void onBtEvent(Context* ctx, const BtEvent& event) {
         default:
             break;
     }
-
-    requestViewUpdate(ctx);
 }
 
 void onBackPressed(lv_event_t* event) {
@@ -212,11 +224,15 @@ int32_t appMain(int argc, char* argv[]) {
     }
 
     bool shouldClose = false;
+    TickType_t last_refresh_ticks = 0;
     while (!shouldClose) {
         // While unsubscribed, wake on a timeout instead of blocking forever: the BT device only
         // gains its event queue once the radio is enabled, so an app opened with the radio off has
         // to keep retrying until then.
-        const TickType_t wait = (ctx.btDevice != nullptr) ? portMAX_DELAY : EVENT_SUBSCRIBE_RETRY_TICKS;
+        //
+        // Bounded even once subscribed, so that a refresh left pending by the last event in a burst
+        // still happens after the events stop, rather than waiting for an event that never comes.
+        const TickType_t wait = (ctx.btDevice != nullptr) ? VIEW_REFRESH_INTERVAL_TICKS : EVENT_SUBSCRIBE_RETRY_TICKS;
         task_event_group_wait_any(&event_group, nullptr, wait);
 
         AppEvent event {};
@@ -265,6 +281,26 @@ int32_t appMain(int argc, char* argv[]) {
                 onBtEvent(&ctx, bt_event);
             }
         }
+
+        // The coalesced half of the event handling: whatever the events marked dirty is read once
+        // here and rendered once, however many events arrived in between. This is also the only
+        // place the view is rebuilt for BT events, so a burst of peer-found events costs one rebuild
+        // per interval rather than one per peer.
+        if (ctx.scan_results_dirty || ctx.paired_peers_dirty) {
+            const TickType_t now = xTaskGetTickCount();
+            if ((TickType_t)(now - last_refresh_ticks) >= VIEW_REFRESH_INTERVAL_TICKS) {
+                if (ctx.scan_results_dirty) {
+                    ctx.state.updateScanResults();
+                    ctx.scan_results_dirty = false;
+                }
+                if (ctx.paired_peers_dirty) {
+                    ctx.state.updatePairedPeers();
+                    ctx.paired_peers_dirty = false;
+                }
+                last_refresh_ticks = now;
+                requestViewUpdate(&ctx);
+            }
+        }
     }
 
     if (ctx.btDevice) {
@@ -294,11 +330,18 @@ extern const ::AppManifest manifest = {
     .name = "Bluetooth",
     .category = APP_CATEGORY_SETTINGS,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
-    // The peer-list rebuild does heavy LVGL work (creating/cleaning dozens of widgets, forcing
-    // layout, and the resulting object-tree redraw recursion) on this app's own task. The default
-    // 8 KB stack overflows under that redraw recursion (Stack protection fault), so give this
-    // app more headroom.
-    .stack = { .depth = 4096 }, // 16 KB
+    // The peer-list rebuild does heavy LVGL work on this app's own task: it cleans and recreates
+    // every row. Destroying a row that is in the keypad group makes LVGL refocus the next object,
+    // which fires its event handler, which forces a full layout pass - and that pass recurses
+    // through the flex tree, sending GET_SELF_SIZE events to children as it goes. With a list full
+    // of scan results that recursion is deep enough to overflow an 8 KB stack, and 16 KB as well
+    // (both produced a Stack protection fault when Scan was pressed). 32 KB is the size that was
+    // measured to survive it.
+    //
+    // This is a mitigation rather than a cure: the churn of destroying and recreating every row is
+    // what makes the recursion deep in the first place, and rebuilding only the rows that actually
+    // changed would address the cause. APP_STACK_SIZE_MAX is 64 KB, so there is headroom left.
+    .stack = { .depth = 8192 }, // 32 KB
 };
 
 } // namespace tt::app::btmanage
