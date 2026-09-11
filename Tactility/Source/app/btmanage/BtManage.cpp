@@ -263,7 +263,20 @@ int32_t appMain(int argc, char* argv[]) {
             ctx.btDevice = nullptr;
         }
 
-        if (ctx.btDevice == nullptr && dev != nullptr) {
+        // Only (re)subscribe once the radio is actually up.
+        //
+        // This used to retry unconditionally while unsubscribed, on the assumption that subscribing
+        // with the radio off would fail and the retry would simply wait for it to come up. It does
+        // not fail - the driver accepts the subscription - so with the rule above dropping the
+        // subscription because the radio is off, the two together oscillated: subscribe, see Off,
+        // unsubscribe, subscribe again, ~100 times a second. That saturated this task with logging
+        // (starving the idle task into a watchdog trip) and left the UI unable to respond, which is
+        // why turning Bluetooth back on appeared to do nothing at all.
+        //
+        // Gating on the radio state loses nothing: this loop already polls the radio by calling
+        // getRadioState() every pass, so it notices the radio coming up by itself, which is the
+        // whole reason the retry exists.
+        if (ctx.btDevice == nullptr && dev != nullptr && radio != bluetooth::RadioState::Off) {
             if (bluetooth_event_subscribe(dev, &ctx.btEventSub, &event_group) == ERROR_NONE) {
                 ctx.btDevice = dev;
                 LOG_I(TAG, "Subscribed to BT events (radio became available)");
