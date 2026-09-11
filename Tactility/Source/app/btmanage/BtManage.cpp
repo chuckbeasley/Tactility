@@ -290,6 +290,15 @@ int32_t appMain(int argc, char* argv[]) {
                 ctx.paired_peers_dirty = true;
                 ctx.view_dirty = true;
                 ctx.state.setScanning(bluetooth_is_scanning(dev));
+                // The radio turning on is what starts a scan, via BT_EVENT_RADIO_STATE_CHANGED -
+                // but that event fires while we are still unsubscribed, so on a re-enable we miss
+                // the only trigger there is and scanning stays stopped. The list then shows
+                // whatever the previous scan happened to leave in the cache, which is why not every
+                // available device appeared. Do what the missed event would have done.
+                if (radio != bluetooth::RadioState::Off && !bluetooth_is_scanning(dev)) {
+                    LOG_I(TAG, "Starting scan after re-subscribing");
+                    bluetooth_scan_start(dev);
+                }
                 // getRadioState() reports Off whenever no BT device is active, which is also true
                 // mid-enable, so don't let a transient Off overwrite the pending state.
                 if (radio != bluetooth::RadioState::Off) {
@@ -354,18 +363,13 @@ extern const ::AppManifest manifest = {
     .name = "Bluetooth",
     .category = APP_CATEGORY_SETTINGS,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
-    // The peer-list rebuild does heavy LVGL work on this app's own task: it cleans and recreates
-    // every row. Destroying a row that is in the keypad group makes LVGL refocus the next object,
-    // which fires its event handler, which forces a full layout pass - and that pass recurses
-    // through the flex tree, sending GET_SELF_SIZE events to children as it goes. With a list full
-    // of scan results that recursion is deep enough to overflow an 8 KB stack, and 16 KB as well
-    // (both produced a Stack protection fault when Scan was pressed). 32 KB is the size that was
-    // measured to survive it.
-    //
-    // This is a mitigation rather than a cure: the churn of destroying and recreating every row is
-    // what makes the recursion deep in the first place, and rebuilding only the rows that actually
-    // changed would address the cause. APP_STACK_SIZE_MAX is 64 KB, so there is headroom left.
-    .stack = { .depth = 8192 }, // 32 KB
+    // Deliberately back to 16 KB rather than the 32 KB tried to survive the list-rebuild stack
+    // fault: that did not fix the fault (it still faulted with 32 KB) and the extra 16 KB of
+    // internal RAM starved the Bluetooth driver, which allocates a node per discovered peer and
+    // was logging "malloc addr node failed" - i.e. it could no longer record every device it found.
+    // The depth is instead kept down by the coalesced refresh, which rebuilds the list at most once
+    // per interval instead of once per event.
+    .stack = { .depth = 4096 }, // 16 KB
 };
 
 } // namespace tt::app::btmanage
