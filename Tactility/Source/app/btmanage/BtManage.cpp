@@ -127,23 +127,29 @@ void onBtEvent(Context* ctx, const BtEvent& event) {
     switch (event.type) {
         case BT_EVENT_SCAN_STARTED:
             ctx->state.setScanning(true);
+            ctx->view_dirty = true;
             break;
         case BT_EVENT_SCAN_FINISHED:
             ctx->state.setScanning(false);
             ctx->scan_results_dirty = true;
             ctx->paired_peers_dirty = true;
+            ctx->view_dirty = true;
             break;
         case BT_EVENT_PEER_FOUND:
             ctx->scan_results_dirty = true;
+            ctx->view_dirty = true;
             break;
         case BT_EVENT_PAIR_RESULT:
             ctx->paired_peers_dirty = true;
+            ctx->view_dirty = true;
             break;
         case BT_EVENT_PROFILE_STATE_CHANGED:
             ctx->scan_results_dirty = true;
             ctx->paired_peers_dirty = true;
+            ctx->view_dirty = true;
             break;
         case BT_EVENT_RADIO_STATE_CHANGED:
+            ctx->view_dirty = true;
             if (event.radio_state == BT_RADIO_STATE_ON) {
                 ctx->paired_peers_dirty = true;
                 Device* dev = nullptr;
@@ -262,16 +268,20 @@ int32_t appMain(int argc, char* argv[]) {
                 ctx.btDevice = dev;
                 LOG_I(TAG, "Subscribed to BT events (radio became available)");
                 // This transition's event fired before we could subscribe, so read the current
-                // values directly rather than wait for an event that will never arrive.
+                // values directly rather than wait for an event that will never arrive - but only
+                // mark them, exactly as the event path does. Doing the reads and the render here
+                // instead was the crash on re-enabling the radio: this is the path the radio comes
+                // back through, and it rebuilt the whole peer list (see the stack note on the
+                // manifest) in the middle of the loop.
+                ctx.scan_results_dirty = true;
+                ctx.paired_peers_dirty = true;
+                ctx.view_dirty = true;
                 ctx.state.setScanning(bluetooth_is_scanning(dev));
-                ctx.state.updateScanResults();
-                ctx.state.updatePairedPeers();
                 // getRadioState() reports Off whenever no BT device is active, which is also true
                 // mid-enable, so don't let a transient Off overwrite the pending state.
                 if (radio != bluetooth::RadioState::Off) {
                     ctx.state.setRadioState(radio);
                 }
-                requestViewUpdate(&ctx);
             }
         }
 
@@ -283,10 +293,10 @@ int32_t appMain(int argc, char* argv[]) {
         }
 
         // The coalesced half of the event handling: whatever the events marked dirty is read once
-        // here and rendered once, however many events arrived in between. This is also the only
-        // place the view is rebuilt for BT events, so a burst of peer-found events costs one rebuild
-        // per interval rather than one per peer.
-        if (ctx.scan_results_dirty || ctx.paired_peers_dirty) {
+        // here and rendered once, however many events arrived in between. This is the only place
+        // either happens for BT events or for the re-subscribe path, so neither a burst of
+        // peer-found events nor the radio coming back can rebuild the list mid-loop.
+        if (ctx.view_dirty) {
             const TickType_t now = xTaskGetTickCount();
             if ((TickType_t)(now - last_refresh_ticks) >= VIEW_REFRESH_INTERVAL_TICKS) {
                 if (ctx.scan_results_dirty) {
@@ -297,6 +307,7 @@ int32_t appMain(int argc, char* argv[]) {
                     ctx.state.updatePairedPeers();
                     ctx.paired_peers_dirty = false;
                 }
+                ctx.view_dirty = false;
                 last_refresh_ticks = now;
                 requestViewUpdate(&ctx);
             }

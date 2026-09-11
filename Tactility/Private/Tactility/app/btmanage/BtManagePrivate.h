@@ -25,6 +25,11 @@ struct Context {
     // Only the app task touches these, so they need no synchronisation.
     bool scan_results_dirty = false;
     bool paired_peers_dirty = false;
+    // Set by any event that changes something visible - including the ones that only touch
+    // `scanning` or the radio state, which have no data to re-read but still need the view
+    // redrawn. Without this, pressing "Stop scan" left the button reading "Stop scan" because
+    // nothing asked for a redraw.
+    bool view_dirty = false;
 
     void lock() { mutex.lock(); }
     void unlock() { mutex.unlock(); }
