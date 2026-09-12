@@ -97,6 +97,12 @@ struct LvglDisplayCtx {
     // the next one corrects is a far better trade than a mirror that waits for the UI to stop
     // rendering (measured: up to 754 ms waiting for the LVGL lock while the screen was busy).
     std::atomic<uint32_t> shadow_seq {0};
+    // When a consumer last asked for the shadow frame's sequence. Maintaining the shadow costs a
+    // copy of every flushed region, made on the LVGL task, on every refresh - and with no mirror
+    // client connected that work is paid for nothing while the UI is trying to keep up. The copy is
+    // therefore skipped unless a consumer has asked recently. See lvgl_display_shadow_sequence(),
+    // which every consumer calls before reading the frame.
+    std::atomic<int64_t> shadow_consumer_us {0};
     // Guards the dirty rectangle and the completeness flag below, which must not lose an update.
     // Held for a handful of instructions, never across a pixel copy.
     //
@@ -314,7 +320,18 @@ static void* lvgl_display_try_ppa_rotate(struct LvglDisplayCtx* ctx, const uint8
 // Copies a freshly rendered region into the shadow frame (see LvglDisplayCtx::shadow_frame).
 // Called from the flush callback, so it runs on the LVGL task with the LVGL lock held, and works in
 // logical screen coordinates - before the rotation/byte-swap handling below rewrites them.
+// A consumer counts as present for this long after its last request. Long enough to bridge the gap
+// between mirror frames (a session's low-latency window is 4 s), short enough that an idle device
+// stops paying for the shadow entirely.
+constexpr int64_t SHADOW_CONSUMER_TIMEOUT_US = 10'000'000;
+
 static void lvgl_display_shadow_update(struct LvglDisplayCtx* ctx, lv_display_t* disp, const lv_area_t* area, const uint8_t* color_map) {
+    // Nobody is reading the shadow frame, so do not pay to maintain it. Maintaining it means copying
+    // every flushed region into PSRAM from the LVGL task; with no consumer that is pure cost, and it
+    // is the one piece of extra work this module adds to every refresh.
+    if (lvgl_now_us() - ctx->shadow_consumer_us.load(std::memory_order_acquire) > SHADOW_CONSUMER_TIMEOUT_US) {
+        return;
+    }
     if (lv_display_get_color_format(disp) != LV_COLOR_FORMAT_RGB565) {
         return; // Only RGB565 has a layout that can be copied straight through.
     }
@@ -709,6 +726,9 @@ uint32_t lvgl_display_shadow_sequence(lv_display_t* display) {
         return 0;
     }
     struct LvglDisplayCtx* ctx = (struct LvglDisplayCtx*)wrapper->context;
+    // Every consumer reads the sequence before copying the shadow frame, so this doubles as "a
+    // consumer exists right now" and keeps the shadow being maintained.
+    ctx->shadow_consumer_us.store(lvgl_now_us(), std::memory_order_release);
     return ctx->shadow_seq.load(std::memory_order_acquire);
 }
 
