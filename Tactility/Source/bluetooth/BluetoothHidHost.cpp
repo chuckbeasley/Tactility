@@ -711,7 +711,35 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
         });
 
         auto peer_addr = ctx.peerAddr;
-        getMainDispatcher().dispatch([peer_addr] {
+
+        // Save under the peer's *identity* address, not the one we connected to.
+        //
+        // The address this path holds came from the scan - for a device using a private address,
+        // whatever it happened to be advertising with at the time - while the pair-result path in
+        // Bluetooth.cpp keys its entry on desc.peer_id_addr. Two keys for one device meant two
+        // settings files, both with autoConnect=true: the app lists the device twice, and each
+        // duplicate occupies one of only three bond slots.
+        //
+        // Resolved here, in the callback, rather than inside the dispatch below: ble_gap_conn_find()
+        // belongs to the NimBLE host task, which is where this code is running.
+        std::array<uint8_t, 6> identity_addr = peer_addr;
+        {
+            struct ble_gap_conn_desc conn_desc = {};
+            if (ctx.connHandle != BLE_HS_CONN_HANDLE_NONE &&
+                ble_gap_conn_find(ctx.connHandle, &conn_desc) == 0) {
+                // An unbonded peer reports BLE_ADDR_ANY here; using that would file the device under
+                // an all-zero address, which is worse than the duplicate this is fixing.
+                bool usable = false;
+                for (uint8_t byte : conn_desc.peer_id_addr.val) {
+                    if (byte != 0) { usable = true; break; }
+                }
+                if (usable) {
+                    std::memcpy(identity_addr.data(), conn_desc.peer_id_addr.val, 6);
+                }
+            }
+        }
+
+        getMainDispatcher().dispatch([peer_addr, identity_addr] {
             // Find name from cached scan results
             std::string name;
             {
@@ -721,16 +749,26 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
                 }
             }
             settings::PairedDevice device;
-            device.addr        = peer_addr;
+            device.addr        = identity_addr;
             device.profileId   = BT_PROFILE_HID_HOST;
             device.autoConnect = true;
-            const auto addr_hex = settings::addrToHex(peer_addr);
+            const auto addr_hex = settings::addrToHex(identity_addr);
             settings::PairedDevice existing;
             if (settings::load(addr_hex, existing)) {
                 device.autoConnect = existing.autoConnect;
             }
             device.name = name;
             settings::save(device);
+
+            // The connect address may already have produced its own file for this same device. Now
+            // that the identity key exists, drop that one, so duplicates disappear as devices
+            // reconnect instead of needing to be cleaned up by hand.
+            const auto connect_hex = settings::addrToHex(peer_addr);
+            if (connect_hex != addr_hex && settings::hasFileForDevice(connect_hex) &&
+                settings::remove(connect_hex)) {
+                LOG_I(TAG, "Removed duplicate entry %s (same device as %s)",
+                    connect_hex.c_str(), addr_hex.c_str());
+            }
             Device* dev;
             if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
                 BtEvent e = {};
@@ -1183,15 +1221,35 @@ void autoConnectHidHost() {
 
     // Connect to the first saved HID host peer that appeared in the last scan.
     // cacheScanAddr() is populated during scanning so addr_type is available for ble_gap_connect.
+    //
+    // Matched by identity address first, then by name. The identity address is what the save path
+    // keys on (see the note there), and it is not necessarily what a scan reports - for a device
+    // whose advertised address is not its identity, an address-only lookup would miss a peer sitting
+    // right there in the results, which is the case that produced the duplicate entries.
     auto scan = getScanResults();
+    auto saved = settings::loadAll();
+
     for (const auto& r : scan) {
-        settings::PairedDevice stored;
-        if (settings::load(settings::addrToHex(r.addr), stored) &&
-            stored.autoConnect &&
-            stored.profileId == BT_PROFILE_HID_HOST) {
-            LOG_I(TAG, "Auto-connecting HID host to %s", settings::addrToHex(r.addr).c_str());
-            hidHostConnect(r.addr);
-            return;
+        for (const auto& peer : saved) {
+            if (!peer.autoConnect || peer.profileId != BT_PROFILE_HID_HOST) continue;
+            if (peer.addr == r.addr) {
+                LOG_I(TAG, "Auto-connecting HID host to %s", settings::addrToHex(r.addr).c_str());
+                hidHostConnect(r.addr);
+                return;
+            }
+        }
+    }
+
+    for (const auto& r : scan) {
+        if (r.name.empty()) continue;
+        for (const auto& peer : saved) {
+            if (!peer.autoConnect || peer.profileId != BT_PROFILE_HID_HOST) continue;
+            if (peer.name == r.name) {
+                LOG_I(TAG, "Auto-connecting HID host to %s (matched by name, saved address %s)",
+                    settings::addrToHex(r.addr).c_str(), settings::addrToHex(peer.addr).c_str());
+                hidHostConnect(r.addr);
+                return;
+            }
         }
     }
 
