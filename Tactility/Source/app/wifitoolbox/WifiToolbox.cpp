@@ -866,6 +866,25 @@ static void onCaptureChannelChanged(lv_event_t* event) {
     }
 }
 
+// Takes the deauth target from the current association. Returns false when there is no connection
+// to take it from - a deauth with nothing to aim at would transmit nothing, so the caller refuses
+// rather than accepting a switch that cannot work.
+static bool resolveDeauthTargetFromConnection(Context* ctx) {
+    if (ctx->wifi == nullptr) {
+        ctx->wifi = getWifiDevice();
+    }
+    if (ctx->wifi == nullptr) {
+        return false;
+    }
+    uint8_t bssid[6] = {};
+    if (wifi_station_get_bssid(ctx->wifi, bssid) != ERROR_NONE) {
+        return false;
+    }
+    std::memcpy(ctx->targetBssid, bssid, 6);
+    ctx->targetBssidKnown = true;
+    return true;
+}
+
 static void onCaptureDeauthToggled(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
     auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(event));
@@ -874,6 +893,12 @@ static void onCaptureDeauthToggled(lv_event_t* event) {
     // injections would follow the hop and miss the target. The switch is put back rather than
     // accepted, so the UI never claims a deauth that cannot transmit.
     if (ctx->autoDeauth && ctx->lockChannel == 0) {
+        ctx->autoDeauth = false;
+        lv_obj_remove_state(sw, LV_STATE_CHECKED);
+    }
+    // Same reasoning for the target: without an association there is no AP to deauth against.
+    if (ctx->autoDeauth && !resolveDeauthTargetFromConnection(ctx)) {
+        LOG_W(TAG, "Deauth has no connected AP to target; refusing to enable");
         ctx->autoDeauth = false;
         lv_obj_remove_state(sw, LV_STATE_CHECKED);
     }
@@ -922,12 +947,14 @@ static void showCaptureScreen(Context* ctx) {
     lv_obj_add_event_cb(deauthSwitch, onCaptureDeauthToggled, LV_EVENT_VALUE_CHANGED, ctx);
     ctx->deauthSwitch = deauthSwitch;
 
-    auto* deauthBssid = lv_textarea_create(ctx->body);
-    lv_textarea_set_placeholder_text(deauthBssid, "Deauth AP BSSID (required), e.g. 34:3e:a4:7e:90:45");
-    lv_textarea_set_one_line(deauthBssid, true);
-    lv_textarea_set_accepted_chars(deauthBssid, "0123456789abcdefABCDEF:");
-    lv_obj_set_width(deauthBssid, LV_PCT(100));
-    lv_obj_add_event_cb(deauthBssid, onInjectBssidChanged, LV_EVENT_VALUE_CHANGED, ctx);
+    // No BSSID field. The deauth target is the access point this device is connected to, read from
+    // the connection when the switch is enabled. The association is authoritative and cannot drift
+    // while it holds, whereas an address learned from received frames is only whichever cell was
+    // heard most recently - which, on a channel shared with other networks, is not necessarily the
+    // one being attacked. Only the client MAC is supplied by hand.
+    auto* deauthTargetLabel = lv_label_create(ctx->body);
+    lv_label_set_text(deauthTargetLabel, "Targets the AP this device is connected to");
+    lv_obj_set_style_text_opa(deauthTargetLabel, LV_OPA_70, LV_STATE_DEFAULT);
 
     auto* deauthClientTa = lv_textarea_create(ctx->body);
     lv_textarea_set_placeholder_text(deauthClientTa, "Target client MAC (blank = broadcast deauth + capture all)");

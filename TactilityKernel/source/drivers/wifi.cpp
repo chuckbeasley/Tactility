@@ -61,6 +61,12 @@ error_t wifi_set_channel(struct Device* device, uint8_t channel) {
     return api->set_channel(device, channel);
 }
 
+error_t wifi_station_get_bssid(struct Device* device, uint8_t* bssid) {
+    auto* api = WIFI_API(device);
+    if (api->station_get_bssid == nullptr) return ERROR_NOT_SUPPORTED;
+    return api->station_get_bssid(device, bssid);
+}
+
 error_t wifi_send_raw_frame(struct Device* device, const uint8_t* frame, size_t length) {
     auto* api = WIFI_API(device);
     if (api->send_raw_frame == nullptr) return ERROR_NOT_SUPPORTED;

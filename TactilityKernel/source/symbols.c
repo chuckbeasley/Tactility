@@ -391,6 +391,7 @@ const struct ModuleSymbol KERNEL_SYMBOLS[] = {
     DEFINE_MODULE_SYMBOL(wifi_get_scan_results),
     DEFINE_MODULE_SYMBOL(wifi_station_get_ipv4_address),
     DEFINE_MODULE_SYMBOL(wifi_station_get_target_ssid),
+    DEFINE_MODULE_SYMBOL(wifi_station_get_bssid),
     DEFINE_MODULE_SYMBOL(wifi_station_connect),
     DEFINE_MODULE_SYMBOL(wifi_station_disconnect),
     DEFINE_MODULE_SYMBOL(wifi_set_channel),

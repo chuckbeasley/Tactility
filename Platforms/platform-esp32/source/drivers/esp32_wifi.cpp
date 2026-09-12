@@ -586,6 +586,21 @@ error_t api_set_channel(Device* device, uint8_t channel) {
     return err == ESP_OK ? ERROR_NONE : esp_err_to_error(err);
 }
 
+error_t api_station_get_bssid(Device* device, uint8_t* bssid) {
+    auto* ctx = GET_CTX(device);
+    if (ctx == nullptr || bssid == nullptr) return ERROR_INVALID_ARGUMENT;
+
+    // The driver already has this - it logs the BSSID when the station associates - it was simply
+    // never exposed. Addressing a deauth at the associated access point needs it, and taking it
+    // from the connection is what stops the target drifting between cells heard on the same channel.
+    wifi_ap_record_t ap_info = {};
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
+    if (err != ESP_OK) return esp_err_to_error(err);
+
+    memcpy(bssid, ap_info.bssid, 6);
+    return ERROR_NONE;
+}
+
 error_t api_send_raw_frame(Device* device, const uint8_t* frame, size_t length) {
     auto* ctx = GET_CTX(device);
     if (ctx == nullptr || frame == nullptr) return ERROR_INVALID_ARGUMENT;
@@ -703,6 +718,7 @@ const WifiApi esp32_wifi_api = {
     .get_scan_results = api_get_scan_results,
     .station_get_ipv4_address = api_station_get_ipv4_address,
     .station_get_target_ssid = api_station_get_target_ssid,
+    .station_get_bssid = api_station_get_bssid,
     .station_connect = api_station_connect,
     .station_disconnect = api_station_disconnect,
     .station_get_rssi = api_station_get_rssi,

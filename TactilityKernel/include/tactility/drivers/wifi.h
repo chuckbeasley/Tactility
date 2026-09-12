@@ -247,6 +247,18 @@ struct WifiApi {
     error_t (*station_get_target_ssid)(struct Device* device, char* ssid);
 
     /**
+     * Get the BSSID of the access point the device is currently connected to.
+     *
+     * The connection is the authoritative source of an access point's address: it cannot change
+     * while the association holds, unlike an address derived from received frames, which is
+     * whatever the last packet happened to imply.
+     * @param[in] device the wifi device
+     * @param[out] bssid the buffer to store the BSSID (must be at least 6 bytes)
+     * @return ERROR_NONE on success
+     */
+    error_t (*station_get_bssid)(struct Device* device, uint8_t* bssid);
+
+    /**
      * Connect to an access point.
      * @param[in] device the wifi device
      * @param[in] ssid the SSID of the access point
@@ -371,6 +383,14 @@ error_t wifi_station_get_target_ssid(struct Device* device, char* ssid);
 error_t wifi_station_connect(struct Device* device, const char* ssid, const char* password, int32_t channel);
 error_t wifi_station_disconnect(struct Device* device);
 error_t wifi_set_channel(struct Device* device, uint8_t channel);
+
+/**
+ * @brief Copy the BSSID of the access point the station is associated with.
+ * @param[in] device the wifi device
+ * @param[out] bssid the buffer to store the BSSID (must be at least 6 bytes)
+ * @return ERROR_NONE on success, ERROR_NOT_SUPPORTED if the driver cannot report it
+ */
+error_t wifi_station_get_bssid(struct Device* device, uint8_t* bssid);
 error_t wifi_send_raw_frame(struct Device* device, const uint8_t* frame, size_t length);
 error_t wifi_station_get_rssi(struct Device* device, int32_t* rssi);
 
