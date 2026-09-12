@@ -133,6 +133,12 @@ struct Context {
     tt::app::wifimonitor::PcapWriter writer;
     std::atomic<bool> writerStop{false};
     std::atomic<uint8_t> currentChannel{0};
+    // The channel this app last *tuned the radio to*, as opposed to currentChannel above, which
+    // onPacket() overwrites with the channel reported for every received frame. Deciding whether a
+    // retune is needed from currentChannel therefore reads frame metadata rather than the radio's
+    // state, and re-issues esp_wifi_set_channel() whenever a frame reports anything else. Only the
+    // code that actually calls wifi_set_channel() writes this.
+    std::atomic<uint8_t> tunedChannel{0};
     uint8_t lockChannel = 0;
     uint8_t channelIndex = 0;
     uint8_t hopTick = 0;
@@ -239,6 +245,7 @@ static void hopChannel(Context* ctx) {
     uint8_t channel = kChannels[ctx->channelIndex % kChannelCount];
     ctx->channelIndex++;
     ctx->currentChannel.store(channel);
+    ctx->tunedChannel.store(channel);
     if (ctx->wifi != nullptr) {
         wifi_set_channel(ctx->wifi, channel);
     }
@@ -502,14 +509,17 @@ static void onCaptureDeauthTick(Context* ctx) {
                                        !ctx->deauthClientKnown);
         if (len > 0) wifi_send_raw_frame(ctx->wifi, frame, len);
     }
-    // Re-assert the attack channel only if it is not already set. This runs on a timer, and
-    // esp_wifi_set_channel() acts on the interface rather than being a no-op when the value is
-    // unchanged, so calling it unconditionally retunes the radio continuously for as long as the
-    // attack runs - which is what tears the association down. Nothing else moves the channel while
-    // the capture is up: startCapture() pauses auto-scan for its duration.
-    if (ctx->lockChannel != 0 && ctx->currentChannel.load() != ctx->lockChannel) {
+    // Re-assert the attack channel only if this app has not already tuned to it. This runs on a
+    // timer, and esp_wifi_set_channel() acts on the interface rather than being a no-op when the
+    // value is unchanged, so calling it unconditionally retunes the radio for as long as the attack
+    // runs. Note this compares against tunedChannel, not currentChannel: onPacket() overwrites the
+    // latter from frame metadata, so gating on it would re-issue the retune on any frame that
+    // reports something else. Nothing else moves the channel while the capture is up either -
+    // startCapture() pauses auto-scan for its duration.
+    if (ctx->lockChannel != 0 && ctx->tunedChannel.load() != ctx->lockChannel) {
         wifi_set_channel(ctx->wifi, ctx->lockChannel);
         ctx->currentChannel.store(ctx->lockChannel);
+        ctx->tunedChannel.store(ctx->lockChannel);
     }
 }
 
@@ -552,12 +562,14 @@ static void onInjectTick(Context* ctx) {
         }
     }
 
-    // Keep the radio on the channel we're attacking - but only retune when it actually differs.
-    // See the note in onCaptureDeauthTick(): this is also a timer callback, and an unconditional
-    // esp_wifi_set_channel() here retunes the interface on every tick.
-    if (ctx->lockChannel != 0 && ctx->currentChannel.load() != ctx->lockChannel) {
+    // Keep the radio on the channel we're attacking - but only retune when this app has not already
+    // tuned to it. See the note in onCaptureDeauthTick(): this is also a timer callback, an
+    // unconditional esp_wifi_set_channel() here retunes the interface on every tick, and the
+    // comparison has to be against tunedChannel rather than currentChannel.
+    if (ctx->lockChannel != 0 && ctx->tunedChannel.load() != ctx->lockChannel) {
         wifi_set_channel(ctx->wifi, ctx->lockChannel);
         ctx->currentChannel.store(ctx->lockChannel);
+        ctx->tunedChannel.store(ctx->lockChannel);
     }
 }
 
