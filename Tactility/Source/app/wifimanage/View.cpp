@@ -167,7 +167,14 @@ void View::updateNetworkList() {
     state->withApRecords([&](const std::vector<WifiApRecord>& ap_records) {
         have_records = !ap_records.empty();
     });
-    if (state->isScanning() && !have_records) {
+    // Hold the existing list while a scan is in flight - but only once something has been rendered.
+    // Gating on isScanning() alone means the very first build, which happens while a scan may
+    // already be running and with no records yet, returns here and renders nothing at all. The
+    // screen then stays blank, because the only thing that would rebuild it is a Wi-Fi event, and
+    // a missed one leaves it empty forever. That is the "does not always show available networks"
+    // symptom. hasRenderedList separates "nothing on screen yet, so render even mid-scan" from "a
+    // list is already up, so do not blank it".
+    if (state->isScanning() && !have_records && hasRenderedList) {
         return;
     }
 
