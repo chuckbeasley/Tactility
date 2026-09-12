@@ -407,6 +407,20 @@ static lv_obj_t* windowManagerScreenInit(lv_obj_t* root) {
     // focused textarea shows it (see lvgl_keyboard_add_textarea()/textarea_show_keyboard()).
     lvgl_software_keyboard_construct(&softwareKeyboard, root);
 
+    // Tell the keyboard which part of the screen is the app's UI, so that while the keyboard is up
+    // LVGL sees a viewport matching what the user can actually see. Without this the keyboard only
+    // overlays the screen: widgets behind it still count as being in view, so
+    // lv_obj_scroll_to_view_recursive() in textarea_show_keyboard() has nothing to do and a focused
+    // textarea can sit permanently underneath the keyboard. That is exactly what happened to the
+    // Wi-Fi password prompt. Nothing registered this region before, so the mechanism existed but
+    // had never done anything.
+    //
+    // vertical_container rather than app_container on purpose: the height update subtracts the
+    // keyboard from the content area's *parent*, and vertical_container is the widget sized as a
+    // percentage of root. Choosing app_container would leave the app area too tall by the height of
+    // the statusbar, so its bottom strip would still be covered.
+    lvgl_software_keyboard_set_content_area(vertical_container);
+
     return app_container;
 }
 
