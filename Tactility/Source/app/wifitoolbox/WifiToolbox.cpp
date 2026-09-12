@@ -152,6 +152,16 @@ struct Context {
     // is rejecting nearly all of it" - Pkts only counts what survived the filter, so it answers
     // neither question on its own.
     std::atomic<uint32_t> sniffedCount{0};
+    // Deauth transmission accounting. The existing deauth counter counts frames *received*, so it
+    // can never say whether our own frames went out - and the result of the send used to be
+    // discarded, which made a total failure to transmit indistinguishable from a successful attack.
+    // Attempts/successes/failures plus the last error code are the strongest claim obtainable from
+    // this board alone: the radio cannot hear its own transmissions, so proving they actually
+    // radiated needs a second receiver.
+    std::atomic<uint32_t> deauthTxAttempts{0};
+    std::atomic<uint32_t> deauthTxOk{0};
+    std::atomic<uint32_t> deauthTxFail{0};
+    std::atomic<int32_t> deauthTxLastError{0};
     std::atomic<bool> writerStop{false};
     std::atomic<uint8_t> currentChannel{0};
     // The channel this app last *tuned the radio to*, as opposed to currentChannel above, which
@@ -580,7 +590,20 @@ static void onCaptureDeauthTick(Context* ctx) {
                                        ctx->deauthClientKnown ? ctx->deauthClient : nullptr,
                                        ctx->targetBssid,
                                        !ctx->deauthClientKnown);
-        if (len > 0) wifi_send_raw_frame(ctx->wifi, frame, len);
+        if (len > 0) {
+            ctx->deauthTxAttempts.fetch_add(1);
+            const error_t result = wifi_send_raw_frame(ctx->wifi, frame, len);
+            if (result == ERROR_NONE) {
+                ctx->deauthTxOk.fetch_add(1);
+            } else {
+                if (ctx->deauthTxFail.fetch_add(1) == 0) {
+                    // Log the first failure only: this runs in a burst every tick, and one line is
+                    // enough to identify the cause without flooding the console.
+                    LOG_W(TAG, "Deauth send failed with error %d", (int)result);
+                }
+                ctx->deauthTxLastError.store(static_cast<int32_t>(result));
+            }
+        }
     }
     // Re-assert the attack channel only if this app has not already tuned to it. This runs on a
     // timer, and esp_wifi_set_channel() acts on the interface rather than being a no-op when the
@@ -1276,7 +1299,7 @@ static void onPollTick(Context* ctx) {
             // Two lines rather than one: the single-line form overran the screen width once every
             // counter had a place on it, and a label that runs off the edge hides the counters at
             // the end of the line - which are the ones that say whether the capture is working.
-            statsText = std::format("All:{} Pkts:{} EAPOL:{} PMKID:{}\nDeauth:{} Dropped:{} KB:{} Ch:{}",
+            statsText = std::format("All:{} Pkts:{} EAPOL:{} PMKID:{}\nDeauth:{} Dropped:{} KB:{} Ch:{}\nTx:{} ok:{} fail:{} err:{}",
                 (unsigned)ctx->sniffedCount.load(),
                 (unsigned)ctx->packetCount.load(),
                 (unsigned)ctx->eapolCount.load(),
@@ -1284,7 +1307,11 @@ static void onPollTick(Context* ctx) {
                 (unsigned)ctx->deauthCount.load(),
                 (unsigned)ctx->droppedCount.load(),
                 (unsigned)(ctx->writer.getBytesWritten() / 1024),
-                (unsigned)ctx->currentChannel.load());
+                (unsigned)ctx->currentChannel.load(),
+                (unsigned)ctx->deauthTxAttempts.load(),
+                (unsigned)ctx->deauthTxOk.load(),
+                (unsigned)ctx->deauthTxFail.load(),
+                (int)ctx->deauthTxLastError.load());
             if (ctx->autoDeauth && ctx->writerThread != nullptr) statsText += "  +deauth";
         }
     }
