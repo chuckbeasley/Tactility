@@ -125,6 +125,31 @@ partition erased afterwards, so the next dump will be a real one.
 A dump survives a reboot but not a flash: flashing rewrites the partition table and the app, and a
 dump only means anything against the ELF that produced it.
 
+## IDLE starvation, and why it is no longer treated as a fault
+
+```properties
+# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 is not set
+```
+
+The task watchdog watches the idle task by default, and reports "IDLE did not reset the watchdog"
+when no lower-priority task has run for the timeout. That is the right check for a wedged system -
+it is what caught the lock-free shadow frame's spinlock deadlock - but it is the wrong one for a
+workload that saturates the CPU *by design*.
+
+The Wi-Fi Toolbox's promiscuous capture is exactly that workload. Its callback runs inside the
+Wi-Fi driver task at priority 23, the highest on the chip, and a busy channel keeps that task
+runnable continuously. Every capture longer than a few seconds therefore rebooted the device, and
+the blamed task varied with whatever happened to be running when the check tripped: `wifi_cap`,
+`taskLVGL`, `wifi`, all the same starvation seen from three angles. Memory was ruled out first
+(43-46 KB internal free, largest block 20-30 KB, no MemoryChecker warning), and the channel was
+ruled out earlier still.
+
+**The cost of this, recorded deliberately:** with no idle check and no explicitly subscribed tasks,
+the task watchdog now has nothing to watch, so a genuine hang that starves the idle task will no
+longer reset the device. `CONFIG_ESP_TASK_WDT_PANIC=y` remains but is largely moot. A hang now
+shows up as a device that stops responding rather than one that reboots - which is a real loss of
+diagnosis, accepted in exchange for a capture that can run for longer than ten seconds.
+
 ## A hang, and why the watchdog has to panic
 
 A core dump is only written by the panic handler, so it captures crashes and nothing else. The
