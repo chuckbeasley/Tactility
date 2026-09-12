@@ -150,6 +150,10 @@ struct Context {
     // Inject state.
     bool injecting = false;
     bool autoDeauth = false; // "deauth to force handshake" on the Capture screen
+    // The deauth switch itself, so the channel selector can turn it off when Auto is chosen. Deauth
+    // and Auto are mutually exclusive: injected frames go out on whatever channel the hop currently
+    // sits on, so on Auto they mostly miss the target and the feature silently does nothing.
+    lv_obj_t* deauthSwitch = nullptr;
     InjectMode injectMode = InjectMode::Beacon;
     bool funnySsids = true;
     size_t funnyIndex = 0;
@@ -847,6 +851,16 @@ static void onCaptureChannelChanged(lv_event_t* event) {
     auto* dropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
     uint32_t index = lv_dropdown_get_selected(dropdown);
     ctx->lockChannel = (index == 0) ? 0 : kChannels[index - 1];
+    // Choosing Auto forces the deauth off. It cannot work there - injections follow the hop and
+    // mostly land on the wrong channel - and leaving it switched on would look like a running
+    // attack that is silently transmitting nothing.
+    if (ctx->lockChannel == 0 && ctx->autoDeauth) {
+        ctx->autoDeauth = false;
+        if (ctx->deauthSwitch != nullptr) lv_obj_remove_state(ctx->deauthSwitch, LV_STATE_CHECKED);
+#if defined(CONFIG_SOC_WIFI_SUPPORTED)
+        if (ctx->deauthTimer != nullptr) ctx->deauthTimer->stop();
+#endif
+    }
     if (ctx->wifi != nullptr && ctx->lockChannel != 0) {
         wifi_set_channel(ctx->wifi, ctx->lockChannel);
     }
@@ -856,6 +870,13 @@ static void onCaptureDeauthToggled(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
     auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(event));
     ctx->autoDeauth = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    // Refuse to enable it while the channel is Auto, for the same reason Auto clears it: the
+    // injections would follow the hop and miss the target. The switch is put back rather than
+    // accepted, so the UI never claims a deauth that cannot transmit.
+    if (ctx->autoDeauth && ctx->lockChannel == 0) {
+        ctx->autoDeauth = false;
+        lv_obj_remove_state(sw, LV_STATE_CHECKED);
+    }
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
     // Deauth-elicitation only makes sense while capture is active, so gate the timer on that.
     if (ctx->writerThread != nullptr) {
@@ -899,6 +920,7 @@ static void showCaptureScreen(Context* ctx) {
     lv_label_set_text(deauthLabel, "Deauth to force handshake");
     auto* deauthSwitch = lv_switch_create(deauthRow);
     lv_obj_add_event_cb(deauthSwitch, onCaptureDeauthToggled, LV_EVENT_VALUE_CHANGED, ctx);
+    ctx->deauthSwitch = deauthSwitch;
 
     auto* deauthBssid = lv_textarea_create(ctx->body);
     lv_textarea_set_placeholder_text(deauthBssid, "Deauth AP BSSID (required), e.g. 34:3e:a4:7e:90:45");
