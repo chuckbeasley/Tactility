@@ -180,7 +180,11 @@ class StatusbarService final : public Service {
 
         Device* serial_dev = bluetooth_serial_get();
         Device* midi_dev = bluetooth_midi_get();
-        bool connected = (serial_dev && bluetooth_serial_is_connected(serial_dev)) ||
+        // The HID host counts too. It is the profile the Bluetooth app's device list connects -
+        // keyboards, mice, gamepads - and without it a connected device left the header showing the
+        // plain "Bluetooth on" icon, as though nothing were attached.
+        bool connected = bluetooth::hidHostIsConnected() ||
+                         (serial_dev && bluetooth_serial_is_connected(serial_dev)) ||
                          (midi_dev && bluetooth_midi_is_connected(midi_dev));
         if (serial_dev) {
             device_put(serial_dev);
