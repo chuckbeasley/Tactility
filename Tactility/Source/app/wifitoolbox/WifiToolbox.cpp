@@ -530,6 +530,22 @@ static bool startCapture(Context* ctx) {
     thread_set_priority(ctx->writerThread, THREAD_PRIORITY_LOW);
     thread_start(ctx->writerThread);
     LOG_I(TAG, "Capture started");
+    // Record what this capture is aiming at, in full. Without it "0 EAPOL" cannot be attributed: a
+    // deauth aimed at a client MAC that is not on the air - which per-network MAC randomisation makes
+    // likely - reaches nobody and looks identical in the log to a deauth never sent at all. The same
+    // goes for a locked channel that is not the target's. channel=0 means Auto, where deauth is
+    // forced off.
+    LOG_I(TAG, "Config: channel=%u deauth=%s target=%02x:%02x:%02x:%02x:%02x:%02x (%s)",
+          (unsigned)ctx->lockChannel,
+          ctx->autoDeauth ? "on" : "off",
+          ctx->targetBssid[0], ctx->targetBssid[1], ctx->targetBssid[2],
+          ctx->targetBssid[3], ctx->targetBssid[4], ctx->targetBssid[5],
+          ctx->deauthClientKnown ? "directed" : "broadcast");
+    if (ctx->deauthClientKnown) {
+        LOG_I(TAG, "Config: client=%02x:%02x:%02x:%02x:%02x:%02x",
+              ctx->deauthClient[0], ctx->deauthClient[1], ctx->deauthClient[2],
+              ctx->deauthClient[3], ctx->deauthClient[4], ctx->deauthClient[5]);
+    }
     return true;
 }
 
