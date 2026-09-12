@@ -502,7 +502,15 @@ static void onCaptureDeauthTick(Context* ctx) {
                                        !ctx->deauthClientKnown);
         if (len > 0) wifi_send_raw_frame(ctx->wifi, frame, len);
     }
-    if (ctx->lockChannel != 0) wifi_set_channel(ctx->wifi, ctx->lockChannel);
+    // Re-assert the attack channel only if it is not already set. This runs on a timer, and
+    // esp_wifi_set_channel() acts on the interface rather than being a no-op when the value is
+    // unchanged, so calling it unconditionally retunes the radio continuously for as long as the
+    // attack runs - which is what tears the association down. Nothing else moves the channel while
+    // the capture is up: startCapture() pauses auto-scan for its duration.
+    if (ctx->lockChannel != 0 && ctx->currentChannel.load() != ctx->lockChannel) {
+        wifi_set_channel(ctx->wifi, ctx->lockChannel);
+        ctx->currentChannel.store(ctx->lockChannel);
+    }
 }
 
 static void onInjectTick(Context* ctx) {
@@ -544,9 +552,12 @@ static void onInjectTick(Context* ctx) {
         }
     }
 
-    // Keep the radio on the channel we're attacking.
-    if (ctx->lockChannel != 0) {
+    // Keep the radio on the channel we're attacking - but only retune when it actually differs.
+    // See the note in onCaptureDeauthTick(): this is also a timer callback, and an unconditional
+    // esp_wifi_set_channel() here retunes the interface on every tick.
+    if (ctx->lockChannel != 0 && ctx->currentChannel.load() != ctx->lockChannel) {
         wifi_set_channel(ctx->wifi, ctx->lockChannel);
+        ctx->currentChannel.store(ctx->lockChannel);
     }
 }
 
