@@ -382,6 +382,8 @@ static int32_t captureWriterMain(void* context) {
     }
     LOG_I(TAG, "Capturing to %s", path.c_str());
 
+    // Counts packets written, so the loop can hand the CPU back periodically. See the delay below.
+    size_t packetsSinceYield = 0;
     while (!ctx->writerStop.load() || xStreamBufferBytesAvailable(ctx->streamBuffer) > 0) {
         CaptureRecord record;
         size_t got = xStreamBufferReceive(ctx->streamBuffer, &record, sizeof(record), pdMS_TO_TICKS(100));
@@ -391,6 +393,18 @@ static int32_t captureWriterMain(void* context) {
         size_t pgot = xStreamBufferReceive(ctx->streamBuffer, payload, plen, pdMS_TO_TICKS(100));
         if (pgot != plen) continue;
         ctx->writer.writePacket(record.ts_sec, record.ts_usec, payload, plen, record.rssi, record.channel);
+
+        // Hand the CPU back so the idle task can run. This thread is I/O bound on flash, but while
+        // the stream buffer is being filled faster than it drains, both receives return immediately
+        // and the loop never blocks - and a task that never blocks starves IDLE, which is exactly
+        // what the watchdog reports: "IDLE did not reset the watchdog", with wifi_cap named as the
+        // running task, followed by a software reset. taskYIELD() is not enough here, because it
+        // only yields to equal or higher priority and IDLE is lower; only blocking lets it run.
+        // Every 64 packets rather than every one, so a slow tick rate does not cap throughput.
+        if (++packetsSinceYield >= 64) {
+            packetsSinceYield = 0;
+            vTaskDelay(1);
+        }
     }
     ctx->writer.close();
     LOG_I(TAG, "Capture stopped");
