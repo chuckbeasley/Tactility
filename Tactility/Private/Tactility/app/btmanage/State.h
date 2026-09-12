@@ -19,6 +19,12 @@ class State final {
     // connected to, so the app tracks it from the click until an outcome event arrives.
     std::array<uint8_t, 6> connectingAddr = {};
     bool connecting = false;
+    // Whether scanning should be running. Several paths start a scan automatically - opening the app
+    // with the radio on, the radio being switched on, re-subscribing to the driver - and without an
+    // explicit intent they would each bring back a scan the user had stopped or that had been
+    // stopped to make room for a connection. Cleared by pressing Stop scan or by clicking a device
+    // to connect, and re-armed when the radio is switched on.
+    bool scanWanted = true;
 
 public:
     State() = default;
@@ -40,6 +46,10 @@ public:
     bool isConnectingTo(const std::array<uint8_t, 6>& addr) const;
     /** @return true when any connection is in flight. */
     bool isConnecting() const;
+
+    /** Records whether the user still wants scanning to run; see the note on scanWanted. */
+    void setScanWanted(bool wanted);
+    bool isScanWanted() const;
 
     std::vector<bluetooth::PeerRecord> getScanResults() const {
         auto lock = mutex.asScopedLock();

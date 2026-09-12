@@ -66,4 +66,16 @@ bool State::isConnecting() const {
     return connecting;
 }
 
+void State::setScanWanted(bool wanted) {
+    auto lock = mutex.asScopedLock();
+    lock.lock();
+    scanWanted = wanted;
+}
+
+bool State::isScanWanted() const {
+    auto lock = mutex.asScopedLock();
+    lock.lock();
+    return scanWanted;
+}
+
 } // namespace tt::app::btmanage

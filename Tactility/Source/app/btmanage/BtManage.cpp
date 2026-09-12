@@ -48,10 +48,10 @@ static void onBtToggled(void* context, bool requestOn) {
         if (requestOn && !radio_on) {
             LOG_I(TAG, "Turning on");
             bluetooth::start(dev);
-            // Show the transition immediately. The radio (and with it our BT event subscription)
-            // comes up asynchronously, so until then the view would redraw the switch from the
-            // still-"off" state and it would look like it flipped itself back off.
+            // Turning the radio on is the user asking for Bluetooth to work, so it re-arms scanning;
+            // a stop asked for earlier belonged to the previous time the radio was on.
             if (ctx != nullptr) {
+                ctx->state.setScanWanted(true);
                 ctx->state.setRadioState(bluetooth::RadioState::OnPending);
                 requestViewUpdate(ctx);
             }
@@ -71,17 +71,28 @@ static void onBtToggled(void* context, bool requestOn) {
 #endif
 }
 
-static void onScanToggled(void* /*context*/, bool enabled) {
+static void onScanToggled(void* context, bool enabled) {
+    auto* ctx = static_cast<Context*>(context);
     Device* dev;
     if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) != ERROR_NONE) {
         LOG_W(TAG, "Scan: No bluetooth device found");
         return;
     }
 
+    // Recorded so the automatic starts below know that a stop was asked for, rather than starting
+    // the scan up again on the next event that happens by.
+    if (ctx != nullptr) {
+        ctx->state.setScanWanted(enabled);
+    }
+
     if (enabled) {
         bluetooth_scan_start(dev);
     } else {
         bluetooth_scan_stop(dev);
+        if (ctx != nullptr) {
+            ctx->state.setScanning(false);
+            requestViewUpdate(ctx);
+        }
     }
 
     device_put(dev);
@@ -124,6 +135,9 @@ static void onPairPeer(void* context, const std::array<uint8_t, 6>& addr) {
         // asked whether a connection is in flight, so the app is the only place that knows it
         // started, and the events below are the only places that know it ended.
         ctx->state.beginConnecting(addr);
+        // Picking a device is a decision to stop looking for others, so nothing may start the scan
+        // again while this connection is being made.
+        ctx->state.setScanWanted(false);
         ctx->connecting_since_ticks = xTaskGetTickCount();
     }
     bluetooth::hidHostConnect(addr);
@@ -197,8 +211,14 @@ void onBtEvent(Context* ctx, const BtEvent& event) {
             ctx->view_dirty = true;
             if (event.radio_state == BT_RADIO_STATE_ON) {
                 ctx->paired_peers_dirty = true;
+                // Deliberately does not re-arm scanning. Connecting to a device brings the radio
+                // back to ON, and re-arming here would restart the very scan the click had stopped -
+                // which is what left it scanning after a connection. The intent is set by user
+                // actions only (turning the radio on, Scan, Stop scan, clicking a device); this
+                // event just acts on it.
                 Device* dev = nullptr;
-                if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE && !bluetooth_is_scanning(dev)) {
+                if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE &&
+                    ctx->state.isScanWanted() && !bluetooth_is_scanning(dev)) {
                     bluetooth_scan_start(dev);
                 }
                 if (dev) {
@@ -270,7 +290,7 @@ int32_t appMain(int argc, char* argv[]) {
         bluetooth::radioStateToString(radio_state),
         (int)(dev ? bluetooth_is_scanning(dev) : false),
         (int)can_scan);
-    if (can_scan && dev && !bluetooth_is_scanning(dev)) {
+    if (can_scan && dev && ctx.state.isScanWanted() && !bluetooth_is_scanning(dev)) {
         bluetooth_scan_start(dev);
     }
 
@@ -340,7 +360,8 @@ int32_t appMain(int argc, char* argv[]) {
                 // the only trigger there is and scanning stays stopped. The list then shows
                 // whatever the previous scan happened to leave in the cache, which is why not every
                 // available device appeared. Do what the missed event would have done.
-                if (radio != bluetooth::RadioState::Off && !bluetooth_is_scanning(dev)) {
+                if (radio != bluetooth::RadioState::Off && ctx.state.isScanWanted() &&
+                    !bluetooth_is_scanning(dev)) {
                     LOG_I(TAG, "Starting scan after re-subscribing");
                     bluetooth_scan_start(dev);
                 }
