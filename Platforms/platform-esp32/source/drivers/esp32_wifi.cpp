@@ -558,8 +558,14 @@ error_t api_set_promiscuous(Device* device, bool enable) {
         // management. The previously stated reason for ALL - observing ACK/RTS noise for the
         // association-sleep attack - is not worth losing the association over, and can be revisited
         // with a narrower filter if that feature ever needs it.
+        // All three data masks, not just DATA: MPDU and AMPDU are documented as "a kind of
+        // WIFI_PKT_DATA", and EAPOL frequently arrives aggregated, so DATA alone silently stops
+        // delivering the frames this app exists to capture - which showed up as EAPOL, PMKID and
+        // deauth all counting zero while packets were still being received.
         wifi_promiscuous_filter_t filter {
-            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_MISC
+            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA |
+                WIFI_PROMIS_FILTER_MASK_DATA_MPDU | WIFI_PROMIS_FILTER_MASK_DATA_AMPDU |
+                WIFI_PROMIS_FILTER_MASK_MISC
         };
         esp_wifi_set_promiscuous_filter(&filter);
     }
