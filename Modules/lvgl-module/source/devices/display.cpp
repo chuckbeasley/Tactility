@@ -17,6 +17,7 @@
 #ifdef ESP_PLATFORM
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
 #endif
 
 constexpr auto* TAG = "lvgl_display";
@@ -98,7 +99,22 @@ struct LvglDisplayCtx {
     std::atomic<uint32_t> shadow_seq {0};
     // Guards the dirty rectangle and the completeness flag below, which must not lose an update.
     // Held for a handful of instructions, never across a pixel copy.
+    //
+    // This has to be a critical section rather than a hand-rolled spinlock. The LVGL task takes it
+    // from the flush callback, and the mirror's consumer task takes it from
+    // lvgl_display_peek_dirty_area/lvgl_display_take_dirty_area. A spinning waiter that outranks the
+    // holder therefore deadlocks on a single core: the holder is preempted mid-section and can never
+    // be scheduled again to release it. That is not hypothetical - it is what happened, and the core
+    // dump shows it plainly: taskLVGL spinning here, pc inside lvgl_shadow_lock, until the task
+    // watchdog fired. While it spun, every task that outranks nothing was starved, so the device
+    // also fell off Wi-Fi and its console went silent, which is why the first symptom looked like a
+    // network fault rather than a hang. Interrupts are off inside this section, so the holder always
+    // finishes and no waiter can spin forever.
+#ifdef ESP_PLATFORM
+    portMUX_TYPE dirty_mux = portMUX_INITIALIZER_UNLOCKED;
+#else
     std::atomic_flag dirty_lock = ATOMIC_FLAG_INIT;
+#endif
     // Union of the regions changed since a consumer last took it (lvgl_display_take_dirty_area).
     // This is what lets the mirror send only what moved instead of a whole frame: for a typical UI
     // update (a keystroke, a clock tick, a highlight) the rectangle is tiny.
@@ -113,17 +129,25 @@ struct LvglDisplayCtx {
     int64_t dirty_last_update_us;
 };
 
-// A spinlock, not a mutex, because the sections it guards are a few comparisons: the cost of a
-// syscall or a scheduler round trip would dwarf the work. Only these two functions use it.
+// The sections guarded here are a few comparisons, so this is deliberately not a mutex - but on the
+// single-core ESP targets it must be a critical section, for the reason spelled out at dirty_mux.
 static void lvgl_shadow_lock(struct LvglDisplayCtx* ctx) {
+#ifdef ESP_PLATFORM
+    portENTER_CRITICAL(&ctx->dirty_mux);
+#else
     while (ctx->dirty_lock.test_and_set(std::memory_order_acquire)) {
-        // Spin. The holder is the LVGL task doing a few compares, and it cannot be preempted
-        // inside the section on the single-core targets this runs on.
+        // Spin. Nothing else runs while the holder is mid-section on the targets that reach this
+        // branch, so the wait is bounded.
     }
+#endif
 }
 
 static void lvgl_shadow_unlock(struct LvglDisplayCtx* ctx) {
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&ctx->dirty_mux);
+#else
     ctx->dirty_lock.clear(std::memory_order_release);
+#endif
 }
 
 static void* lvgl_display_alloc_buffer(size_t size_bytes, bool prefer_external_ram) {
@@ -345,11 +369,14 @@ static void lvgl_display_shadow_update(struct LvglDisplayCtx* ctx, lv_display_t*
     // an update to a race would mean a change the mirror never hears about - it would show a stale
     // patch until something else changed. They are therefore updated inside a spinlock, but a very
     // short one: this is a handful of comparisons, nothing like the LVGL lock.
+    // Stamp the widening, so a consumer that serves a frame captured before this moment knows the
+    // rectangle is newer than its frame. Read outside the section: the section serialises the
+    // rectangle, not the clock, and nothing but integer work should run with interrupts off.
+    const int64_t now_us = lvgl_now_us();
+
     lvgl_shadow_lock(ctx);
 
-    // Stamp the widening, so a consumer that serves a frame captured before this moment knows the
-    // rectangle is newer than its frame.
-    ctx->dirty_last_update_us = lvgl_now_us();
+    ctx->dirty_last_update_us = now_us;
 
     // Widen the dirty rectangle to cover this region.
     if (ctx->dirty_empty) {
