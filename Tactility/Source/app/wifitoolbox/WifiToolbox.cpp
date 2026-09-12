@@ -382,29 +382,37 @@ static int32_t captureWriterMain(void* context) {
     }
     LOG_I(TAG, "Capturing to %s", path.c_str());
 
-    // Counts packets written, so the loop can hand the CPU back periodically. See the delay below.
+    // Counts loop iterations, so the loop can hand the CPU back periodically. See the delay below.
     size_t packetsSinceYield = 0;
     while (!ctx->writerStop.load() || xStreamBufferBytesAvailable(ctx->streamBuffer) > 0) {
-        CaptureRecord record;
-        size_t got = xStreamBufferReceive(ctx->streamBuffer, &record, sizeof(record), pdMS_TO_TICKS(100));
-        if (got != sizeof(record)) continue;
-        uint8_t payload[MAX_FRAME_SIZE];
-        size_t plen = record.length > MAX_FRAME_SIZE ? MAX_FRAME_SIZE : record.length;
-        size_t pgot = xStreamBufferReceive(ctx->streamBuffer, payload, plen, pdMS_TO_TICKS(100));
-        if (pgot != plen) continue;
-        ctx->writer.writePacket(record.ts_sec, record.ts_usec, payload, plen, record.rssi, record.channel);
-
-        // Hand the CPU back so the idle task can run. This thread is I/O bound on flash, but while
-        // the stream buffer is being filled faster than it drains, both receives return immediately
-        // and the loop never blocks - and a task that never blocks starves IDLE, which is exactly
-        // what the watchdog reports: "IDLE did not reset the watchdog", with wifi_cap named as the
-        // running task, followed by a software reset. taskYIELD() is not enough here, because it
-        // only yields to equal or higher priority and IDLE is lower; only blocking lets it run.
-        // Every 64 packets rather than every one, so a slow tick rate does not cap throughput.
+        // Yield on every path through this loop, not only after a successful write. The receive can
+        // return short, and the previous code continued on that path without ever blocking - so a
+        // sustained mismatch spun here at full speed and starved the idle task. The watchdog reported
+        // exactly that: IDLE did not reset it, with this task named as running, then a software
+        // reset. taskYIELD would not help, because it never yields down to IDLE.
         if (++packetsSinceYield >= 64) {
             packetsSinceYield = 0;
             vTaskDelay(1);
         }
+
+        CaptureRecord record;
+        size_t got = xStreamBufferReceive(ctx->streamBuffer, &record, sizeof(record), pdMS_TO_TICKS(100));
+        if (got != sizeof(record)) continue;
+
+        uint8_t payload[MAX_FRAME_SIZE];
+        size_t plen = record.length > MAX_FRAME_SIZE ? MAX_FRAME_SIZE : record.length;
+        // Accumulate instead of assuming one read returns the whole payload. A stream buffer returns
+        // only what is available, and discarding a short read would also throw away the bytes already
+        // taken - leaving the stream misaligned so that every later read is garbage.
+        size_t have = 0;
+        while (have < plen) {
+            const size_t n = xStreamBufferReceive(ctx->streamBuffer, payload + have, plen - have, pdMS_TO_TICKS(100));
+            if (n == 0) break;
+            have += n;
+        }
+        if (have != plen) continue;
+
+        ctx->writer.writePacket(record.ts_sec, record.ts_usec, payload, plen, record.rssi, record.channel);
     }
     ctx->writer.close();
     LOG_I(TAG, "Capture stopped");
