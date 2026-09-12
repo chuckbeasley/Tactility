@@ -130,10 +130,10 @@ bool PcapWriter::writePacket(uint32_t ts_sec, uint32_t ts_usec, const uint8_t* p
     bytes_written_ += sizeof(pcap_header) + sizeof(radiotap) + length;
     packet_count_++;
 
-    // Flush periodically so captured data isn't lost to a crash / power cut.
-    // Kept far enough apart that it doesn't add flash-write pressure beyond the
-    // 16 KB stdio buffer's own auto-flush (which already batches nearby packets).
-    if (packet_count_ % 250 == 0) {
+    // Flush periodically so captured data isn't lost to a crash / power cut. The interval is in
+    // packets and works out at roughly 300 KB, comfortably past the 256 KB buffer, so this is a
+    // safety net rather than the thing that drives write frequency.
+    if (packet_count_ % 1000 == 0) {
         fflush(file_);
     }
     return true;

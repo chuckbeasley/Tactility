@@ -35,7 +35,11 @@ public:
     size_t getPacketCount() const { return packet_count_; }
 
 private:
-    static constexpr size_t WRITE_BUFFER_SIZE = 64 * 1024;
+    // 256 KB, in PSRAM. Larger writes mean fewer trips through FatFS and the wear-levelling layer,
+    // which is where the time goes: a 2.5 MB capture flushed at ~38 KB/s. If this does not change
+    // the flush time, that figure is the filesystem's sustained write rate rather than per-write
+    // overhead, and the answer is to document it rather than keep tuning.
+    static constexpr size_t WRITE_BUFFER_SIZE = 256 * 1024;
 
     FILE* file_ = nullptr;
     // Owned here rather than left to stdio. setvbuf with a null buffer allocates from internal RAM,
