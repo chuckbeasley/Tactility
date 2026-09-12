@@ -147,6 +147,11 @@ struct Context {
     uint8_t* streamBufferStorage = nullptr;
     ::Thread* writerThread = nullptr;
     tt::app::wifimonitor::PcapWriter writer;
+    // Every frame the sniffer hands us, before any filtering. Without this there is no way to tell
+    // "the radio is barely receiving" apart from "it is receiving plenty and the target-MAC filter
+    // is rejecting nearly all of it" - Pkts only counts what survived the filter, so it answers
+    // neither question on its own.
+    std::atomic<uint32_t> sniffedCount{0};
     std::atomic<bool> writerStop{false};
     std::atomic<uint8_t> currentChannel{0};
     // The channel this app last *tuned the radio to*, as opposed to currentChannel above, which
@@ -305,6 +310,7 @@ static bool looksLikePmkid(const uint8_t* payload, size_t length) {
 
 static void onPacket(void* context, const uint8_t* payload, size_t length, WifiPromiscuousPacketInfo info) {
     auto* ctx = static_cast<Context*>(context);
+    ctx->sniffedCount.fetch_add(1);
     ctx->currentChannel.store(info.channel);
 
     if (length >= 22) {
@@ -1245,7 +1251,8 @@ static void onPollTick(Context* ctx) {
         if (ctx->injecting) {
             statsText = std::format("Injecting... Ch:{}", (unsigned)ctx->currentChannel.load());
         } else {
-            statsText = std::format("Pkts:{} EAPOL:{} PMKID:{} Deauth:{} Dropped:{} KB:{} Ch:{}",
+            statsText = std::format("All:{} Pkts:{} EAPOL:{} PMKID:{} Deauth:{} Dropped:{} KB:{} Ch:{}",
+                (unsigned)ctx->sniffedCount.load(),
                 (unsigned)ctx->packetCount.load(),
                 (unsigned)ctx->eapolCount.load(),
                 (unsigned)ctx->pmkidCount.load(),
