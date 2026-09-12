@@ -90,6 +90,18 @@ static void onDisconnectPeer(const std::array<uint8_t, 6>& addr, int profileId) 
 }
 
 static void onPairPeer(void* /*context*/, const std::array<uint8_t, 6>& addr) {
+    // Clicking a device means the user has picked one, so stop looking for others first. A scan
+    // holds the radio in a duty cycle that competes with the connection it is trying to make, and
+    // it also keeps rebuilding the list underneath the click.
+    Device* dev;
+    if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
+        if (bluetooth_is_scanning(dev)) {
+            LOG_I(TAG, "Stopping scan to connect");
+            bluetooth_scan_stop(dev);
+        }
+        device_put(dev);
+    }
+
     // Clicking an unrecognised scan result initiates a HID host connection.
     // Bond exchange happens automatically during the first connection.
     bluetooth::hidHostConnect(addr);
