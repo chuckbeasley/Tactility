@@ -401,9 +401,22 @@ static bool startCapture(Context* ctx) {
     }
 
     if (ctx->lockChannel != 0) {
-        wifi_set_channel(ctx->wifi, ctx->lockChannel);
+        // A specific channel means "capture on this one and keep the association". Do not retune.
+        // While the STA is associated esp_wifi_set_channel() is refused anyway - the driver logs
+        // "STA is scanning or connecting, or AP has connected with external STAs, cannot set
+        // channel" - and asking for it is what immediately preceded the association dying of
+        // bcn_timeout in the captured run. Staying put also means the radio is already on this
+        // channel whenever it matches the associated AP, which is the case the lock exists for.
         ctx->currentChannel.store(ctx->lockChannel);
+        ctx->tunedChannel.store(ctx->lockChannel);
     } else {
+        // Auto hops across every channel, and hopping genuinely cannot coexist with being
+        // associated: one radio cannot sit on the AP's channel receiving beacons while it is tuned
+        // somewhere else. So drop the link deliberately here, which is the only case that should
+        // disconnect - and doing it up front, before the sniffer is enabled, is also what lets the
+        // channel set succeed instead of being refused, and avoids the link dying of a beacon
+        // timeout 25 s later while the user is left wondering what happened.
+        tt::service::wifi::disconnect();
         hopChannel(ctx);
     }
 
