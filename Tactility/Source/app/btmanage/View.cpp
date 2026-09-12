@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <format>
 #include <string>
 
@@ -117,24 +118,33 @@ static uint8_t mapRssiToPercentage(int8_t rssi) {
 }
 
 void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired) {
-    const auto name = record.name.empty()
-        ? std::format("Unknown ({:02x}{:02x}{:02x}{:02x}{:02x}{:02x})",
-            record.addr[0], record.addr[1], record.addr[2],
-            record.addr[3], record.addr[4], record.addr[5])
-        : record.name;
-
-    // A connected HID host reports no RSSI (rssi=0 maps to "100%"), which is misleading, and a peer
-    // mid-connection has no meaningful signal either - show what is actually happening instead.
-    std::string label;
+    // Built with snprintf rather than std::format, deliberately. This runs once per row, at the
+    // very bottom of a deep chain - window creation, then the list rebuild, all on this app's own
+    // task - and std::format reaches vformat and its sink machinery, which is around twenty frames
+    // of its own. That was the deepest point when this app crashed opening its device list: the
+    // coredump shows createPeerListItem at frame 20 with frames 0..19 all inside libstdc++ format,
+    // on a 16 KB stack. snprintf does the same job in a handful of frames.
+    char suffix[32];
     if (state->isConnectingTo(record.addr)) {
-        label = std::format("{} {}Connecting...", name, LV_SYMBOL_REFRESH);
+        std::snprintf(suffix, sizeof(suffix), "%sConnecting...", LV_SYMBOL_REFRESH);
     } else if (record.connected) {
-        label = std::format("{} {}Connected", name, LV_SYMBOL_OK);
+        std::snprintf(suffix, sizeof(suffix), "%sConnected", LV_SYMBOL_OK);
     } else {
-        label = std::format("{} {}%", name, mapRssiToPercentage(record.rssi));
+        // A connected HID host reports no RSSI (rssi=0 maps to "100%"), which is misleading.
+        std::snprintf(suffix, sizeof(suffix), "%u%%", static_cast<unsigned>(mapRssiToPercentage(record.rssi)));
     }
 
-    auto* button = lv_list_add_button(peers_list, nullptr, label.c_str());
+    char label[96];
+    if (record.name.empty()) {
+        std::snprintf(label, sizeof(label), "Unknown (%02x%02x%02x%02x%02x%02x) %s",
+            record.addr[0], record.addr[1], record.addr[2],
+            record.addr[3], record.addr[4], record.addr[5],
+            suffix);
+    } else {
+        std::snprintf(label, sizeof(label), "%s %s", record.name.c_str(), suffix);
+    }
+
+    auto* button = lv_list_add_button(peers_list, nullptr, label);
     // Compact rows so more peers fit on the small display (local style overrides the theme).
     lv_obj_set_style_pad_ver(button,
         lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 2 : 4,
