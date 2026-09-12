@@ -157,6 +157,20 @@ void View::updateConnectToHidden() {
 }
 
 void View::updateNetworkList() {
+    // Never wipe the list while a scan is in flight and has produced nothing yet. The service has
+    // no records mid-scan, so rebuilding here empties a list the user is trying to tap - and
+    // because a refresh is signalled when the scan starts, and the service re-scans periodically,
+    // the list blanks on a cycle and is only selectable in the gaps between scans. Hold the
+    // previous entries on screen until the scan finishes; the refresh that follows completion
+    // performs the real update.
+    bool have_records = false;
+    state->withApRecords([&](const std::vector<WifiApRecord>& ap_records) {
+        have_records = !ap_records.empty();
+    });
+    if (state->isScanning() && !have_records) {
+        return;
+    }
+
     lv_obj_clean(networks_list);
 
     // Enable on boot
