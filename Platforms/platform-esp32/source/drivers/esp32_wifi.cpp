@@ -546,13 +546,22 @@ error_t api_set_promiscuous(Device* device, bool enable) {
         return esp_err_to_error(err);
     }
     if (enable) {
-        // Capture management + control + data + misc (not just MISC, the driver's default), so a
-        // monitor app sees beacons, deauth/assoc mgmt frames and EAPOL data frames. The app filters
-        // down to what it needs; dropping control frames here would hide e.g. the association sleep
-        // attack's ACK/RTS noise the app may want to observe.
-        wifi_promiscuous_filter_t filter { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
+        // Management, data and misc - deliberately NOT control.
+        //
+        // WIFI_PROMIS_FILTER_MASK_ALL also forwards control frames, and on any real channel that
+        // means an ACK for every acknowledged frame: thousands per second, each delivered to the
+        // app callback from the driver's own receive path, where each one is copied twice. That work
+        // competes with the driver's handling of beacons, and the station then times out on them and
+        // drops the link - observed consistently about nine seconds after the sniffer is enabled,
+        // with the channel uninvolved and internal memory healthy (43 KB free, no low-memory warning).
+        // Nothing the app needs is a control frame: EAPOL/PMKID are data, and deauth/assoc/beacons are
+        // management. The previously stated reason for ALL - observing ACK/RTS noise for the
+        // association-sleep attack - is not worth losing the association over, and can be revisited
+        // with a narrower filter if that feature ever needs it.
+        wifi_promiscuous_filter_t filter {
+            .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA | WIFI_PROMIS_FILTER_MASK_MISC
+        };
         esp_wifi_set_promiscuous_filter(&filter);
-        esp_wifi_set_promiscuous_ctrl_filter(&filter);
     }
     return ERROR_NONE;
 }
