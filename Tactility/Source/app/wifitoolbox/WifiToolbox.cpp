@@ -423,6 +423,12 @@ static int32_t captureWriterMain(void* context) {
         return 1;
     }
     LOG_I(TAG, "Capturing to %s", path.c_str());
+    if (!ctx->writer.hasWriteBuffer()) {
+        // Unbuffered, so every packet's writes go straight to FatFS through the wear-levelling layer.
+        // That is orders of magnitude slower and will drop most of the capture, so say so instead of
+        // letting it look like a slow disk.
+        LOG_W(TAG, "No write buffer (allocation failed); capture will drop heavily");
+    }
 
     // Counts loop iterations, so the loop can hand the CPU back periodically. See the delay below.
     size_t packetsSinceYield = 0;

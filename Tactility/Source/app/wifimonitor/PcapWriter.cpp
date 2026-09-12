@@ -1,6 +1,11 @@
 #include "PcapWriter.h"
 
 #include <cstring>
+#include <cstdlib>
+
+#ifdef ESP_PLATFORM
+#include <esp_heap_caps.h>
+#endif
 
 namespace tt::app::wifimonitor {
 
@@ -47,10 +52,20 @@ bool PcapWriter::open(const char* path) {
         return false;
     }
 
-    // Buffer the stream in 16 KB chunks: the default small stdio buffer forces a
-    // flash write every few packets, and FATFS/NOR flash writes are far faster in
-    // large batches. This lets the capture writer keep up and cuts drops.
-    setvbuf(file_, nullptr, _IOFBF, 16 * 1024);
+    // Buffer the stream in 64 KB chunks, in PSRAM where there is room, and pass the buffer in
+    // explicitly. The previous call passed nullptr, which lets stdio allocate the buffer from
+    // internal RAM - scarce on this target - and when that allocation fails the stream goes
+    // unbuffered without saying so, pushing every packet's three writes straight to FatFS. Capturing
+    // to PSRAM is also what keeps this from competing with the rest of the system.
+    // FATFS/NOR flash writes are far faster in large batches, so a capture lives or dies on this.
+#ifdef ESP_PLATFORM
+    write_buffer_ = static_cast<char*>(heap_caps_malloc(WRITE_BUFFER_SIZE, MALLOC_CAP_SPIRAM));
+#else
+    write_buffer_ = static_cast<char*>(malloc(WRITE_BUFFER_SIZE));
+#endif
+    if (write_buffer_ != nullptr) {
+        setvbuf(file_, write_buffer_, _IOFBF, WRITE_BUFFER_SIZE);
+    }
 
     // Global header: magic 0xa1b2c3d4 (LE, microsecond), version 2.4, snaplen
     // 65535, link type 127 (IEEE802_11_RADIOTAP).
@@ -129,6 +144,10 @@ void PcapWriter::close() {
         fflush(file_);
         fclose(file_);
         file_ = nullptr;
+    }
+    if (write_buffer_ != nullptr) {
+        free(write_buffer_);
+        write_buffer_ = nullptr;
     }
 }
 
