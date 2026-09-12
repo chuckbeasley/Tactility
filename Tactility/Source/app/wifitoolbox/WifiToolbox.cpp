@@ -460,11 +460,17 @@ static bool startCapture(Context* ctx) {
 }
 
 static void stopCapture(Context* ctx) {
-    joinWriter(ctx);
+    // Stop the producer before waiting for the consumer. The writer's loop only exits once
+    // writerStop is set AND the stream buffer is empty, so joining it while the sniffer is still
+    // filling that buffer never returns on a busy channel: the app task blocks in
+    // thread_join(portMAX_DELAY) and the Stop button appears to do nothing. Setting writerStop here
+    // rather than relying on the caller keeps the function correct on its own.
+    ctx->writerStop = true;
     if (ctx->wifi != nullptr) {
         wifi_set_promiscuous(ctx->wifi, false);
         wifi_set_promiscuous_callback(ctx->wifi, nullptr, nullptr);
     }
+    joinWriter(ctx);
     tt::service::wifi::setAutoScanPaused(false);
 }
 
