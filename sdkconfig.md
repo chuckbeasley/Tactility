@@ -63,6 +63,44 @@ headroom (the web server asks httpd for 6).
 CONFIG_LWIP_MAX_SOCKETS=16
 ```
 
+## Core dumps
+
+A panic is written to flash and can be decoded afterwards, which is the only way to diagnose a
+crash that nobody was watching when it happened. Three things are needed, and the first is the one
+that is easy to miss.
+
+**The component has to be in the build.** The root `CMakeLists.txt` scopes the build with
+`set(COMPONENTS Tactility)`. `espcoredump` is not a dependency of `Tactility`, so it was excluded -
+and excluding a component also excludes its Kconfig, which means `ESP_COREDUMP_ENABLE_TO_FLASH` did
+not merely default to off, it did not exist and could not be turned on from any menu. It is now
+named alongside `Tactility` in that list.
+
+**A coredump partition**, added to `partitions-16mb-no-sd.csv` ahead of `data`, taking 128 KB from
+it. That is more than the dumps need - a single-task dump measured 3232 bytes without
+`CONFIG_ESP_COREDUMP_CAPTURE_DRAM` - but it is space `data` will not miss.
+
+**Pointing dumps at flash:**
+
+```properties
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+# CONFIG_ESP_COREDUMP_ENABLE_TO_NONE is not set
+```
+
+To read the most recent dump:
+
+```shell
+idf.py coredump-info -p COM11
+```
+
+Verified end to end by crashing the device on purpose with a temporary `abort()` in `app_main()`:
+the panic was saved to flash, the checksum was verified on the next boot (`Core dump data checksum
+is correct`, `Found core dump 3232 bytes in flash @ 0x430000`), and `coredump-info` printed the task
+list with backtraces - `Tmr Svc` in `prvTimerTask`, among others. The trigger was removed and the
+partition erased afterwards, so the next dump will be a real one.
+
+A dump survives a reboot but not a flash: flashing rewrites the partition table and the app, and a
+dump only means anything against the ELF that produced it.
+
 ## PSRAM speed
 
 The remote screen mirror's capture pass is bound by PSRAM bandwidth, not by its own

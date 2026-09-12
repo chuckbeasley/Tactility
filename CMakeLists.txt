@@ -33,7 +33,14 @@ if (DEFINED ENV{ESP_IDF_VERSION})
     message("Using ESP-IDF ${Cyan}v$ENV{ESP_IDF_VERSION}${ColorReset}")
     include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
-    set(COMPONENTS Tactility)
+    set(COMPONENTS
+        Tactility
+        # Core dumps. Not a dependency of Tactility, so without naming it here the component is
+        # excluded from the build entirely - which also excludes its Kconfig menu, making
+        # CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH not merely unset but non-existent and therefore
+        # impossible to turn on. It brings its own config menu once it is in the build.
+        espcoredump
+    )
     set(EXTRA_COMPONENT_DIRS
         # Tactility must be discovered first: its CMakeLists.txt calls init_tactility_globals(),
         # which other components' CMakeLists.txt (e.g. lvgl-module) rely on having already run to
