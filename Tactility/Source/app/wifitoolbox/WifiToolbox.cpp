@@ -56,6 +56,14 @@ namespace tt::app::wifitoolbox {
 
 constexpr auto* TAG = "WifiToolbox";
 
+// Diagnostic switch for the capture's cost, left at 0. At 1 the promiscuous callback counts the
+// frame and returns immediately, doing none of this app's work. That separates the two possible
+// reasons the Wi-Fi driver task starves everything below it: if the device still becomes
+// unresponsive with this at 1, the cost is the driver's own per-frame promiscuous handling and no
+// amount of callback optimisation will help; if it stays responsive, the cost is this app's
+// callback and worth cutting further. Flip to 1, rebuild, flash, compare, set back to 0.
+#define WIFITOOLBOX_SNIFFER_COUNT_ONLY 0
+
 // Temporary instrumentation. Internal RAM is nearly exhausted while this app is open - the app logs
 // 44 KB when it starts and the MemoryChecker is warning about 7 KB moments later, before any capture
 // runs - and in that state the Wi-Fi driver floods "m f null" and the station loses its AP. This
@@ -83,7 +91,15 @@ constexpr uint32_t POLL_INTERVAL_MS = 200;
 constexpr size_t STREAM_BUFFER_SIZE = 1024 * 1024;
 constexpr size_t MAX_FRAME_SIZE = 2346;
 constexpr uint32_t INJECT_INTERVAL_MS = 50;
-constexpr size_t INJECT_BURST = 8;
+// Reduced from 8. Each injected frame is one esp_wifi_80211_tx, and the driver holds only a small
+// pool of static TX buffers - eight back-to-back sends every 300 ms exhausted it, which is why the
+// send failed with ERROR_OUT_OF_MEMORY rather than a frame-type rejection. Halving the burst lowers
+// the peak demand without much changing the overall deauth rate. Raising the TX buffer count
+// instead was the other option and is deliberately not taken here: the failure is memory
+// exhaustion, so holding more buffers spends the resource that is short. Worth revisiting though,
+// since static buffers are allocated once at init and are DMA-capable, which fragmentation may not
+// provide later.
+constexpr size_t INJECT_BURST = 4;
 // Cadence for the "deauth to force handshake" elicitation while capturing: a burst of deauth
 // frames, then a short quiet gap so the kicked client can reassociate and emit a fresh EAPOL/PMKID.
 constexpr uint32_t CAPTURE_DEAUTH_INTERVAL_MS = 300;
@@ -328,6 +344,9 @@ static bool looksLikePmkid(const uint8_t* payload, size_t length) {
 static void onPacket(void* context, const uint8_t* payload, size_t length, WifiPromiscuousPacketInfo info) {
     auto* ctx = static_cast<Context*>(context);
     ctx->sniffedCount.fetch_add(1);
+#if WIFITOOLBOX_SNIFFER_COUNT_ONLY
+    return; // Diagnostic: count the frame and do nothing else. See the switch at the top of the file.
+#endif
     ctx->currentChannel.store(info.channel);
 
     if (length >= 22) {
@@ -610,7 +629,7 @@ static void onCaptureDeauthTick(Context* ctx) {
                 if (ctx->deauthTxFail.fetch_add(1) == 0) {
                     // Log the first failure only: this runs in a burst every tick, and one line is
                     // enough to identify the cause without flooding the console.
-                    LOG_W(TAG, "Deauth send failed with error %d", (int)result);
+                    LOG_W(TAG, "Deauth send failed: %s", error_to_string(result));
                 }
                 ctx->deauthTxLastError.store(static_cast<int32_t>(result));
             }
