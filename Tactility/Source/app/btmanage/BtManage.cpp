@@ -33,6 +33,12 @@ constexpr TickType_t EVENT_SUBSCRIBE_RETRY_TICKS = pdMS_TO_TICKS(250);
 // the list and leaves the CPU to everything else.
 constexpr TickType_t VIEW_REFRESH_INTERVAL_TICKS = pdMS_TO_TICKS(100);
 
+// How long a "Connecting..." row may stand before it is given up on. The driver retries a connect
+// every 500 ms and reports its own failure, so this only covers the case where neither a success nor
+// a failure event ever arrives - without it a row would sit saying "Connecting..." indefinitely with
+// no way to tell that nothing is happening.
+constexpr TickType_t CONNECT_TIMEOUT_TICKS = pdMS_TO_TICKS(15000);
+
 static void onBtToggled(void* context, bool requestOn) {
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
     auto* ctx = static_cast<Context*>(context);
@@ -113,6 +119,13 @@ static void onPairPeer(void* context, const std::array<uint8_t, 6>& addr) {
 
     // Clicking an unrecognised scan result initiates a HID host connection.
     // Bond exchange happens automatically during the first connection.
+    if (ctx != nullptr) {
+        // Shown as "Connecting..." on that row until an outcome event arrives. The API cannot be
+        // asked whether a connection is in flight, so the app is the only place that knows it
+        // started, and the events below are the only places that know it ended.
+        ctx->state.beginConnecting(addr);
+        ctx->connecting_since_ticks = xTaskGetTickCount();
+    }
     bluetooth::hidHostConnect(addr);
 
     // This runs on the LVGL task (it is a widget callback), so the view can be redrawn immediately
@@ -168,10 +181,14 @@ void onBtEvent(Context* ctx, const BtEvent& event) {
             ctx->view_dirty = true;
             break;
         case BT_EVENT_PAIR_RESULT:
+            // The outcome of a connection attempt: either way there is nothing in flight any more.
+            ctx->state.endConnecting();
             ctx->paired_peers_dirty = true;
             ctx->view_dirty = true;
             break;
         case BT_EVENT_PROFILE_STATE_CHANGED:
+            // Fires on connect and on disconnect, so it is also an outcome.
+            ctx->state.endConnecting();
             ctx->scan_results_dirty = true;
             ctx->paired_peers_dirty = true;
             ctx->view_dirty = true;
@@ -340,6 +357,15 @@ int32_t appMain(int argc, char* argv[]) {
             while (bluetooth_event_poll(&ctx.btEventSub, &bt_event) == ERROR_NONE) {
                 onBtEvent(&ctx, bt_event);
             }
+        }
+
+        // Give up on a connection that has produced no outcome, so its row stops saying
+        // "Connecting..." and goes back to reporting the peer's signal.
+        if (ctx.state.isConnecting() &&
+            (TickType_t)(xTaskGetTickCount() - ctx.connecting_since_ticks) > CONNECT_TIMEOUT_TICKS) {
+            LOG_W(TAG, "Connect timed out");
+            ctx.state.endConnecting();
+            ctx.view_dirty = true;
         }
 
         // The coalesced half of the event handling: whatever the events marked dirty is read once

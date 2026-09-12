@@ -41,4 +41,29 @@ void State::updatePairedPeers() {
     pairedPeers = std::move(peers);
 }
 
+void State::beginConnecting(const std::array<uint8_t, 6>& addr) {
+    auto lock = mutex.asScopedLock();
+    lock.lock();
+    connectingAddr = addr;
+    connecting = true;
+}
+
+void State::endConnecting() {
+    auto lock = mutex.asScopedLock();
+    lock.lock();
+    connecting = false;
+}
+
+bool State::isConnectingTo(const std::array<uint8_t, 6>& addr) const {
+    auto lock = mutex.asScopedLock();
+    lock.lock();
+    return connecting && connectingAddr == addr;
+}
+
+bool State::isConnecting() const {
+    auto lock = mutex.asScopedLock();
+    lock.lock();
+    return connecting;
+}
+
 } // namespace tt::app::btmanage

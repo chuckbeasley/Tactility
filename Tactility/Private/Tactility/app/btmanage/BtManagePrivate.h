@@ -30,6 +30,10 @@ struct Context {
     // redrawn. Without this, pressing "Stop scan" left the button reading "Stop scan" because
     // nothing asked for a redraw.
     bool view_dirty = false;
+    // When the in-flight connection started, so it can be timed out. Only the app task writes it,
+    // except for onPairPeer() which runs on the LVGL task but sets it at the moment it also sets the
+    // connecting state, before any refresh can look at it.
+    TickType_t connecting_since_ticks = 0;
 
     void lock() { mutex.lock(); }
     void unlock() { mutex.unlock(); }

@@ -88,20 +88,22 @@ void View::onConnect(lv_event_t* event) {
 
     const uintptr_t packed = reinterpret_cast<uintptr_t>(lv_obj_get_user_data(button));
     const bool isPaired = (packed & 1u) != 0;
-    const size_t index = static_cast<size_t>(packed >> 1);
+    const size_t row_key = static_cast<size_t>(packed >> 1);
+
+    // Resolved against the rows that were actually rendered, not against the live scan results: the
+    // list is rebuilt while a scan runs, so looking the peer up by position in the current results
+    // would connect to whatever moved into that slot, or silently do nothing if the list shrank.
+    if (row_key >= self->rowAddresses.size()) {
+        return;
+    }
+    const auto addr = self->rowAddresses[row_key];
 
     if (isPaired) {
         // Open the per-device settings screen for paired devices
-        auto peers = self->state->getPairedPeers();
-        if (index < peers.size()) {
-            btpeersettings::start(bluetooth::settings::addrToHex(peers[index].addr));
-        }
+        btpeersettings::start(bluetooth::settings::addrToHex(addr));
     } else {
         // Unrecognised scan result — initiate pairing
-        auto peers = self->state->getScanResults();
-        if (index < peers.size()) {
-            self->bindings->onPairPeer(self->context, peers[index].addr);
-        }
+        self->bindings->onPairPeer(self->context, addr);
     }
 }
 
@@ -114,25 +116,22 @@ static uint8_t mapRssiToPercentage(int8_t rssi) {
     return static_cast<uint8_t>((float)(90 - abs_rssi) / 60.f * 100.f);
 }
 
-void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired, size_t index) {
-    const auto percentage = mapRssiToPercentage(record.rssi);
-    // A connected HID host reports no RSSI (rssi=0 maps to "100%"), which is misleading. Render a
-    // clear connected marker instead of the percentage so the user can see the live link.
+void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired) {
+    const auto name = record.name.empty()
+        ? std::format("Unknown ({:02x}{:02x}{:02x}{:02x}{:02x}{:02x})",
+            record.addr[0], record.addr[1], record.addr[2],
+            record.addr[3], record.addr[4], record.addr[5])
+        : record.name;
+
+    // A connected HID host reports no RSSI (rssi=0 maps to "100%"), which is misleading, and a peer
+    // mid-connection has no meaningful signal either - show what is actually happening instead.
     std::string label;
-    if (record.connected) {
-        const auto name = record.name.empty()
-            ? std::format("Unknown ({:02x}{:02x}{:02x}{:02x}{:02x}{:02x})",
-                record.addr[0], record.addr[1], record.addr[2],
-                record.addr[3], record.addr[4], record.addr[5])
-            : record.name;
+    if (state->isConnectingTo(record.addr)) {
+        label = std::format("{} {}Connecting...", name, LV_SYMBOL_REFRESH);
+    } else if (record.connected) {
         label = std::format("{} {}Connected", name, LV_SYMBOL_OK);
     } else {
-        label = record.name.empty()
-            ? std::format("Unknown ({:02x}{:02x}{:02x}{:02x}{:02x}{:02x}) {}%",
-                record.addr[0], record.addr[1], record.addr[2],
-                record.addr[3], record.addr[4], record.addr[5],
-                percentage)
-            : std::format("{} {}%", record.name, percentage);
+        label = std::format("{} {}%", name, mapRssiToPercentage(record.rssi));
     }
 
     auto* button = lv_list_add_button(peers_list, nullptr, label.c_str());
@@ -140,9 +139,12 @@ void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired
     lv_obj_set_style_pad_ver(button,
         lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT ? 2 : 4,
         LV_STATE_DEFAULT);
-    // Pack (index, isPaired) into the button's user_data so onConnect() can decode it without a
-    // per-row heap allocation (see onConnect()). See PeerListItemData removal note.
-    lv_obj_set_user_data(button, reinterpret_cast<void*>((index << 1) | (isPaired ? 1u : 0u)));
+    // Pack (row key, isPaired) into the button's user_data so onConnect() can decode it without a
+    // per-row heap allocation. The key indexes rowAddresses, not the live scan results - see the
+    // note on that member.
+    const size_t row_key = rowAddresses.size();
+    rowAddresses.push_back(record.addr);
+    lv_obj_set_user_data(button, reinterpret_cast<void*>((row_key << 1) | (isPaired ? 1u : 0u)));
     lv_obj_add_event_cb(button, onConnect, LV_EVENT_SHORT_CLICKED, nullptr);
 }
 
@@ -229,6 +231,9 @@ void View::updatePeerList() {
     constexpr size_t MAX_VISIBLE_PEERS = 30;
 
     lv_obj_clean(peers_list);
+    // The rendered rows are gone, so the addresses behind them are too. Refilled below, in the same
+    // order the rows are created.
+    rowAddresses.clear();
 
     using enum bluetooth::RadioState;
     if (state->getRadioState() == On) {
@@ -238,7 +243,7 @@ void View::updatePeerList() {
             lv_list_add_text(peers_list, "Paired");
             size_t count = std::min(paired.size(), MAX_VISIBLE_PEERS);
             for (size_t i = 0; i < count; ++i) {
-                createPeerListItem(paired[i], true, i);
+                createPeerListItem(paired[i], true);
             }
         }
 
@@ -248,7 +253,7 @@ void View::updatePeerList() {
         if (!scan_results.empty()) {
             size_t count = std::min(scan_results.size(), MAX_VISIBLE_PEERS);
             for (size_t i = 0; i < count; ++i) {
-                createPeerListItem(scan_results[i], false, i);
+                createPeerListItem(scan_results[i], false);
             }
         } else if (!state->isScanning()) {
             auto* no_devices_label = lv_label_create(peers_list);

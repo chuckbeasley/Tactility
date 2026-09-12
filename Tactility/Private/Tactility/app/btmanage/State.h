@@ -3,6 +3,8 @@
 #include <Tactility/bluetooth/Bluetooth.h>
 #include <Tactility/RecursiveMutex.h>
 
+#include <array>
+
 namespace tt::app::btmanage {
 
 class State final {
@@ -12,6 +14,11 @@ class State final {
     bluetooth::RadioState radioState = bluetooth::RadioState::Off;
     std::vector<bluetooth::PeerRecord> scanResults;
     std::vector<bluetooth::PeerRecord> pairedPeers;
+    // The peer a connection is currently being made to. The Bluetooth API has no state for this: it
+    // reports whether a peer *is* connected (PeerRecord.connected) and not whether one is being
+    // connected to, so the app tracks it from the click until an outcome event arrives.
+    std::array<uint8_t, 6> connectingAddr = {};
+    bool connecting = false;
 
 public:
     State() = default;
@@ -24,6 +31,15 @@ public:
 
     void updateScanResults();
     void updatePairedPeers();
+
+    /** Marks a connection as in flight to `addr`, so the view can show it as pending. */
+    void beginConnecting(const std::array<uint8_t, 6>& addr);
+    /** Clears any in-flight connection, whether it succeeded, failed or timed out. */
+    void endConnecting();
+    /** @return true when a connection to this exact peer is in flight. */
+    bool isConnectingTo(const std::array<uint8_t, 6>& addr) const;
+    /** @return true when any connection is in flight. */
+    bool isConnecting() const;
 
     std::vector<bluetooth::PeerRecord> getScanResults() const {
         auto lock = mutex.asScopedLock();
