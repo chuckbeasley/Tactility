@@ -206,6 +206,10 @@ struct Context {
     char targetBssidText[18] = {0};
     uint8_t targetBssid[6] = {0};
     bool targetBssidKnown = false;
+    // Set once when the deauth tick finds no target, so the log distinguishes "transmitting and
+    // nobody is biting" from "never transmitted at all". Those look identical otherwise, and the
+    // second is what a broadcast deauth that resolves nothing produces.
+    bool deauthIdleLogged = false;
     char deauthClientText[18] = {0};
     uint8_t deauthClient[6] = {0};
     bool deauthClientKnown = false;
@@ -518,9 +522,10 @@ static bool startCapture(Context* ctx) {
     // likely - reaches nobody and looks identical in the log to a deauth never sent at all. The same
     // goes for a locked channel that is not the target's. channel=0 means Auto, where deauth is
     // forced off.
-    LOG_I(TAG, "Config: channel=%u deauth=%s target=%02x:%02x:%02x:%02x:%02x:%02x (%s)",
+    LOG_I(TAG, "Config: channel=%u deauth=%s targetKnown=%s target=%02x:%02x:%02x:%02x:%02x:%02x (%s)",
           (unsigned)ctx->lockChannel,
           ctx->autoDeauth ? "on" : "off",
+          ctx->targetBssidKnown ? "yes" : "NO",
           ctx->targetBssid[0], ctx->targetBssid[1], ctx->targetBssid[2],
           ctx->targetBssid[3], ctx->targetBssid[4], ctx->targetBssid[5],
           ctx->deauthClientKnown ? "directed" : "broadcast");
@@ -618,7 +623,15 @@ static void onCaptureDeauthTick(Context* ctx) {
         ctx->wifi = getWifiDevice();
         if (ctx->wifi == nullptr) return;
     }
-    if (!ctx->targetBssidKnown) return; // need the target AP to deauth against
+    if (!ctx->targetBssidKnown) {
+        // Logged once rather than per tick. Without this the run shows no EAPOL and says nothing
+        // about why, which is the same symptom as transmitting into an empty cell.
+        if (!ctx->deauthIdleLogged) {
+            ctx->deauthIdleLogged = true;
+            LOG_W(TAG, "Deauth idle: no target AP resolved, so nothing is being transmitted");
+        }
+        return;
+    }
     uint8_t frame[MAX_FRAME_SIZE];
     for (size_t n = 0; n < INJECT_BURST; ++n) {
         const size_t len = buildDeauth(frame,
