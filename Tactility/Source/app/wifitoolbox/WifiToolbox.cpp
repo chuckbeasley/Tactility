@@ -1273,7 +1273,10 @@ static void onPollTick(Context* ctx) {
         if (ctx->injecting) {
             statsText = std::format("Injecting... Ch:{}", (unsigned)ctx->currentChannel.load());
         } else {
-            statsText = std::format("All:{} Pkts:{} EAPOL:{} PMKID:{} Deauth:{} Dropped:{} KB:{} Ch:{}",
+            // Two lines rather than one: the single-line form overran the screen width once every
+            // counter had a place on it, and a label that runs off the edge hides the counters at
+            // the end of the line - which are the ones that say whether the capture is working.
+            statsText = std::format("All:{} Pkts:{} EAPOL:{} PMKID:{}\nDeauth:{} Dropped:{} KB:{} Ch:{}",
                 (unsigned)ctx->sniffedCount.load(),
                 (unsigned)ctx->packetCount.load(),
                 (unsigned)ctx->eapolCount.load(),
