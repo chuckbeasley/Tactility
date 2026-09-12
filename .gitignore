@@ -35,3 +35,13 @@ __pycache__
 
 # Device screenshot captures
 /screenshots/
+
+# Local debugging scratch: serial traces, flash logs, linker maps, disassembly and
+# device captures. Anchored to the repo root so real assets elsewhere are unaffected.
+/wrk/
+/serlog.py
+/*.log
+/*.map
+/*.png
+/net80211-disasm.txt
+/patched-libnet80211-c5.a
