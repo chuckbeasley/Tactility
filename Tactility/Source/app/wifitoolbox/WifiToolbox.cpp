@@ -1018,6 +1018,29 @@ static void showCaptureScreen(Context* ctx) {
     lv_dropdown_set_selected(targetDropdown, 0);
     lv_obj_set_width(targetDropdown, LV_PCT(100));
     lv_obj_add_event_cb(targetDropdown, onCaptureTargetChanged, LV_EVENT_VALUE_CHANGED, ctx);
+    // The picker is built from scan results, and this screen is what causes them to be stale or
+    // missing altogether - it never asked for a scan, so the list offered nothing but the connected
+    // AP. Start one on entry, and repopulate the options when the list is about to be shown, by
+    // which time it has usually completed. deauthTargets is replaced in the same step as the
+    // options because the two are indexed together: a mismatch would aim the deauth at the wrong
+    // access point, which is worse than an empty list.
+    if (!service::wifi::isScanning()) {
+        service::wifi::scan();
+    }
+    lv_obj_add_event_cb(targetDropdown, [](lv_event_t* event) {
+        auto* targetCtx = static_cast<Context*>(lv_event_get_user_data(event));
+        auto* dropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
+        targetCtx->deauthTargets = service::wifi::getScanResults();
+        std::string options = "Connected AP";
+        for (const auto& record : targetCtx->deauthTargets) {
+            options += "\n";
+            options += record.ssid;
+        }
+        lv_dropdown_set_options(dropdown, options.c_str());
+        // Back to the connected AP: the indices shift when the scan results change, so keeping the
+        // old index would silently retarget onto a different network.
+        lv_dropdown_set_selected(dropdown, 0);
+    }, LV_EVENT_CLICKED, ctx);
 
     auto* deauthClientTa = lv_textarea_create(ctx->body);
     lv_textarea_set_placeholder_text(deauthClientTa, "Target client MAC (blank = broadcast deauth + capture all)");
