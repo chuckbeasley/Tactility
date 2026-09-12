@@ -249,7 +249,13 @@ extern const ::AppManifest manifest = {
     .id = "tactility.wifimanage",
     .name = "Wi-Fi",
     .category = APP_CATEGORY_SETTINGS,
-    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) }
+    .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
+    .flags = 0,
+    // 16 KB, not the 8 KB default. This screen re-scans on show and builds a list of access
+    // points, holding each SSID in a std::string - the same shape as the other apps in this tree
+    // that needed an explicit depth (BtManage 16 KB, BleToolbox 24 KB, Wi-Fi Toolbox 16 KB), and
+    // the same shape that made Wi-Fi Toolbox fail to open.
+    .stack = { .depth = 4096 }
 };
 
 } // namespace tt::app::wifimanage
