@@ -1504,12 +1504,13 @@ extern const ::AppManifest manifest = {
     .category = APP_CATEGORY_USER,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
     .flags = 0,
-    // 16 KB, not the 8 KB default. This app scans, runs a capture writer thread, and formats
-    // stats strings with std::format on every poll tick; the default depth left these tasks with
-    // under a kilobyte of headroom and the app would die before it ever drew. BtManage needed the
-    // same treatment for the same reason. Deliberately not larger: 32 KB was tried on BtManage and
-    // starved the Bluetooth driver of internal heap.
-    .stack = { .depth = 4096 }
+    // 24 KB, not the 8 KB default. This app builds complex UI, runs a capture writer thread and
+    // formats stats with std::format; at the default depth these tasks ran with under a kilobyte of
+    // headroom, and at 16 KB the exit path still overflowed the stack outright - a captured run died
+    // with "***ERROR*** A stack overflow in task app_9 has been detected" immediately after leaving
+    // the capture screen. 24 KB matches BleToolbox, which is the same shape of app in this tree.
+    // Not larger: 32 KB was tried on BtManage and starved the Bluetooth driver of internal heap.
+    .stack = { .depth = 6144 }
 };
 
 } // namespace tt::app::wifitoolbox
