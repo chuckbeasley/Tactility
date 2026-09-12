@@ -63,6 +63,30 @@ headroom (the web server asks httpd for 6).
 CONFIG_LWIP_MAX_SOCKETS=16
 ```
 
+Two things about this protocol are easy to get wrong, and both cost time here.
+
+**Input is in device pixels; frame regions are not.** `p`/`m`/`r` coordinates go straight to
+`remoteInputPush` with no scaling, so a tap is always in the 480x320 panel space no matter what
+scale the client asked for frames at. The `D`/`J` reply rectangles, by contrast, are in the
+requested scale's space. Driving the UI from a scale-2 client therefore means doubling whatever
+coordinate is read off the returned frame - tapping the frame's own coordinates lands in the
+status bar instead.
+
+**The web server's settings do not live in the settings directory.** A flash rewrites the data
+partition image, so they are wiped, and the server comes back up on defaults with authentication
+*off* - the API then answers any client, with or without credentials. They are restored by
+writing `webserver.properties` into the app's own user-data directory, not
+`/data/tactility/settings`:
+
+```
+/data/tactility/user/app/tactility.webserversettings/webserver.properties
+```
+
+with `webServerAuthEnabled=1`, `webServerUsername`, `webServerPassword`, `webServerPort` and
+`webServerEnabled`, followed by `POST /admin/reboot`. Check it against a protected endpoint:
+with the file in the wrong place `/fs/list` keeps returning 200 to an unauthenticated request.
+`/api/sysinfo` is unauthenticated by design, so it proves nothing either way.
+
 ## Core dumps
 
 A panic is written to flash and can be decoded afterwards, which is the only way to diagnose a
