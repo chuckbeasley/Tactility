@@ -1059,13 +1059,20 @@ static void showNetworkScreen(Context* ctx) {
 // -----------------------------------------------------------------------------
 static void onPollTick(Context* ctx) {
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
-    // Update capture/inject stats.
+    // This runs on the FreeRTOS timer daemon task, not the LVGL task, so every widget call below has
+    // to be made under the LVGL lock: LVGL's invalid-area bookkeeping is not thread-safe, and a
+    // timer callback setting label text while the LVGL task is refreshing corrupts it. That is what
+    // crashed the device - the coredump showed lv_inv_area reached from this function through
+    // prvProcessExpiredTimer, on the Tmr Svc task.
+    //
+    // The text is built first and the labels touched once at the end, so formatting does not extend
+    // the window in which the UI task is held off.
+    std::string statsText;
     if (ctx->statsLabel != nullptr) {
-        std::string text;
         if (ctx->injecting) {
-            text = std::format("Injecting... Ch:{}", (unsigned)ctx->currentChannel.load());
+            statsText = std::format("Injecting... Ch:{}", (unsigned)ctx->currentChannel.load());
         } else {
-            text = std::format("Pkts:{} EAPOL:{} PMKID:{} Deauth:{} Dropped:{} KB:{} Ch:{}",
+            statsText = std::format("Pkts:{} EAPOL:{} PMKID:{} Deauth:{} Dropped:{} KB:{} Ch:{}",
                 (unsigned)ctx->packetCount.load(),
                 (unsigned)ctx->eapolCount.load(),
                 (unsigned)ctx->pmkidCount.load(),
@@ -1073,26 +1080,38 @@ static void onPollTick(Context* ctx) {
                 (unsigned)ctx->droppedCount.load(),
                 (unsigned)(ctx->writer.getBytesWritten() / 1024),
                 (unsigned)ctx->currentChannel.load());
-            if (ctx->autoDeauth && ctx->writerThread != nullptr) text += "  +deauth";
+            if (ctx->autoDeauth && ctx->writerThread != nullptr) statsText += "  +deauth";
         }
-        lv_label_set_text(ctx->statsLabel, text.c_str());
-    }
-    if (ctx->statusLabel != nullptr) {
-        const char* txt = ctx->injecting ? "Injecting"
-            : (ctx->writerThread != nullptr ? "Capturing" : "Stopped");
-        lv_label_set_text(ctx->statusLabel, txt);
-    }
-    if (ctx->startButtonLabel != nullptr) {
-        bool active = ctx->injecting || ctx->writerThread != nullptr;
-        lv_label_set_text(ctx->startButtonLabel, active ? "Stop" : "Start");
     }
 
-    // Publish network scan results once complete.
-    if (ctx->netRunning.load() == false && ctx->netDone && ctx->resultLabel != nullptr) {
-        std::string text = std::format("{}found {}\n{}", "",
-            (unsigned)ctx->netFound.load(), ctx->netResult);
-        lv_label_set_text(ctx->resultLabel, text.c_str());
-        ctx->netDone = false;
+    const char* statusText = ctx->injecting ? "Injecting"
+        : (ctx->writerThread != nullptr ? "Capturing" : "Stopped");
+    const char* startText = (ctx->injecting || ctx->writerThread != nullptr) ? "Stop" : "Start";
+
+    // Publish network scan results once complete. netDone is only cleared once the label has
+    // actually been set, so a failed lock leaves the result to be published on the next tick rather
+    // than dropping it.
+    std::string resultText;
+    bool publishResult = (ctx->netRunning.load() == false) && ctx->netDone && (ctx->resultLabel != nullptr);
+    if (publishResult) {
+        resultText = std::format("{}found {}\n{}", "", (unsigned)ctx->netFound.load(), ctx->netResult);
+    }
+
+    if (lvgl_try_lock(pdMS_TO_TICKS(100))) {
+        if (ctx->statsLabel != nullptr && !statsText.empty()) {
+            lv_label_set_text(ctx->statsLabel, statsText.c_str());
+        }
+        if (ctx->statusLabel != nullptr) {
+            lv_label_set_text(ctx->statusLabel, statusText);
+        }
+        if (ctx->startButtonLabel != nullptr) {
+            lv_label_set_text(ctx->startButtonLabel, startText);
+        }
+        if (publishResult) {
+            lv_label_set_text(ctx->resultLabel, resultText.c_str());
+            ctx->netDone = false;
+        }
+        lvgl_unlock();
     }
 #endif
 }
