@@ -101,6 +101,28 @@ partition erased afterwards, so the next dump will be a real one.
 A dump survives a reboot but not a flash: flashing rewrites the partition table and the app, and a
 dump only means anything against the ELF that produced it.
 
+## A hang, and why the watchdog has to panic
+
+A core dump is only written by the panic handler, so it captures crashes and nothing else. The
+failures reported against the Bluetooth app have been a mix of the two: some produced a dump and
+were diagnosed exactly from it, and some left the device unreachable with an empty coredump
+partition, which is a hang - a task spinning, or two tasks deadlocked - and leaves no trace at all.
+
+`CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0` is on, so a task that saturates the CPU starves the idle
+task and the watchdog notices. With the default setting it only *prints*, which is no use to anyone
+who was not watching the console at the time. Making it panic turns that case into a crash, and a
+crash into a dump:
+
+```properties
+CONFIG_ESP_TASK_WDT_PANIC=y
+```
+
+The trade is that an overloaded device now reboots instead of freezing, which is usually the better
+of the two anyway. What it does *not* catch is a deadlock: if every task is blocked on a lock the
+other holds, the idle task keeps running, the watchdog never trips, and neither a dump nor a
+watchdog message will appear. A hang that leaves no dump and no watchdog message is that case, and
+it needs the console attached while it happens.
+
 ## PSRAM speed
 
 The remote screen mirror's capture pass is bound by PSRAM bandwidth, not by its own

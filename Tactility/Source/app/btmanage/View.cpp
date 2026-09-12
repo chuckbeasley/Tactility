@@ -341,8 +341,23 @@ void View::init(void* newContext, lv_obj_t* parent) {
 
     // A rebuild deferred by the throttle (or by an in-progress touch) needs something to
     // flush it: the BT event that requested it may well have been the last one.
+    //
+    // Taken under the context lock, because the app task also rebuilds this list - through
+    // requestViewUpdate(), which holds that lock (and the LVGL lock) while it does. This timer runs
+    // on the LVGL task and would otherwise rebuild concurrently, and a rebuild writes rowAddresses:
+    // two tasks resizing the same std::vector while a click reads it is exactly the kind of race
+    // that produces a crash or a lock-up with no pattern to it. The lock is not held inside
+    // View::update() itself, so the callers that already hold it do not deadlock on a re-take.
     rebuild_timer = lv_timer_create([](lv_timer_t* timer) {
-        static_cast<View*>(lv_timer_get_user_data(timer))->update();
+        auto* view = static_cast<View*>(lv_timer_get_user_data(timer));
+        auto* ctx = static_cast<Context*>(view->context);
+        if (ctx != nullptr) {
+            ctx->lock();
+        }
+        view->update();
+        if (ctx != nullptr) {
+            ctx->unlock();
+        }
     }, LIST_REBUILD_INTERVAL_MS, this);
     lv_obj_add_event_cb(parent, [](lv_event_t* e) {
         auto* view = static_cast<View*>(lv_event_get_user_data(e));
