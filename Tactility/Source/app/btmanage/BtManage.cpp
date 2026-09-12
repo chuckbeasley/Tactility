@@ -89,7 +89,9 @@ static void onDisconnectPeer(const std::array<uint8_t, 6>& addr, int profileId) 
     bluetooth::disconnect(addr, profileId);
 }
 
-static void onPairPeer(void* /*context*/, const std::array<uint8_t, 6>& addr) {
+static void onPairPeer(void* context, const std::array<uint8_t, 6>& addr) {
+    auto* ctx = static_cast<Context*>(context);
+
     // Clicking a device means the user has picked one, so stop looking for others first. A scan
     // holds the radio in a duty cycle that competes with the connection it is trying to make, and
     // it also keeps rebuilding the list underneath the click.
@@ -98,6 +100,13 @@ static void onPairPeer(void* /*context*/, const std::array<uint8_t, 6>& addr) {
         if (bluetooth_is_scanning(dev)) {
             LOG_I(TAG, "Stopping scan to connect");
             bluetooth_scan_stop(dev);
+            // The app's own flag is what shows the toolbar's scanning spinner, and it only changes
+            // on BT_EVENT_SCAN_FINISHED - which the driver need not send for a scan stopped on
+            // request rather than one that ran its course. Setting it here is harmless if the event
+            // does arrive, and without it the spinner kept turning over a scan that had stopped.
+            if (ctx != nullptr) {
+                ctx->state.setScanning(false);
+            }
         }
         device_put(dev);
     }
@@ -105,6 +114,13 @@ static void onPairPeer(void* /*context*/, const std::array<uint8_t, 6>& addr) {
     // Clicking an unrecognised scan result initiates a HID host connection.
     // Bond exchange happens automatically during the first connection.
     bluetooth::hidHostConnect(addr);
+
+    // This runs on the LVGL task (it is a widget callback), so the view can be redrawn immediately
+    // rather than waiting for the app loop's coalesced refresh - the same reason onBtToggled() does
+    // this. It is what makes the spinner disappear as soon as the row is clicked.
+    if (ctx != nullptr) {
+        requestViewUpdate(ctx);
+    }
 }
 
 static void onForgetPeer(const std::array<uint8_t, 6>& addr) {
