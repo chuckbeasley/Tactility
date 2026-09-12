@@ -119,18 +119,26 @@ if (DEFINED ENV{ESP_IDF_VERSION})
     # (a no-op once the byte is already 0x0c), so this is safe on every build.
     if(CONFIG_IDF_TARGET STREQUAL "esp32c5")
         set(TT_DEAUTH_PATCH_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/Tactility/Source/app/wifitoolbox/patch_deauth_libnet.py")
-        if(EXISTS "${TT_DEAUTH_PATCH_SCRIPT}")
-            find_package(Python3 COMPONENTS Interpreter QUIET)
-            if(Python3_EXECUTABLE)
-                add_custom_target(tactility_deauth_patch
-                    COMMAND ${Python3_EXECUTABLE} "${TT_DEAUTH_PATCH_SCRIPT}"
-                    VERBATIM
-                    USES_TERMINAL
-                    COMMENT "Patching ESP32-C5 libnet80211.a for deauth injection"
-                )
-                add_dependencies(Tactility.elf tactility_deauth_patch)
-            endif()
+        if(NOT EXISTS "${TT_DEAUTH_PATCH_SCRIPT}")
+            message(FATAL_ERROR "Deauth patch script is missing: ${TT_DEAUTH_PATCH_SCRIPT}. "
+                "Without it libnet80211 rejects deauth frames ('unsupport frame type: 0c0') and "
+                "the Wi-Fi Toolbox's deauth silently does not transmit.")
         endif()
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(NOT Python3_EXECUTABLE)
+            # This used to fall through silently, which produced a firmware with no deauth at all
+            # while the UI still offered the feature. Failing loudly is the only way to be sure the
+            # patch is in the binary, so it is deliberate that this stops the build.
+            message(FATAL_ERROR "esp32c5 needs patch_deauth_libnet.py to run, but no Python3 "
+                "interpreter was found. Install Python3 or set Python3_EXECUTABLE.")
+        endif()
+        add_custom_target(tactility_deauth_patch
+            COMMAND ${Python3_EXECUTABLE} "${TT_DEAUTH_PATCH_SCRIPT}"
+            VERBATIM
+            USES_TERMINAL
+            COMMENT "Patching ESP32-C5 libnet80211.a for deauth injection"
+        )
+        add_dependencies(Tactility.elf tactility_deauth_patch)
     endif()
 endif ()
 
