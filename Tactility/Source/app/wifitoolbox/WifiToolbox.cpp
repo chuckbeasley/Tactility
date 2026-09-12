@@ -1,5 +1,6 @@
 #ifdef ESP_PLATFORM
 #include <sdkconfig.h>
+#include <esp_heap_caps.h>
 #endif
 
 #include <Tactility/DeprecatedPaths.h>
@@ -53,6 +54,21 @@
 namespace tt::app::wifitoolbox {
 
 constexpr auto* TAG = "WifiToolbox";
+
+// Temporary instrumentation. Internal RAM is nearly exhausted while this app is open - the app logs
+// 44 KB when it starts and the MemoryChecker is warning about 7 KB moments later, before any capture
+// runs - and in that state the Wi-Fi driver floods "m f null" and the station loses its AP. This
+// prints the internal heap at each step of building the UI so the missing tens of kilobytes get a
+// name. Remove once the consumer is identified and fixed.
+static void logHeap(const char* step) {
+#if defined(ESP_PLATFORM)
+    LOG_I(TAG, "[heap] %-30s free=%u largest=%u", step,
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+#else
+    (void)step;
+#endif
+}
 
 extern const ::AppManifest manifest;
 
@@ -821,6 +837,7 @@ static void onGoProbe(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(
 static void onGoSleep(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Sleep); }
 
 static void showMainScreen(Context* ctx) {
+    logHeap("showMainScreen enter");
     addMenuButton(ctx, "PMKID / EAPOL Capture", onGoCapture);
     addMenuButton(ctx, "Beacon Spam", onGoBeacon);
     addMenuButton(ctx, "Probe Flood", onGoProbe);
@@ -944,6 +961,7 @@ static void onCaptureDeauthToggled(lv_event_t* event) {
 }
 
 static void showCaptureScreen(Context* ctx) {
+    logHeap("showCaptureScreen enter");
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, "Captures 802.11 EAPOL/PMKID to PCAP.");
     ctx->statusLabel = lv_label_create(ctx->body);
@@ -1065,6 +1083,7 @@ static void onInjectClientMacChanged(lv_event_t* event) {
 }
 
 static void showInjectScreen(Context* ctx) {
+    logHeap("showInjectScreen enter");
     const char* modeText = ctx->injectMode == InjectMode::Beacon ? "Beacon Spam"
         : (ctx->injectMode == InjectMode::Probe ? "Probe Flood" : "Association Sleep");
     auto* label = lv_label_create(ctx->body);
@@ -1140,6 +1159,7 @@ static void onNetTargetChanged(lv_event_t* event) {
 }
 
 static void showNetworkScreen(Context* ctx) {
+    logHeap("showNetworkScreen enter");
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, "WiFi + Net utilities (needs a connection).");
 
@@ -1244,6 +1264,7 @@ static void onPollTick(Context* ctx) {
 // App entry
 // -----------------------------------------------------------------------------
 void createWidgets(lv_obj_t* parent, void* userData) {
+    logHeap("createWidgets enter");
     auto* ctx = static_cast<Context*>(userData);
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
