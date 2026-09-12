@@ -1359,8 +1359,15 @@ static void onPollTick(Context* ctx) {
         }
     }
 
+    // A stop in progress has to look different from a running capture. Disabling the sniffer stops
+    // new frames, but the writer still has the whole ring buffer to flush to the file, and on a busy
+    // channel that took 75 seconds - during which the old text still claimed "Capturing" and the app
+    // looked frozen. This runs on the timer task, which is not the task blocked in the join, so the
+    // text keeps updating while the flush happens.
+    const bool finishing = ctx->writerThread != nullptr && ctx->writerStop.load();
     const char* statusText = ctx->injecting ? "Injecting"
-        : (ctx->writerThread != nullptr ? "Capturing" : "Stopped");
+        : (ctx->writerThread == nullptr ? "Stopped"
+        : (finishing ? "Finishing (writing file)..." : "Capturing"));
     const char* startText = (ctx->injecting || ctx->writerThread != nullptr) ? "Stop" : "Start";
 
     // Publish network scan results once complete. netDone is only cleared once the label has
