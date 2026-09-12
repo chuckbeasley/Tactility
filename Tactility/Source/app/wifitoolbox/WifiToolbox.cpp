@@ -1,6 +1,7 @@
 #ifdef ESP_PLATFORM
 #include <sdkconfig.h>
 #include <esp_heap_caps.h>
+#include <freertos/ringbuf.h>
 #endif
 
 #include <Tactility/DeprecatedPaths.h>
@@ -143,8 +144,14 @@ struct Context {
     std::atomic<uint32_t> droppedCount{0};
 
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
-    StreamBufferHandle_t streamBuffer = nullptr;
-    uint8_t* streamBufferStorage = nullptr;
+    // Frames pass from the Wi-Fi task to the writer through a ring buffer rather than a stream
+    // buffer. A stream buffer needs the record and its payload contiguous, which forced a copy into
+    // a scratch buffer on top of the copy the buffer itself makes: two copies of every frame, made
+    // in the highest-priority task on the chip, which is what starved the idle task and rebooted the
+    // device. A ring buffer hands out a slot to write into, so the payload is copied exactly once on
+    // the way in, and the consumer reads it in place instead of copying it out. Items are also
+    // atomic, so a short read cannot desynchronise the stream the way it could before.
+    RingbufHandle_t ringBuffer = nullptr;
     ::Thread* writerThread = nullptr;
     tt::app::wifimonitor::PcapWriter writer;
     // Every frame the sniffer hands us, before any filtering. Without this there is no way to tell
@@ -364,7 +371,18 @@ static void onPacket(void* context, const uint8_t* payload, size_t length, WifiP
     }
 
     int64_t now_us = esp_timer_get_time();
-    auto* record = reinterpret_cast<CaptureRecord*>(s_scratch);
+
+    // Copy the frame exactly once, straight into a slot in the ring buffer. This runs in the Wi-Fi
+    // task, so the less done here the better: xRingbufferSendAcquire hands back contiguous space to
+    // fill, which avoids the second copy a stream buffer makes when it sends.
+    const size_t total = sizeof(CaptureRecord) + length;
+    void* slot = nullptr;
+    if (xRingbufferSendAcquire(ctx->ringBuffer, &slot, total, 0) != pdTRUE) {
+        ctx->droppedCount.fetch_add(1);
+        return;
+    }
+
+    auto* record = static_cast<CaptureRecord*>(slot);
     record->length = static_cast<uint32_t>(length);
     record->ts_sec = static_cast<uint32_t>(now_us / 1000000);
     record->ts_usec = static_cast<uint32_t>(now_us % 1000000);
@@ -372,15 +390,10 @@ static void onPacket(void* context, const uint8_t* payload, size_t length, WifiP
     record->channel = info.channel;
     record->type = static_cast<uint8_t>(info.type);
     record->reserved = 0;
-    std::memcpy(s_scratch + sizeof(CaptureRecord), payload, length);
+    std::memcpy(static_cast<uint8_t*>(slot) + sizeof(CaptureRecord), payload, length);
 
-    size_t total = sizeof(CaptureRecord) + length;
-    if (xStreamBufferSpacesAvailable(ctx->streamBuffer) >= total) {
-        xStreamBufferSend(ctx->streamBuffer, s_scratch, total, 0);
-        ctx->packetCount.fetch_add(1);
-    } else {
-        ctx->droppedCount.fetch_add(1);
-    }
+    xRingbufferSendComplete(ctx->ringBuffer, slot);
+    ctx->packetCount.fetch_add(1);
 }
 
 static int32_t captureWriterMain(void* context) {
@@ -394,35 +407,33 @@ static int32_t captureWriterMain(void* context) {
 
     // Counts loop iterations, so the loop can hand the CPU back periodically. See the delay below.
     size_t packetsSinceYield = 0;
-    while (!ctx->writerStop.load() || xStreamBufferBytesAvailable(ctx->streamBuffer) > 0) {
-        // Yield on every path through this loop, not only after a successful write. The receive can
-        // return short, and the previous code continued on that path without ever blocking - so a
-        // sustained mismatch spun here at full speed and starved the idle task. The watchdog reported
-        // exactly that: IDLE did not reset it, with this task named as running, then a software
-        // reset. taskYIELD would not help, because it never yields down to IDLE.
+    for (;;) {
+        // Hand the CPU back regularly: a task that never blocks starves IDLE, and this one did
+        // exactly that before the delay was added.
         if (++packetsSinceYield >= 64) {
             packetsSinceYield = 0;
             vTaskDelay(1);
         }
 
-        CaptureRecord record;
-        size_t got = xStreamBufferReceive(ctx->streamBuffer, &record, sizeof(record), pdMS_TO_TICKS(100));
-        if (got != sizeof(record)) continue;
-
-        uint8_t payload[MAX_FRAME_SIZE];
-        size_t plen = record.length > MAX_FRAME_SIZE ? MAX_FRAME_SIZE : record.length;
-        // Accumulate instead of assuming one read returns the whole payload. A stream buffer returns
-        // only what is available, and discarding a short read would also throw away the bytes already
-        // taken - leaving the stream misaligned so that every later read is garbage.
-        size_t have = 0;
-        while (have < plen) {
-            const size_t n = xStreamBufferReceive(ctx->streamBuffer, payload + have, plen - have, pdMS_TO_TICKS(100));
-            if (n == 0) break;
-            have += n;
+        // Wait while running; once stopping, take only what is already queued so the loop can end.
+        const TickType_t wait = ctx->writerStop.load() ? 0 : pdMS_TO_TICKS(100);
+        size_t itemSize = 0;
+        void* item = xRingbufferReceive(ctx->ringBuffer, &itemSize, wait);
+        if (item == nullptr) {
+            if (ctx->writerStop.load()) break;
+            continue;
         }
-        if (have != plen) continue;
 
-        ctx->writer.writePacket(record.ts_sec, record.ts_usec, payload, plen, record.rssi, record.channel);
+        if (itemSize > sizeof(CaptureRecord)) {
+            // Read the frame in place. A ring buffer item is contiguous and complete, so there is no
+            // payload copy on this side and no way for a short read to leave things misaligned.
+            const auto* record = static_cast<const CaptureRecord*>(item);
+            const auto* payload = static_cast<const uint8_t*>(item) + sizeof(CaptureRecord);
+            size_t plen = itemSize - sizeof(CaptureRecord);
+            if (plen > MAX_FRAME_SIZE) plen = MAX_FRAME_SIZE;
+            ctx->writer.writePacket(record->ts_sec, record->ts_usec, payload, plen, record->rssi, record->channel);
+        }
+        vRingbufferReturnItem(ctx->ringBuffer, item);
     }
     ctx->writer.close();
     LOG_I(TAG, "Capture stopped");
@@ -438,7 +449,7 @@ static void joinWriter(Context* ctx) {
 }
 
 static bool startCapture(Context* ctx) {
-    if (ctx->streamBuffer == nullptr) {
+    if (ctx->ringBuffer == nullptr) {
         LOG_E(TAG, "Stream buffer not allocated");
         return false;
     }
@@ -1379,10 +1390,8 @@ int32_t appMain(int argc, char* argv[]) {
     ctx.appInstanceId = appInstanceId;
 
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
-    ctx.streamBufferStorage = static_cast<uint8_t*>(heap_caps_malloc(STREAM_BUFFER_SIZE, MALLOC_CAP_SPIRAM));
-    if (ctx.streamBufferStorage != nullptr) {
-        ctx.streamBuffer = xStreamBufferCreateStatic(STREAM_BUFFER_SIZE, 1, ctx.streamBufferStorage, &s_streamBufferStruct);
-    }
+    // In PSRAM: the capture path should not compete with the rest of the system for internal RAM.
+    ctx.ringBuffer = xRingbufferCreateWithCaps(STREAM_BUFFER_SIZE, RINGBUF_TYPE_NOSPLIT, MALLOC_CAP_SPIRAM);
 #endif
 
     ctx.pollTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(POLL_INTERVAL_MS), [&ctx] {
@@ -1434,10 +1443,9 @@ int32_t appMain(int argc, char* argv[]) {
     task_event_group_destruct(&event_group);
 
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
-    if (ctx.streamBufferStorage != nullptr) {
-        heap_caps_free(ctx.streamBufferStorage);
-        ctx.streamBufferStorage = nullptr;
-        ctx.streamBuffer = nullptr;
+    if (ctx.ringBuffer != nullptr) {
+        vRingbufferDeleteWithCaps(ctx.ringBuffer);
+        ctx.ringBuffer = nullptr;
     }
 #endif
     return 0;

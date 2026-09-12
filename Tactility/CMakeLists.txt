@@ -139,6 +139,10 @@ separate_arguments(DEVICE_DEPENDENCIES UNIX_COMMAND "${DEVICE_DEPENDENCIES}")
 # create a dependency cycle. They only apply to the Tactility target itself once it's built as the
 # final executable (both platforms), never to a library consumer like TactilityTests.
 set(TACTILITY_REQUIRES_LIST ${REQUIRES_LIST})
+# Ring buffers, used by the Wi-Fi Toolbox capture path to hand frames to its writer without copying
+# them twice. Naming it in the root COMPONENTS list is not enough on its own: the include path only
+# propagates to components that declare the dependency.
+list(APPEND TACTILITY_REQUIRES_LIST esp_ringbuf)
 foreach(dts_dependency IN LISTS DEVICE_DEPENDENCIES)
     message("Adding DTS dependency ${dts_dependency}")
     list(APPEND TACTILITY_REQUIRES_LIST ${dts_dependency})

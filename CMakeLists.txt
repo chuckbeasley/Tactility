@@ -40,6 +40,10 @@ if (DEFINED ENV{ESP_IDF_VERSION})
         # CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH not merely unset but non-existent and therefore
         # impossible to turn on. It brings its own config menu once it is in the build.
         espcoredump
+        # Ring buffers, for the Wi-Fi Toolbox capture path. Same scoping trap as espcoredump: the
+        # header lives behind this component, so without naming it here freertos/ringbuf.h does not
+        # exist and the capture cannot hand frames to its writer without copying them twice.
+        esp_ringbuf
     )
     set(EXTRA_COMPONENT_DIRS
         # Tactility must be discovered first: its CMakeLists.txt calls init_tactility_globals(),
