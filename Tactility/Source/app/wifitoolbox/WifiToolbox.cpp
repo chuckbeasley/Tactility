@@ -1012,10 +1012,17 @@ static void onCaptureDeauthToggled(lv_event_t* event) {
         ctx->autoDeauth = false;
         lv_obj_remove_state(sw, LV_STATE_CHECKED);
     }
-    // Only the connected-AP target is resolved here; a picked AP already carries its own BSSID and
-    // must not be overwritten by the association.
-    if (ctx->autoDeauth && ctx->deauthTargetIsConnection && !resolveDeauthTargetFromConnection(ctx)) {
-        LOG_W(TAG, "Deauth has no connected AP to target; refusing to enable");
+    // Refresh the target from the association when it can still be read, but do not require it.
+    // Locking a channel moves the radio off its AP, so by the time this is switched on the station
+    // may already be disassociated - and refusing then would block the deauth in precisely the
+    // configuration that needs it. The BSSID is resolved when the capture screen opens, while the
+    // station is still associated, and kept from then on; only having no target at all, ever, is a
+    // reason to refuse.
+    if (ctx->autoDeauth && ctx->deauthTargetIsConnection) {
+        resolveDeauthTargetFromConnection(ctx);
+    }
+    if (ctx->autoDeauth && !ctx->targetBssidKnown) {
+        LOG_W(TAG, "Deauth has no target AP: connect once, or pick one from the target list");
         ctx->autoDeauth = false;
         lv_obj_remove_state(sw, LV_STATE_CHECKED);
     }
@@ -1086,6 +1093,12 @@ static void showCaptureScreen(Context* ctx) {
     // which time it has usually completed. deauthTargets is replaced in the same step as the
     // options because the two are indexed together: a mismatch would aim the deauth at the wrong
     // access point, which is worse than an empty list.
+    // Resolve the connected AP's BSSID now, while the station is still most likely associated. The
+    // channel lock can move the radio off its AP, and once that has happened the association cannot
+    // be read back - so this is the moment where the picker's default target is obtainable, and it
+    // is kept from here on. Resolving it later, at the moment the deauth is switched on, was too
+    // late in exactly the case the deauth exists for.
+    resolveDeauthTargetFromConnection(ctx);
     if (!service::wifi::isScanning()) {
         service::wifi::scan();
     }
