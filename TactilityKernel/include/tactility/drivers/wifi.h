@@ -37,6 +37,9 @@ struct WifiApRecord {
     int8_t rssi;
     int32_t channel;
     enum WifiAuthenticationType authentication_type;
+    // Carried so a scanned network can be addressed directly - deauth and handshake capture both
+    // need to name an access point, and until now a scan could only offer its SSID.
+    uint8_t bssid[6];
 };
 
 enum WifiRadioState {

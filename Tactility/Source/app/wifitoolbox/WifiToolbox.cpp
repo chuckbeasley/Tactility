@@ -154,6 +154,12 @@ struct Context {
     // and Auto are mutually exclusive: injected frames go out on whatever channel the hop currently
     // sits on, so on Auto they mostly miss the target and the feature silently does nothing.
     lv_obj_t* deauthSwitch = nullptr;
+    // Scan records behind the target-AP picker, so the chosen row maps back to its BSSID. The
+    // dropdown's first entry is the connected AP and has no record here.
+    std::vector<WifiApRecord> deauthTargets;
+    // True while the target is "the AP this device is connected to", which is the default and the
+    // only case taken from the association rather than from a picked scan record.
+    bool deauthTargetIsConnection = true;
     InjectMode injectMode = InjectMode::Beacon;
     bool funnySsids = true;
     size_t funnyIndex = 0;
@@ -885,6 +891,31 @@ static bool resolveDeauthTargetFromConnection(Context* ctx) {
     return true;
 }
 
+// Maps the target-AP picker onto targetBssid. Entry 0 means "the AP this device is connected to",
+// which comes from the association; any other entry takes the BSSID from the scan record, so a
+// neighbouring network on the same channel can be addressed without typing a MAC by hand.
+static void onCaptureTargetChanged(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    auto* dropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    const uint32_t index = lv_dropdown_get_selected(dropdown);
+
+    if (index == 0) {
+        ctx->deauthTargetIsConnection = true;
+        ctx->targetBssidKnown = false;
+        resolveDeauthTargetFromConnection(ctx);
+        return;
+    }
+
+    ctx->deauthTargetIsConnection = false;
+    const size_t record_index = index - 1;
+    if (record_index >= ctx->deauthTargets.size()) {
+        ctx->targetBssidKnown = false;
+        return;
+    }
+    std::memcpy(ctx->targetBssid, ctx->deauthTargets[record_index].bssid, 6);
+    ctx->targetBssidKnown = true;
+}
+
 static void onCaptureDeauthToggled(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
     auto* sw = static_cast<lv_obj_t*>(lv_event_get_target(event));
@@ -896,8 +927,9 @@ static void onCaptureDeauthToggled(lv_event_t* event) {
         ctx->autoDeauth = false;
         lv_obj_remove_state(sw, LV_STATE_CHECKED);
     }
-    // Same reasoning for the target: without an association there is no AP to deauth against.
-    if (ctx->autoDeauth && !resolveDeauthTargetFromConnection(ctx)) {
+    // Only the connected-AP target is resolved here; a picked AP already carries its own BSSID and
+    // must not be overwritten by the association.
+    if (ctx->autoDeauth && ctx->deauthTargetIsConnection && !resolveDeauthTargetFromConnection(ctx)) {
         LOG_W(TAG, "Deauth has no connected AP to target; refusing to enable");
         ctx->autoDeauth = false;
         lv_obj_remove_state(sw, LV_STATE_CHECKED);
@@ -947,14 +979,21 @@ static void showCaptureScreen(Context* ctx) {
     lv_obj_add_event_cb(deauthSwitch, onCaptureDeauthToggled, LV_EVENT_VALUE_CHANGED, ctx);
     ctx->deauthSwitch = deauthSwitch;
 
-    // No BSSID field. The deauth target is the access point this device is connected to, read from
-    // the connection when the switch is enabled. The association is authoritative and cannot drift
-    // while it holds, whereas an address learned from received frames is only whichever cell was
-    // heard most recently - which, on a channel shared with other networks, is not necessarily the
-    // one being attacked. Only the client MAC is supplied by hand.
-    auto* deauthTargetLabel = lv_label_create(ctx->body);
-    lv_label_set_text(deauthTargetLabel, "Targets the AP this device is connected to");
-    lv_obj_set_style_text_opa(deauthTargetLabel, LV_OPA_70, LV_STATE_DEFAULT);
+    // Target AP picker. The default is the AP this device is connected to, whose BSSID comes from
+    // the association - authoritative, and unable to drift while it holds. Any other entry takes its
+    // BSSID from the scan record, which is what lets a neighbouring network on the same channel be
+    // addressed. Either way no MAC is typed by hand; only the client MAC below is.
+    ctx->deauthTargets = service::wifi::getScanResults();
+    auto* targetDropdown = lv_dropdown_create(ctx->body);
+    std::string targetOptions = "Connected AP";
+    for (const auto& record : ctx->deauthTargets) {
+        targetOptions += "\n";
+        targetOptions += record.ssid;
+    }
+    lv_dropdown_set_options(targetDropdown, targetOptions.c_str());
+    lv_dropdown_set_selected(targetDropdown, 0);
+    lv_obj_set_width(targetDropdown, LV_PCT(100));
+    lv_obj_add_event_cb(targetDropdown, onCaptureTargetChanged, LV_EVENT_VALUE_CHANGED, ctx);
 
     auto* deauthClientTa = lv_textarea_create(ctx->body);
     lv_textarea_set_placeholder_text(deauthClientTa, "Target client MAC (blank = broadcast deauth + capture all)");

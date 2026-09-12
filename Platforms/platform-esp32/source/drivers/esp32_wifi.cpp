@@ -424,6 +424,7 @@ error_t api_get_scan_results(Device* device, WifiApRecord* results, size_t* num_
         memcpy(dst.ssid, src.ssid, std::min(sizeof(dst.ssid) - 1, sizeof(src.ssid)));
         dst.rssi = src.rssi;
         dst.channel = src.primary;
+        memcpy(dst.bssid, src.bssid, sizeof(dst.bssid));
         dst.authentication_type = to_wifi_authentication_type(src.authmode);
     }
     *num_results = count;
