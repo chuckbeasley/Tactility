@@ -87,10 +87,13 @@ static const char* injectModeName(InjectMode mode) {
     switch (mode) {
         case InjectMode::Beacon: return "Beacon Spam";
         case InjectMode::Probe: return "Probe Flood";
-        case InjectMode::Sleep: return "Association Sleep (deauth)";
+        // Named for what it builds. It was "Association Sleep", which it never was - it sends a
+        // deauth - and that name now belongs to the listen-interval technique below, which is the
+        // one that actually makes an AP treat a station as asleep.
+        case InjectMode::Sleep: return "Deauth Burst (targeted)";
         case InjectMode::AuthFlood: return "Auth Flood";
         case InjectMode::AssocFlood: return "Assoc Request Flood";
-        case InjectMode::AssocSleep: return "Assoc Spoof (listen interval)";
+        case InjectMode::AssocSleep: return "Association Sleep (listen interval)";
         case InjectMode::Karma: return "Karma (probe response)";
         case InjectMode::Disassoc: return "Disassociation";
         case InjectMode::ClientDeauth: return "Client to AP Deauth";
@@ -1137,15 +1140,18 @@ static void setInjectModeAndGo(Context* ctx, InjectMode mode) {
     ctx->injectMode = mode;
     ShowScreen(ctx, Screen::Inject);
 }
-static void onGoBeacon(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Beacon); }
-static void onGoProbe(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Probe); }
-static void onGoSleep(lv_event_t* e) { setInjectModeAndGo(static_cast<Context*>(lv_event_get_user_data(e)), InjectMode::Sleep); }
+// One entry point for all ten injection modes. The main menu used to carry three of them as separate
+// buttons, which was the only way to choose a mode when there was no dropdown - and once the dropdown
+// existed those three were simply doors into the same screen, with three names appearing in both
+// places. The mode is chosen on the screen itself now, and the last choice is kept.
+static void onGoInject(lv_event_t* e) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(e));
+    setInjectModeAndGo(ctx, ctx->injectMode);
+}
 
 static void showMainScreen(Context* ctx) {
     addMenuButton(ctx, "PMKID / EAPOL Capture", onGoCapture);
-    addMenuButton(ctx, "Beacon Spam", onGoBeacon);
-    addMenuButton(ctx, "Probe Flood", onGoProbe);
-    addMenuButton(ctx, "Association Sleep", onGoSleep);
+    addMenuButton(ctx, "Frame Injection", onGoInject);
     addMenuButton(ctx, "WiFi + Net Utilities", onGoNetwork);
 }
 
