@@ -776,7 +776,14 @@ bool WebServerService::startServer() {
         settings.webServerPort,
         "0.0.0.0",
         handlers,
-        8192  // Stack size
+        // HTTP handlers run on this task, and /api/screenshot renders the entire widget tree on it
+        // through lv_snapshot_take - recursively, one level of the tree per stack frame. The
+        // requirement therefore scales with how deeply a screen nests its containers, not with the
+        // size of the response: 8192 was enough for short screens but a list of nested rows
+        // overflowed it and rebooted the device with a stack protection fault. 16384 covers the
+        // screens in this tree with room to spare; a deeper UI would need the snapshot moved onto a
+        // task of its own rather than more stack here.
+        16384
     );
     
     httpServer->start();
