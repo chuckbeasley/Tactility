@@ -191,8 +191,20 @@ void createDeviceRow(Context* ctx, Device* device) {
 // Rebuilds the device list. Only needs to run when the set of devices could've changed (on
 // creation, and after returning from AddGps) - button state itself is refreshed by the timer.
 void rebuildDeviceList(Context* ctx) {
-    lv_obj_clean(ctx->deviceListWrapper);
+    // Drop the row records *before* freeing the widgets they point at, and this order is the whole
+    // bug fix. Reversed, there is a window in which the vector still holds button and buttonLabel
+    // pointers for widgets lv_obj_clean has just deleted - and the timer below walks that vector
+    // once a second:
+    //
+    //   #2 lv_label_set_text (obj=0x42386c74, text="Start")
+    //   #3 tt::app::gpssettings::updateDeviceStates
+    //   #5 tt::Timer::onCallback
+    //
+    // which freed an already-freed pointer and asserted inside heap_caps_free. It only ever fired
+    // on a board that had a GPS to enumerate, because with no rows the loop body never runs.
+    // Clearing first means the worst case is the timer seeing an empty list for one tick.
     ctx->deviceRows.clear();
+    lv_obj_clean(ctx->deviceListWrapper);
 
     device_for_each_of_type(&GPS_TYPE, ctx, [](Device* device, void* context) {
         createDeviceRow(static_cast<Context*>(context), device);
