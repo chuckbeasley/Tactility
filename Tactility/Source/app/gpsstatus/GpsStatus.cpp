@@ -201,6 +201,31 @@ std::string formatFixed(const struct minmea_float* value, int decimals, const ch
     return std::format("{:.{}f}{}", converted, decimals, suffix);
 }
 
+/**
+ * GGA reports altitude in metres. NMEA defines that field's unit as 'M' and nothing else, which is
+ * what makes converting it unconditionally safe rather than a guess. 1 m = 3.280839895 ft exactly.
+ */
+std::string formatAltitude(const struct minmea_float* value) {
+    const float metres = minmea_tofloat(value);
+    if (std::isnan(metres)) {
+        return "--";
+    }
+    return std::format("{:.1f} ft", metres * 3.280839895f);
+}
+
+/**
+ * RMC reports speed in knots, which is fixed by the sentence definition - minmea parses it as a
+ * bare value with no unit field, so there is nothing else it could be. 1 knot = 1.150779448 mph
+ * (1 nmi = 1852 m, 1 statute mile = 1609.344 m), so this is a scale factor, not an approximation.
+ */
+std::string formatSpeed(const struct minmea_float* value) {
+    const float knots = minmea_tofloat(value);
+    if (std::isnan(knots)) {
+        return "--";
+    }
+    return std::format("{:.1f} mph", knots * 1.150779448f);
+}
+
 /** Coordinates are DDMM.MMMM in the sentence; minmea_tocoord converts to signed decimal degrees. */
 std::string formatCoordinate(const struct minmea_float* value) {
     const float coordinate = minmea_tocoord(value);
@@ -208,15 +233,6 @@ std::string formatCoordinate(const struct minmea_float* value) {
         return "--";
     }
     return std::format("{:.6f}", coordinate);
-}
-
-/** RMC reports speed in knots; km/h is the unit the rest of the world reads. */
-std::string formatSpeed(const struct minmea_float* value) {
-    const float knots = minmea_tofloat(value);
-    if (std::isnan(knots)) {
-        return "--";
-    }
-    return std::format("{:.1f} km/h", knots * 1.852f);
 }
 
 std::string fixToText(const FixState& fix) {
@@ -354,7 +370,7 @@ void render(Context* ctx) {
         lv_label_set_text(ctx->hdopValue, hdopToText(fix).c_str());
         lv_label_set_text(ctx->latitudeValue, formatCoordinate(&fix.latitude).c_str());
         lv_label_set_text(ctx->longitudeValue, formatCoordinate(&fix.longitude).c_str());
-        lv_label_set_text(ctx->altitudeValue, formatFixed(&fix.altitude, 1, " m").c_str());
+        lv_label_set_text(ctx->altitudeValue, formatAltitude(&fix.altitude).c_str());
         lv_label_set_text(ctx->speedValue, formatSpeed(&fix.speed).c_str());
         lv_label_set_text(ctx->courseValue, formatFixed(&fix.course, 1, " deg").c_str());
         lv_label_set_text(ctx->timeValue, timeToText(&fix.time).c_str());
