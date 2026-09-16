@@ -205,7 +205,13 @@ void app_task_main(void* context) {
     // Debug logging so it's invisible by default
     // When logging happens, it can distort the application stdout, which breaks apps that use
     // stdout to output important information, such as the file selection dialog app.
-    LOG_I(TAG, "[instance %lu] Task started", ctx->app_instance_id);
+    //
+    // LOG_D, not LOG_I: this has to be genuinely invisible, and the default log level here is INFO,
+    // so an INFO line is emitted on every app start and lands in whatever stream that app's stdout
+    // is bound to. That is not theoretical - it put this line into the weather app's ZIP code field,
+    // which saved "I (605421) app_scheduler: [instance 9] Task started" as a postal code. At DEBUG
+    // and above it still appears for anyone who raises the level to investigate.
+    LOG_D(TAG, "[instance %lu] Task started", ctx->app_instance_id);
 
     set_state(ctx->app_instance_id, APP_INSTANCE_STATE_ACTIVE);
 
