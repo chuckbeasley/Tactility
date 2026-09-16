@@ -163,6 +163,7 @@ namespace app {
     namespace display { extern const ::AppManifest manifest; }
     namespace files { extern const ::AppManifest manifest; }
     namespace fileselection { extern const ::AppManifest manifest; }
+    namespace gpsstatus { extern const ::AppManifest manifest; }
     namespace gpssettings { extern const ::AppManifest manifest; }
     namespace grovesettings { extern const ::AppManifest manifest; }
     namespace i2cscanner { extern const ::AppManifest manifest; }
@@ -289,6 +290,7 @@ static void registerInternalApps() {
     if (device_exists_of_type(&UART_CONTROLLER_TYPE) || device_exists_of_type(&GROVE_TYPE)) {
         app_manager_add(&app::addgps::manifest);
         app_manager_add(&app::gpssettings::manifest);
+        app_manager_add(&app::gpsstatus::manifest);
     }
 
     if (device_exists_of_type(&POWER_SUPPLY_TYPE)) {
