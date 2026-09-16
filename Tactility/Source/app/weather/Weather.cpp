@@ -40,6 +40,7 @@
 #include <tactility/log.h>
 
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <ctime>
@@ -64,6 +65,36 @@ constexpr uint32_t GPS_FIX_WAIT_MILLIS = 1500;
 constexpr auto* SETTINGS_FILE_NAME = "weather.properties";
 constexpr auto* SETTINGS_KEY_POSTAL_CODE = "postalCode";
 
+std::string trim(const std::string& value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+/** A US ZIP code: five digits, optionally followed by the four-digit extension. */
+bool isPostalCode(const std::string& value) {
+    for (size_t i = 0; i < 5; i++) {
+        if (i >= value.size() || std::isdigit(static_cast<unsigned char>(value[i])) == 0) {
+            return false;
+        }
+    }
+    if (value.size() == 5) {
+        return true;
+    }
+    if (value.size() == 10 && value[5] == '-') {
+        for (size_t i = 6; i < 10; i++) {
+            if (std::isdigit(static_cast<unsigned char>(value[i])) == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 // region Settings
 
 std::string getSettingsFilePath() {
@@ -86,7 +117,20 @@ std::string loadPostalCode() {
     }
 
     auto entry = properties.find(SETTINGS_KEY_POSTAL_CODE);
-    return entry != properties.end() ? entry->second : std::string();
+    if (entry == properties.end()) {
+        return {};
+    }
+
+    // Anything that is not a ZIP code is worth less than nothing: sending it to the geocoder
+    // produces a location error on every launch, and the value is invisible to the user. An earlier
+    // version of this app saved whatever the input dialog's stream happened to contain, so a stored
+    // value that fails this check is treated as "no ZIP set" and logged rather than reported.
+    const std::string postalCode = trim(entry->second);
+    if (!isPostalCode(postalCode)) {
+        LOG_W(TAG, "Ignoring the stored location '%s': it is not a ZIP code", postalCode.c_str());
+        return {};
+    }
+    return postalCode;
 }
 
 void savePostalCode(const std::string& postalCode) {
@@ -179,13 +223,34 @@ std::string formatLocalTime() {
     return buffer;
 }
 
-std::string trim(const std::string& value) {
-    const auto first = value.find_first_not_of(" \t\r\n");
-    if (first == std::string::npos) {
-        return {};
+/**
+ * Pull the ZIP code out of what the input dialog returned.
+ *
+ * That dialog's stdout is not a private channel. The app framework logs through the same stdout
+ * from the app's own task, and the scheduler writes its "[instance N] Task started" line moments
+ * after the stream is bound - so what arrives here is a mixture of framework log lines and the
+ * text the dialog was asked to return. Reading the whole stream as the answer is how this app came
+ * to save a log line as a postal code.
+ *
+ * The answer is therefore the last line that is actually a ZIP code. A log line cannot match, the
+ * dialog's own output is the last thing it writes, and this holds whether noise arrives before the
+ * answer, after it, or on both sides.
+ */
+std::string extractPostalCode(const std::string& streamText) {
+    size_t end = streamText.size();
+    while (end > 0) {
+        const size_t newline = streamText.find_last_of('\n', end - 1);
+        const size_t start = (newline == std::string::npos) ? 0 : newline + 1;
+        const std::string line = trim(streamText.substr(start, end - start));
+        if (isPostalCode(line)) {
+            return line;
+        }
+        if (newline == std::string::npos) {
+            break;
+        }
+        end = newline;
     }
-    const auto last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
+    return {};
 }
 
 // endregion
@@ -550,8 +615,14 @@ void handleResult(Context* ctx, const AppResultEventData& result) {
     if (result.result == 0) {
         char buffer[sizeof(ctx->zipDialogBuffer) + 1] = {};
         const size_t length = app_stream_read(&ctx->zipDialogStream, buffer, sizeof(ctx->zipDialogBuffer));
-        const std::string entered = trim(std::string(buffer, length));
-        if (!entered.empty() && entered != ctx->postalCode) {
+        const std::string entered = extractPostalCode(std::string(buffer, length));
+        if (entered.empty()) {
+            // The stream carried no ZIP code at all - either nothing was typed, or the dialog's
+            // output was lost behind framework logging. Saying so is better than saving the noise.
+            LOG_W(TAG, "The location dialog returned no ZIP code");
+            setStatus(ctx, "Enter a 5-digit US ZIP code");
+            render(ctx);
+        } else if (entered != ctx->postalCode) {
             ctx->postalCode = entered;
             savePostalCode(entered);
             ctx->refreshRequested.store(true);
