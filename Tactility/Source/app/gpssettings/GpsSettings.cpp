@@ -51,6 +51,11 @@ struct Context {
     std::vector<DeviceRow> deviceRows;
     std::unique_ptr<Timer> timer;
 
+    // Set before the window is torn down. The timer callback above walks deviceRows and calls into
+    // LVGL, so it must not run once the widget tree is going away - and stopping the timer does not
+    // wait for a callback that has already begun. See the close path for how the two are ordered.
+    std::atomic<bool> closing{false};
+
     // Set when a delete confirmation is pending; read/cleared on this app's own thread when
     // the dialog's result arrives.
     bool hasPendingDelete = false;
@@ -263,6 +268,9 @@ int32_t appMain(int argc, char* argv[]) {
     // Runs for this app instance's whole lifetime - there's no push notification for GPS
     // device state changes, so this is the only way this screen finds out about them.
     ctx.timer = std::make_unique<Timer>(Timer::Type::Periodic, seconds_to_ticks(1), [&ctx] {
+        // A callback that has not started yet is dropped here; one already running is waited for by
+        // the close path taking the LVGL lock, which this callback holds for its whole body.
+        if (ctx.closing.load()) return;
         updateDeviceStates(&ctx);
     });
 
@@ -312,7 +320,24 @@ int32_t appMain(int argc, char* argv[]) {
         }
     }
 
+    // Order matters here, and getting it wrong is what broke this app on a board that actually had a
+    // GPS to enumerate:
+    //
+    //   assert failed: heap_caps_free (heap != NULL && "free() target pointer is outside heap areas")
+    //   in gpssettings::updateDeviceStates, on 'Tmr Svc'
+    //
+    // Stopping a timer does not wait for a callback that is already running, so a callback in flight
+    // could still be inside updateDeviceStates when the window below was removed and its widgets
+    // freed - and the next lv_label_set_text freed a pointer that had already been freed. Setting
+    // the flag first stops any callback that has not begun. Taking the LVGL lock waits for one that
+    // has, because the callback holds that lock for its entire body. Only then is it safe to drop
+    // the rows and remove the window.
+    ctx.closing = true;
     ctx.timer->stop();
+    lvgl_lock();
+    ctx.deviceRows.clear();
+    ctx.deviceListWrapper = nullptr;
+    lvgl_unlock();
     window_manager_remove(window);
     check(app_event_unsubscribe(&sub) == ERROR_NONE);
     task_event_group_destruct(&event_group);
