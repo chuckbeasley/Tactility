@@ -244,6 +244,28 @@ void updateDeviceStates(Context* ctx) {
     lvgl_unlock();
 }
 
+/*
+ * Called when this window's widget is deleted, which happens on suspend as well as on close - so the
+ * close path below is not the only way the pointers go stale, and handling only that is why the
+ * crash survived the first two attempts at it:
+ *
+ *   Guru Meditation Error: Core 0 panic'ed (Load access fault)
+ *   ... 0x42038f20 ... (updateDeviceStates) <- tt::Timer::onCallback
+ *
+ * Opening the Add-GPS dialog from this screen suspends it, its widgets are destroyed, and the
+ * one-second timer carried on walking the rows. Leaving createWidgets' window registered without a
+ * destroy hook was the bug.
+ *
+ * Must stay lock-free: it runs inside the LVGL-locked section that is deleting the widgets, and
+ * that same lock is what stops updateDeviceStates from being mid-iteration when this runs - which is
+ * also why clearing the rows here is sufficient and no extra synchronisation is needed.
+ */
+void destroyWidgets(void* userData) {
+    auto* ctx = static_cast<Context*>(userData);
+    ctx->deviceRows.clear();
+    ctx->deviceListWrapper = nullptr;
+}
+
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
 
@@ -292,7 +314,9 @@ int32_t appMain(int argc, char* argv[]) {
     AppEventSubscription sub {};
     check(app_event_subscribe(&sub, &event_group) == ERROR_NONE);
 
-    WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
+    // create_ext, not create: the destroy hook is what keeps the timer from walking rows whose
+    // widgets have been deleted on suspend. See destroyWidgets() above.
+    WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
     ctx.timer->start();
 
     bool shouldClose = false;
