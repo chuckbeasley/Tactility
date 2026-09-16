@@ -73,35 +73,60 @@ void createButton(Context* ctx, lv_obj_t* parent, const std::string& text, lv_ob
 
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
-    // argv layout: [0]=title, [1]=message, [2]=prefilled.
-    char** argv = ctx->argv;
 
-    auto* toolbar = lvgl_toolbar_create(parent, argv[0]);
-    lv_obj_align(toolbar, LV_ALIGN_TOP_MID, 0, 0);
+    // argv layout: [0]=title, [1]=message, [2]=prefilled. Launched with no arguments at all - from
+    // the app list, or straight through the web API's app runner - there are none, and reading them
+    // regardless is a null dereference, so each falls back to something usable.
+    const char* title = (ctx->argv != nullptr && ctx->argc > 0 && ctx->argv[0] != nullptr) ? ctx->argv[0] : "Input";
+    const char* message = (ctx->argv != nullptr && ctx->argc > 1 && ctx->argv[1] != nullptr) ? ctx->argv[1] : "";
+    const char* prefilled = (ctx->argv != nullptr && ctx->argc > 2 && ctx->argv[2] != nullptr) ? ctx->argv[2] : "";
 
-    auto* message_label = lv_label_create(parent);
-    lv_obj_align(message_label, LV_ALIGN_CENTER, 0, -20);
-    lv_obj_set_width(message_label, LV_PCT(80));
-    lv_label_set_text(message_label, argv[1]);
-    lv_label_set_long_mode(message_label, LV_LABEL_LONG_WRAP);
+    // Laid out as a column from the top, rather than a centred message with the buttons pinned to
+    // the bottom. The software keyboard overlays the lower half of the screen, so anything anchored
+    // low ends up underneath it: the old layout put the entry field at the vertical centre and the
+    // buttons at the very bottom, which is exactly the region the keyboard covers, and the field
+    // was reported as being overlaid by it. Everything here stays in the top half instead, which is
+    // how every other text-entry screen in this tree is arranged.
+    lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(parent, 8, LV_STATE_DEFAULT);
+    // Left scrollable on purpose. The keyboard shrinks this area while it is up (see
+    // lvgl_software_keyboard_set_content_area() in Tactility.cpp), and scrolling is what lets
+    // lv_obj_scroll_to_view_recursive() pull the focused field back into the visible part if a long
+    // message pushes it down. The window manager clears this flag on every window, so it has to be
+    // set again here.
+    lv_obj_add_flag(parent, LV_OBJ_FLAG_SCROLLABLE);
+
+    lvgl_toolbar_create(parent, title);
+
+    if (message[0] != '\0') {
+        auto* message_label = lv_label_create(parent);
+        lv_obj_set_width(message_label, LV_PCT(100));
+        lv_label_set_text(message_label, message);
+        lv_label_set_long_mode(message_label, LV_LABEL_LONG_WRAP);
+    }
 
     auto* textarea = lv_textarea_create(parent);
-    lv_obj_align_to(textarea, message_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 4);
+    lv_obj_set_width(textarea, LV_PCT(100));
     lv_textarea_set_one_line(textarea, true);
-    if (argv[2][0] != '\0') {
-        lv_textarea_set_text(textarea, argv[2]);
+    if (prefilled[0] != '\0') {
+        lv_textarea_set_text(textarea, prefilled);
     }
 
     auto* button_wrapper = lv_obj_create(parent);
     lv_obj_set_flex_flow(button_wrapper, LV_FLEX_FLOW_ROW);
     lv_obj_set_size(button_wrapper, LV_PCT(100), LV_SIZE_CONTENT);
     lv_obj_set_style_pad_all(button_wrapper, 0, 0);
+    lv_obj_set_style_bg_opa(button_wrapper, 0, 0);
     lv_obj_set_flex_align(button_wrapper, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_border_width(button_wrapper, 0, 0);
-    lv_obj_align(button_wrapper, LV_ALIGN_BOTTOM_MID, 0, -4);
 
     createButton(ctx, button_wrapper, "OK", textarea);
     createButton(ctx, button_wrapper, "Cancel", nullptr);
+
+    // Focus the field, because entering text is the only thing this dialog is for. Without this the
+    // toolbar's close button keeps the focus it takes when it is created (see toolbar.cpp), so the
+    // user has to tap the field before they can type anything.
+    lv_group_focus_obj(textarea);
 }
 
 int32_t appMain(int argc, char* argv[]) {
