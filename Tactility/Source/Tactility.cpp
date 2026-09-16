@@ -184,6 +184,7 @@ namespace app {
 #endif
     namespace timezone { extern const ::AppManifest manifest; }
     namespace usbsettings { extern const ::AppManifest manifest; }
+    namespace weather { extern const ::AppManifest manifest; }
     namespace btmanage { extern const ::AppManifest manifest; }
     namespace btpeersettings { extern const ::AppManifest manifest; }
     namespace bletoolbox { extern const ::AppManifest manifest; }
@@ -281,6 +282,9 @@ static void registerInternalApps() {
     app_manager_add(&app::chat::manifest);
     app_manager_add(&app::wifimonitor::manifest);
     app_manager_add(&app::wifitoolbox::manifest);
+    // The weather app is network-only: it reads the National Weather Service API and geocodes ZIP
+    // codes through Nominatim, so there is nothing for it to show without a connection.
+    app_manager_add(&app::weather::manifest);
 #endif
 
     if (device_exists_of_type(&GROVE_TYPE)) {
