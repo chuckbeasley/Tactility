@@ -2,7 +2,4 @@ dependencies:
   - Platforms/platform-esp32
   - Drivers/st7796-module
   - Drivers/xpt2046-softspi-module
-  # NEO-6M on UART1 (GPIO 4 RX, GPIO 5 TX). Without this the device tree's gps node has no
-  # binding to resolve against and the build fails with "Binding not found for gps".
-  - Drivers/gps-generic-module
 dts: generic,esp32c5.dts
