@@ -9,16 +9,16 @@
 //
 // Two products exist per radar site, and both are fetched from the same directory:
 //
-//   {SITE}_loop.gif  the last ten frames, animated
+//   {SITE}_loop.gif  the last ten frames, animated, played by LVGL as the GIF says (200ms a frame)
 //   {SITE}_0.gif     the most recent frame alone
 //
-// Only the single frame is used. The loop draws correctly, but it costs a full 600x550 canvas
-// re-render plus a scaled blit every 200ms for as long as the screen is open, and that work happens
-// while LVGL's lock is held: with the loop on screen a screenshot request took nine seconds, most of
-// it waiting for that lock and one attempt failed outright against the lock timeout. The still frame
-// costs one decode and then nothing, which is the right trade for a panel this size - and it is the
-// newest observation either way. When the weather is quiet the loop's frames differ only in the
-// observation-time stamp, so the animation is not what makes this screen useful.
+// The loop is what this screen shows, and the single frame is the fallback for when it cannot be
+// fetched: the loop is what makes a radar view worth looking at, because the echoes move in it.
+//
+// It is not free. Each frame is a full 600x550 canvas render plus a scaled blit while LVGL's lock is
+// held, five times a second for as long as the screen is open; with the loop on screen a screenshot
+// request measured nine seconds end to end against five for the still frame, most of it waiting for
+// that lock. That is a diagnostic tool's cost, not a user's, so it is accepted here.
 #include <Tactility/file/File.h>
 #include <Tactility/lvgl/Lvgl.h>
 #include <Tactility/network/HttpClient.h>
@@ -98,12 +98,20 @@ void setStatus(Context* ctx, const std::string& text) {
 }
 
 /**
- * Downloads the site's most recent frame into @a outData, leaving @a outError describing the
- * failure. See the note at the top of this file for why the animated loop is not an option.
+ * Downloads the site's animated loop into @a outData, falling back to the single most recent frame
+ * when the loop cannot be fetched - the loop carries the history, so it is the one worth having.
  * @return true when an image arrived
  */
 bool fetchImage(const std::string& station, std::string& outData, std::string& outError) {
+    const std::string loopUrl = std::format("{}/{}_loop.gif", RADAR_BASE_URL, station);
+    if (tt::network::httpGet(loopUrl, outData, outError)) {
+        LOG_I(TAG, "Fetched %u bytes of radar loop", static_cast<unsigned>(outData.size()));
+        return true;
+    }
+    LOG_W(TAG, "Radar loop failed: %s", outError.c_str());
+
     const std::string frameUrl = std::format("{}/{}_0.gif", RADAR_BASE_URL, station);
+    outData.clear();
     if (tt::network::httpGet(frameUrl, outData, outError)) {
         LOG_I(TAG, "Fetched %u bytes of radar frame", static_cast<unsigned>(outData.size()));
         return true;
