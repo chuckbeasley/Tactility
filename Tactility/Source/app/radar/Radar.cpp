@@ -72,9 +72,20 @@ constexpr auto* IMAGE_FILE_NAME = "radar.gif";
  */
 constexpr double PIXELS_PER_DEGREE = 133.0;
 
-/** 100 shows the product at its own resolution; above that the image is magnified and softens.
- *  The whole 600x550 frame is never on screen at once - the view is a window into it. */
-constexpr int32_t ZOOM_PERCENT = 100;
+/**
+ * Zoom levels as a percentage of the size the product is published at, with 0 meaning "shrink the
+ * whole frame until it fits the window".
+ *
+ * Percentages rather than multiples of the fit scale, because the question this screen has to answer
+ * is whether what is on it is the size of the original image - "100%" answers that directly, where
+ * "2x of fit" reads as a magnification of something the user never sees. 100 is also the default:
+ * the published 600x550 is larger than the 480x231 the toolbar and caption leave, so it fills the
+ * window at the size the NWS draws it, and the steps on either side are the whole image (0) and
+ * magnification (150 and up), which is what the buttons are for.
+ */
+constexpr int32_t ZOOM_PERCENTS[] = { 0, 100, 150, 200, 300 };
+constexpr size_t ZOOM_STEP_COUNT = sizeof(ZOOM_PERCENTS) / sizeof(ZOOM_PERCENTS[0]);
+constexpr size_t ZOOM_DEFAULT_STEP = 1;
 
 /** The GIF header puts the logical screen size in little-endian at byte 6, which is read back so
  *  the image can be scaled from what it actually is rather than from a guess at the product size. */
@@ -101,6 +112,20 @@ struct Context {
     lv_obj_t* statusLabel = nullptr;
     lv_obj_t* imageHolder = nullptr;
     lv_obj_t* image = nullptr;
+    lv_obj_t* zoomInButton = nullptr;
+    lv_obj_t* zoomOutButton = nullptr;
+
+    // What the zoom buttons need to redo their work without fetching anything again: the size of the
+    // frame that arrived, the scale at which all of it fits, which entry of ZOOM_PERCENTS is showing,
+    // and the pixel of the frame that belongs in the middle of the window.
+    std::string imagePath;
+    int32_t imageWidth = 0;
+    int32_t imageHeight = 0;
+    int32_t fitScale = 0;
+    size_t zoomStep = ZOOM_DEFAULT_STEP;
+    int32_t focusX = 0;
+    int32_t focusY = 0;
+    bool hasImage = false;
 
     bool hasWidgets() const {
         return statusLabel != nullptr;
@@ -110,6 +135,8 @@ struct Context {
         statusLabel = nullptr;
         imageHolder = nullptr;
         image = nullptr;
+        zoomInButton = nullptr;
+        zoomOutButton = nullptr;
     }
 };
 
@@ -199,6 +226,123 @@ bool fetchStationPosition(const std::string& station, double& outLatitude, doubl
     return found;
 }
 
+/** The place, the site and which zoom step is showing. The observation time is part of the image. */
+void updateCaption(Context* ctx) {
+    if (!ctx->hasWidgets()) {
+        return;
+    }
+
+    const std::string where = ctx->place.empty() ? ctx->station : std::format("{} - {}", ctx->place, ctx->station);
+    const std::string zoom = (ZOOM_PERCENTS[ctx->zoomStep] == 0)
+        ? std::string("full")
+        : std::format("{}%", ZOOM_PERCENTS[ctx->zoomStep]);
+    lv_label_set_text(ctx->statusLabel, std::format("{}   {}", where, zoom).c_str());
+}
+
+/**
+ * Draws the frame at the current zoom step, centred on the location.
+ *
+ * Called once when the image arrives and again on every zoom button press, which is why everything
+ * it works from - the frame size, the scale that fits it, the pixel to centre on - is kept in the
+ * context instead of being recomputed from a fetch.
+ */
+void applyZoom(Context* ctx) {
+    if (!ctx->hasWidgets() || !ctx->hasImage) {
+        return;
+    }
+
+    lv_obj_update_layout(ctx->imageHolder);
+    const int32_t window_width = lv_obj_get_content_width(ctx->imageHolder);
+    const int32_t window_height = lv_obj_get_content_height(ctx->imageHolder);
+    if (window_width <= 0 || window_height <= 0) {
+        return;
+    }
+
+    const int32_t scale = (ZOOM_PERCENTS[ctx->zoomStep] == 0)
+        ? ctx->fitScale
+        : LV_SCALE_NONE * ZOOM_PERCENTS[ctx->zoomStep] / 100;
+    const int32_t scaled_width = ctx->imageWidth * scale / LV_SCALE_NONE;
+    const int32_t scaled_height = ctx->imageHeight * scale / LV_SCALE_NONE;
+
+    lv_image_set_scale(ctx->image, scale);
+    lv_obj_set_size(ctx->image, scaled_width, scaled_height);
+
+    // An axis with room to spare is centred in the window; an axis that overflows is scrolled so the
+    // location sits in the middle of it. LVGL clamps the scroll to what the content allows, so a
+    // location near the edge of the coverage lands as close to the middle as the product permits.
+    const bool overflows_x = scaled_width > window_width;
+    const bool overflows_y = scaled_height > window_height;
+
+    lv_obj_set_pos(
+        ctx->image,
+        overflows_x ? 0 : (window_width - scaled_width) / 2,
+        overflows_y ? 0 : (window_height - scaled_height) / 2
+    );
+    lv_obj_update_layout(ctx->imageHolder);
+    lv_obj_scroll_to_x(
+        ctx->imageHolder,
+        overflows_x ? ctx->focusX * scale / LV_SCALE_NONE - window_width / 2 : 0,
+        LV_ANIM_OFF
+    );
+    lv_obj_scroll_to_y(
+        ctx->imageHolder,
+        overflows_y ? ctx->focusY * scale / LV_SCALE_NONE - window_height / 2 : 0,
+        LV_ANIM_OFF
+    );
+
+    LOG_I(
+        TAG,
+        "Radar %dx%d at %d/256 (step %u of %u), centred on pixel %d,%d in a %dx%d window",
+        static_cast<int>(ctx->imageWidth),
+        static_cast<int>(ctx->imageHeight),
+        static_cast<int>(scale),
+        static_cast<unsigned>(ctx->zoomStep + 1),
+        static_cast<unsigned>(ZOOM_STEP_COUNT),
+        static_cast<int>(ctx->focusX),
+        static_cast<int>(ctx->focusY),
+        static_cast<int>(window_width),
+        static_cast<int>(window_height)
+    );
+}
+
+/** Greys out whichever button has nothing left to do, so the ends of the ladder are visible. */
+void updateZoomButtons(Context* ctx) {
+    if (ctx->zoomOutButton != nullptr) {
+        if (ctx->zoomStep == 0) {
+            lv_obj_add_state(ctx->zoomOutButton, LV_STATE_DISABLED);
+        } else {
+            lv_obj_remove_state(ctx->zoomOutButton, LV_STATE_DISABLED);
+        }
+    }
+    if (ctx->zoomInButton != nullptr) {
+        if (ctx->zoomStep + 1 >= ZOOM_STEP_COUNT) {
+            lv_obj_add_state(ctx->zoomInButton, LV_STATE_DISABLED);
+        } else {
+            lv_obj_remove_state(ctx->zoomInButton, LV_STATE_DISABLED);
+        }
+    }
+}
+
+void onZoomInPressed(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    if (ctx->zoomStep + 1 < ZOOM_STEP_COUNT) {
+        ctx->zoomStep++;
+        updateCaption(ctx);
+        updateZoomButtons(ctx);
+        applyZoom(ctx);
+    }
+}
+
+void onZoomOutPressed(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    if (ctx->zoomStep > 0) {
+        ctx->zoomStep--;
+        updateCaption(ctx);
+        updateZoomButtons(ctx);
+        applyZoom(ctx);
+    }
+}
+
 /** Scales the image to fit the space it has, in whole 1/256ths as LVGL expects. */
 void showImage(Context* ctx, const std::string& data) {
     if (data.size() < GIF_HEADER_SIZE) {
@@ -236,11 +380,7 @@ void showImage(Context* ctx, const std::string& data) {
         // The caption is set first because it is one of the two things that decide how much space is
         // left: a caption that wraps to a second line takes a line away from the image, and measuring
         // before it is set is what made the image overflow the bottom of the screen.
-        //
-        // The observation time is part of the image itself, so there is nothing to report here beyond
-        // which place and which site are on screen.
-        const std::string caption = ctx->place.empty() ? ctx->station : std::format("{} - {}", ctx->place, ctx->station);
-        lv_label_set_text(ctx->statusLabel, caption.c_str());
+        updateCaption(ctx);
 
         // Measured on the holder rather than on the parent: the holder is the flex child that grows
         // into whatever the toolbar and the caption leave, so its size is the real remaining space.
@@ -256,60 +396,36 @@ void showImage(Context* ctx, const std::string& data) {
         // because the file is what makes a repeat visit instant.
         const std::string lvgl_path = std::string(tt::lvgl::PATH_PREFIX) + path;
 
-        // The image is drawn at its own size inside the holder and the holder is scrolled, rather
-        // than the image being scaled to the holder. Two things follow from that: the view is a
-        // window into the product instead of the whole of it shrunk to fit (which at 0.42x drew the
-        // map 250px wide in a 480px panel), and which part of the map is in that window is a scroll
-        // offset - which is how the view gets centred on a coordinate rather than on the middle of
-        // the product. Dragging the map around comes free with a scrollable holder.
-        const int32_t scale = LV_SCALE_NONE * ZOOM_PERCENT / 100;
-        const int32_t scaled_width = width * scale / LV_SCALE_NONE;
-        const int32_t scaled_height = height * scale / LV_SCALE_NONE;
-
         // The product's grid is centred on the radar site, so the requested location sits at the
-        // site's pixel offset by the difference between them in degrees.
-        int32_t centre_x = width / 2;
-        int32_t centre_y = height / 2;
+        // site's pixel offset by the difference between them in degrees. This is the pixel the view
+        // centres on at every zoom, which is what keeps a zoomed-in view on the place being watched.
+        ctx->focusX = width / 2;
+        ctx->focusY = height / 2;
         if (ctx->hasLocation && ctx->hasStationPosition) {
-            centre_x += static_cast<int32_t>(std::lround((ctx->longitude - ctx->stationLongitude) * PIXELS_PER_DEGREE));
-            centre_y -= static_cast<int32_t>(std::lround((ctx->latitude - ctx->stationLatitude) * PIXELS_PER_DEGREE));
+            ctx->focusX += static_cast<int32_t>(std::lround((ctx->longitude - ctx->stationLongitude) * PIXELS_PER_DEGREE));
+            ctx->focusY -= static_cast<int32_t>(std::lround((ctx->latitude - ctx->stationLatitude) * PIXELS_PER_DEGREE));
         }
         // Kept inside the frame, so the arithmetic cannot ask for a window that does not exist.
-        if (centre_x < 0) centre_x = 0;
-        if (centre_x > width - 1) centre_x = width - 1;
-        if (centre_y < 0) centre_y = 0;
-        if (centre_y > height - 1) centre_y = height - 1;
+        if (ctx->focusX < 0) ctx->focusX = 0;
+        if (ctx->focusX > width - 1) ctx->focusX = width - 1;
+        if (ctx->focusY < 0) ctx->focusY = 0;
+        if (ctx->focusY > height - 1) ctx->focusY = height - 1;
+
+        // The scale at which the whole frame fits the window. Every zoom step is a multiple of this,
+        // so the ladder is the same on any panel and "1x" always means the published image entire.
+        const int32_t fit = std::min(
+            available_width * LV_SCALE_NONE / width,
+            available_height * LV_SCALE_NONE / height
+        );
+
+        ctx->imagePath = lvgl_path;
+        ctx->imageWidth = width;
+        ctx->imageHeight = height;
+        ctx->fitScale = fit > 0 ? fit : 1;
+        ctx->hasImage = true;
 
         lv_gif_set_src(ctx->image, lvgl_path.c_str());
-        lv_image_set_scale(ctx->image, scale);
-        lv_obj_set_size(ctx->image, scaled_width, scaled_height);
-        lv_obj_update_layout(ctx->imageHolder);
-
-        // Scroll so that pixel is in the middle of the window. LVGL clamps this to the scrollable
-        // range, so a location near the edge of the coverage simply sits as close to the centre as
-        // the product allows.
-        lv_obj_scroll_to_x(
-            ctx->imageHolder,
-            centre_x * scale / LV_SCALE_NONE - available_width / 2,
-            LV_ANIM_OFF
-        );
-        lv_obj_scroll_to_y(
-            ctx->imageHolder,
-            centre_y * scale / LV_SCALE_NONE - available_height / 2,
-            LV_ANIM_OFF
-        );
-
-        LOG_I(
-            TAG,
-            "Radar image %dx%d at %d%%, centred on pixel %d,%d in a %dx%d window",
-            width,
-            height,
-            ZOOM_PERCENT,
-            centre_x,
-            centre_y,
-            available_width,
-            available_height
-        );
+        applyZoom(ctx);
     }
     lvgl_unlock();
 }
@@ -352,6 +468,11 @@ void createWidgets(lv_obj_t* parent, void* userData) {
 
     auto* toolbar = lvgl_toolbar_create(parent, "Radar");
     lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
+    // Zoom controls, in the order they read: out on the left of the pair and in on the right. The
+    // toolbar sizes a text button as a square, so a symbol is what fits - and these are the two
+    // symbols a zoom control is expected to use.
+    ctx->zoomOutButton = lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_MINUS, onZoomOutPressed, ctx);
+    ctx->zoomInButton = lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_PLUS, onZoomInPressed, ctx);
     lv_obj_set_style_margin_bottom(toolbar, margin, LV_STATE_DEFAULT);
 
     // One line for the place and the site, then the map window below it.
@@ -378,6 +499,8 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_set_scrollbar_mode(ctx->imageHolder, LV_SCROLLBAR_MODE_OFF);
     ctx->image = lv_gif_create(ctx->imageHolder);
     lv_obj_set_pos(ctx->image, 0, 0);
+
+    updateZoomButtons(ctx);
 }
 
 /**
