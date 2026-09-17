@@ -35,8 +35,6 @@
 #include <tactility/check.h>
 #include <tactility/log.h>
 
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <format>
@@ -176,16 +174,18 @@ void showImage(Context* ctx, const std::string& data) {
         // disk rather than kept in memory because the decoder reads it back incrementally, and
         // because the file is what makes a repeat visit instant.
         const std::string lvgl_path = std::string(tt::lvgl::PATH_PREFIX) + path;
-        int32_t scale = std::min(
-            (available_width * LV_SCALE_NONE) / width,
-            (available_height * LV_SCALE_NONE) / height
-        );
-        scale = std::clamp<int32_t>(scale, 1, LV_SCALE_NONE);
 
+        // Filled, not fitted. Fitting the whole 600x550 frame into this space only reaches 0.42x,
+        // which draws the map 250px wide in a 480px panel with the rest empty - the entire product
+        // on screen and too small to read, which is what "zoomed out too far" means here. COVER
+        // scales the image up until it covers the widget, 0.8x for this frame, and centres what does
+        // not fit, so the map is nearly twice the size. What is cut off is the top and bottom of the
+        // coverage area, and that band is where the NWS legend and the observation stamp sit, so
+        // those are no longer on screen; the caption still names the place and the site.
         lv_gif_set_src(ctx->image, lvgl_path.c_str());
-        lv_image_set_scale(ctx->image, scale);
-        lv_obj_set_size(ctx->image, (width * scale) / LV_SCALE_NONE, (height * scale) / LV_SCALE_NONE);
-        LOG_I(TAG, "Radar image %dx%d scaled to %d/256 in %dx%d", width, height, scale, available_width, available_height);
+        lv_image_set_inner_align(ctx->image, LV_IMAGE_ALIGN_COVER);
+        lv_obj_set_size(ctx->image, available_width, available_height);
+        LOG_I(TAG, "Radar image %dx%d covering %dx%d", width, height, available_width, available_height);
     }
     lvgl_unlock();
 }
