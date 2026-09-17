@@ -281,6 +281,11 @@ struct Context {
     uint8_t zipDialogBuffer[128] = {};
     uint32_t zipDialogInstanceId = 0;
 
+    // The radar screen, while it is open: it is a for-result child so that closing it returns here,
+    // and a for-result child has to be reaped by its parent once its result arrives. Written from
+    // the LVGL task (the button) and read on this app's task (the event loop).
+    std::atomic<uint32_t> radarInstanceId { 0 };
+
     // Set from another task: the toolbar runs in the LVGL task, refresh() and the loop run here.
     std::atomic<bool> closing { false };
     std::atomic<bool> refreshRequested { false };
@@ -557,6 +562,10 @@ void onRefreshPressed(lv_event_t* event) {
 /**
  * Opens the radar screen on the location the report was fetched for, so the button means "the radar
  * for what you are looking at" rather than "a radar map you then have to navigate".
+ *
+ * Started for a result rather than with app_start(), which is what makes closing it come back here:
+ * a for-result launch records this instance as the parent, so the window manager has somewhere to
+ * return to. Fire-and-forget leaves it with none, and the launcher is what comes up instead.
  */
 void onRadarPressed(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
@@ -572,8 +581,10 @@ void onRadarPressed(lv_event_t* event) {
     };
 
     uint32_t instanceId = 0;
-    if (app_start("tactility.radar", 4, arguments, &instanceId) != ERROR_NONE) {
+    if (app_start_for_result("tactility.radar", 4, arguments, ctx->appInstanceId, &instanceId) != ERROR_NONE) {
         LOG_W(TAG, "Failed to open the radar");
+    } else {
+        ctx->radarInstanceId.store(instanceId);
     }
 }
 
@@ -651,6 +662,14 @@ void destroyWidgets(void* userData) {
 // endregion
 
 void handleResult(Context* ctx, const AppResultEventData& result) {
+    // The radar closes like any other child and has to be reaped, but it carries nothing back: the
+    // screen beside it is the point of it.
+    if (result.launch_id == ctx->radarInstanceId.load() && result.launch_id != 0) {
+        ctx->radarInstanceId.store(0);
+        app_manager_stop(result.launch_id);
+        return;
+    }
+
     if (result.launch_id != ctx->zipDialogInstanceId || ctx->zipDialogInstanceId == 0) {
         return;
     }
