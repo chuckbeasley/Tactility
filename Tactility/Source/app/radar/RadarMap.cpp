@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "RadarMap.h"
 
+#include <Tactility/Thread.h>
 #include <Tactility/network/HttpClient.h>
 
 #include <tactility/log.h>
@@ -17,6 +18,7 @@
 #include <draw/lv_image_decoder_private.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +51,20 @@ constexpr int32_t NEWEST_FRAME_LAG_SECONDS = 180;
 constexpr size_t MAX_BASEMAP_BYTES = 4 * 1024 * 1024;
 constexpr size_t MAX_FRAME_BYTES = 4 * 1024 * 1024;
 constexpr int32_t FETCH_TIMEOUT_MS = 45000;
+
+/**
+ * How many frames are fetched at once.
+ *
+ * The frames are independent requests - six separate WMS renders - so fetching them one after another
+ * spends the whole time waiting: measured at about four seconds a frame, of which almost none is
+ * transfer. Two at a time is the useful number here rather than six, because each request in flight
+ * holds its own TLS session and those buffers come out of internal RAM, of which this board has less
+ * than a hundred kilobytes to spare.
+ */
+constexpr int32_t FRAME_WORKERS = 2;
+
+/** Stack for a frame worker: an HTTPS request and a PNG decode, both of which go deep. */
+constexpr size_t FRAME_WORKER_STACK = 16384;
 
 /** Web mercator, the projection both services are asked for, so a bbox means the same to each. */
 constexpr double EARTH_RADIUS = 6378137.0;
@@ -262,53 +278,104 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
     pixels.assign(framePixels * FRAME_COUNT, 0);
 
     const long long now = static_cast<long long>(std::time(nullptr));
-    int32_t produced = 0;
-    for (int32_t index = 0; index < FRAME_COUNT; index++) {
-        // Oldest first, so playback runs forward in time like the loop it replaces.
-        const int32_t ageSeconds = NEWEST_FRAME_LAG_SECONDS + (FRAME_COUNT - 1 - index) * FRAME_INTERVAL_SECONDS;
-        const std::string time = formatTime(now - ageSeconds);
 
-        std::string frameData;
-        std::string frameError;
-        if (!tt::network::httpGet(radarUrl(view, time), frameData, frameError, FETCH_TIMEOUT_MS, MAX_FRAME_BYTES)) {
-            LOG_W(TAG, "Frame %s failed: %s", time.c_str(), frameError.c_str());
-            continue;
-        }
+    // Frames are claimed from a shared counter rather than handed out in advance, so a worker that
+    // finishes early takes the next one instead of idling, and each writes into its own slot - which
+    // is what keeps the series in time order however the requests interleave.
+    std::atomic<int32_t> nextIndex { 0 };
+    std::atomic<int32_t> producedCount { 0 };
+    std::atomic<bool> succeeded[FRAME_COUNT] {};
 
-        DecodedImage overlay;
-        if (!decodePng(frameData, overlay, frameError)) {
-            LOG_W(TAG, "Frame %s did not decode: %s", time.c_str(), frameError.c_str());
-            continue;
-        }
-        if (overlay.width != basemap.width || overlay.height != basemap.height) {
-            LOG_W(TAG, "Frame %s is %ux%u", time.c_str(), overlay.width, overlay.height);
-            continue;
-        }
+    const auto worker = [&]() -> int32_t {
+        while (true) {
+            const int32_t index = nextIndex.fetch_add(1);
+            if (index >= FRAME_COUNT) {
+                break;
+            }
 
-        flatten(basemap, overlay, pixels.data() + (produced * framePixels));
-        produced++;
-        LOG_I(TAG, "Frame %d at %s: %u bytes", static_cast<int>(index), time.c_str(), static_cast<unsigned>(frameData.size()));
+            // Oldest first, so playback runs forward in time like the loop it replaces.
+            const int32_t ageSeconds = NEWEST_FRAME_LAG_SECONDS + (FRAME_COUNT - 1 - index) * FRAME_INTERVAL_SECONDS;
+            const std::string time = formatTime(now - ageSeconds);
+
+            std::string frameData;
+            std::string frameError;
+            if (!tt::network::httpGet(radarUrl(view, time), frameData, frameError, FETCH_TIMEOUT_MS, MAX_FRAME_BYTES)) {
+                LOG_W(TAG, "Frame %s failed: %s", time.c_str(), frameError.c_str());
+                continue;
+            }
+
+            DecodedImage overlay;
+            bool decoded = false;
+            {
+                // LVGL is not thread safe, so the decode happens under the graphics lock. The
+                // blending below is arithmetic on two buffers and needs nothing.
+                lvgl_lock();
+                decoded = decodePng(frameData, overlay, frameError);
+                lvgl_unlock();
+            }
+            if (!decoded) {
+                LOG_W(TAG, "Frame %s did not decode: %s", time.c_str(), frameError.c_str());
+                continue;
+            }
+            if (overlay.width != basemap.width || overlay.height != basemap.height) {
+                LOG_W(TAG, "Frame %s is %ux%u", time.c_str(), overlay.width, overlay.height);
+                continue;
+            }
+
+            flatten(basemap, overlay, pixels.data() + (static_cast<size_t>(index) * framePixels));
+            succeeded[index].store(true);
+            producedCount.fetch_add(1);
+            LOG_I(
+                TAG,
+                "Frame %d at %s: %u bytes",
+                static_cast<int>(index),
+                time.c_str(),
+                static_cast<unsigned>(frameData.size())
+            );
+        }
+        return 0;
+    };
+
+    std::vector<Thread*> workers;
+    workers.reserve(FRAME_WORKERS);
+    for (int32_t index = 0; index < FRAME_WORKERS; index++) {
+        auto* thread = new Thread(std::format("radar-frame-{}", index), FRAME_WORKER_STACK, worker);
+        thread->start();
+        workers.push_back(thread);
+    }
+    for (auto* thread : workers) {
+        thread->join();
+        delete thread;
     }
 
+    // If no worker ran at all - which is what happens when the tasks could not be created on a busy
+    // board - the same work is done here rather than leaving the screen empty.
+    if (producedCount.load() == 0) {
+        LOG_W(TAG, "No frame workers ran; fetching on this task instead");
+        worker();
+    }
+
+    const int32_t produced = producedCount.load();
     if (produced == 0) {
         outError = "no radar frames arrived";
         return false;
     }
 
-    // Give back whatever the missing frames were holding, then hand out one frame per buffer.
-    pixels.resize(static_cast<size_t>(produced) * framePixels);
+    // Handed out in index order, which is oldest to newest, with the failed slots closed up.
     frames.clear();
     frames.reserve(produced);
-    for (int32_t index = 0; index < produced; index++) {
+    for (int32_t slot = 0; slot < FRAME_COUNT; slot++) {
+        if (!succeeded[slot].load()) {
+            continue;
+        }
         frames.push_back(MapFrame {
-            .pixels = pixels.data() + (static_cast<size_t>(index) * framePixels),
+            .pixels = pixels.data() + (static_cast<size_t>(slot) * framePixels),
             .width = view.width,
             .height = view.height
         });
     }
 
-    description = std::format(
-        "{} zoom {}",
+    description = std::format(        "{} zoom {}",
         station.empty() ? std::string("radar") : station,
         static_cast<int>(view.zoom)
     );
