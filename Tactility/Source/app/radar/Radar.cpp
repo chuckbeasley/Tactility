@@ -25,7 +25,6 @@
 // place being looked at off to one side, which is what "the ZIP code should be in the center" was
 // about. The screen is therefore a window into the frame, scrolled to the coordinate that was asked
 // for, and the map can be dragged from there.
-#include <Tactility/file/File.h>
 #include <Tactility/lvgl/Lvgl.h>
 #include <Tactility/network/HttpClient.h>
 
@@ -60,7 +59,6 @@ namespace {
 
 constexpr auto* RADAR_BASE_URL = "https://radar.weather.gov/ridge/standard";
 constexpr auto* STATION_URL_BASE = "https://api.weather.gov/radar/stations";
-constexpr auto* IMAGE_FILE_NAME = "radar.gif";
 
 /**
  * The standard product is a 600x550 grid drawn on a latitude/longitude grid with the radar site at
@@ -118,7 +116,13 @@ struct Context {
     // What the zoom buttons need to redo their work without fetching anything again: the size of the
     // frame that arrived, the scale at which all of it fits, which entry of ZOOM_PERCENTS is showing,
     // and the pixel of the frame that belongs in the middle of the window.
-    std::string imagePath;
+    //
+    // The GIF itself is held here too, because LVGL decodes it from this buffer for as long as the
+    // screen is open. It used to be written to /data and read back by LVGL instead, which cost 67
+    // seconds for a megabyte on this board - the data goes through the wear-levelling FAT, and that
+    // write was the whole of the delay between the download finishing and the map appearing.
+    std::string imageData;
+    lv_image_dsc_t imageDescriptor {};
     int32_t imageWidth = 0;
     int32_t imageHeight = 0;
     int32_t fitScale = 0;
@@ -139,14 +143,6 @@ struct Context {
         zoomOutButton = nullptr;
     }
 };
-
-std::string getImageFilePath() {
-    char path[256] = {};
-    if (app_paths_get_user_data_path(manifest.id, IMAGE_FILE_NAME, path, sizeof(path)) != ERROR_NONE) {
-        return {};
-    }
-    return path;
-}
 
 void setStatus(Context* ctx, const std::string& text) {
     lvgl_lock();
@@ -351,7 +347,7 @@ void onZoomOutPressed(lv_event_t* event) {
 }
 
 /** Scales the image to fit the space it has, in whole 1/256ths as LVGL expects. */
-void showImage(Context* ctx, const std::string& data) {
+void showImage(Context* ctx, std::string data) {
     if (data.size() < GIF_HEADER_SIZE) {
         setStatus(ctx, "The radar image was truncated");
         return;
@@ -361,24 +357,6 @@ void showImage(Context* ctx, const std::string& data) {
     const auto height = static_cast<int32_t>(static_cast<uint8_t>(data[GIF_HEIGHT_OFFSET]) | (static_cast<uint8_t>(data[GIF_HEIGHT_OFFSET + 1]) << 8));
     if (width <= 0 || height <= 0) {
         setStatus(ctx, "The radar image has no size");
-        return;
-    }
-
-    const std::string path = getImageFilePath();
-    if (path.empty()) {
-        setStatus(ctx, "Could not resolve where to store the radar image");
-        return;
-    }
-    // The app's own directory does not exist until something creates it, and file::writeString()
-    // does not create it either - without this the write fails on a freshly formatted /data.
-    if (!file::findOrCreateParentDirectory(path, 0755)) {
-        LOG_E(TAG, "Failed to create the directory for %s", path.c_str());
-        setStatus(ctx, "Could not create the radar image directory");
-        return;
-    }
-    if (!file::writeString(path, data)) {
-        LOG_E(TAG, "Failed to write the radar image to %s", path.c_str());
-        setStatus(ctx, "Could not store the radar image");
         return;
     }
 
@@ -396,12 +374,6 @@ void showImage(Context* ctx, const std::string& data) {
         lv_obj_update_layout(ctx->imageHolder);
         const int32_t available_width = lv_obj_get_content_width(ctx->imageHolder);
         const int32_t available_height = lv_obj_get_content_height(ctx->imageHolder);
-
-        // LVGL loads through its own filesystem layer, which addresses files by driver letter - the
-        // same file needs "A:" in front of it for LVGL and no prefix for the C library. Written to
-        // disk rather than kept in memory because the decoder reads it back incrementally, and
-        // because the file is what makes a repeat visit instant.
-        const std::string lvgl_path = std::string(tt::lvgl::PATH_PREFIX) + path;
 
         // The product's grid is centred on the radar site, so the requested location sits at the
         // site's pixel offset by the difference between them in degrees. This is the pixel the view
@@ -425,13 +397,25 @@ void showImage(Context* ctx, const std::string& data) {
             available_height * LV_SCALE_NONE / height
         );
 
-        ctx->imagePath = lvgl_path;
+        // LVGL takes the GIF from this buffer, so it has to outlive the widget - the context does.
+        // It is handed over as an image descriptor rather than as the bytes themselves because LVGL
+        // decides between "a file path" and "an image in memory" by looking at the first byte of what
+        // it is given: a GIF starts with 'G' (printable, so it would be read as a filename), while a
+        // descriptor starts with its magic field, which is below 0x20.
+        ctx->imageData = std::move(data);
+        ctx->imageDescriptor.header.magic = LV_IMAGE_HEADER_MAGIC;
+        ctx->imageDescriptor.header.cf = LV_COLOR_FORMAT_RAW;
+        ctx->imageDescriptor.header.w = width;
+        ctx->imageDescriptor.header.h = height;
+        ctx->imageDescriptor.data_size = ctx->imageData.size();
+        ctx->imageDescriptor.data = reinterpret_cast<const uint8_t*>(ctx->imageData.data());
+
         ctx->imageWidth = width;
         ctx->imageHeight = height;
         ctx->fitScale = fit > 0 ? fit : 1;
         ctx->hasImage = true;
 
-        lv_gif_set_src(ctx->image, lvgl_path.c_str());
+        lv_gif_set_src(ctx->image, &ctx->imageDescriptor);
         applyZoom(ctx);
     }
     lvgl_unlock();
@@ -457,7 +441,7 @@ void loadRadar(Context* ctx) {
         return;
     }
 
-    showImage(ctx, data);
+    showImage(ctx, std::move(data));
 }
 
 void onBackPressed(lv_event_t* event) {
@@ -508,6 +492,14 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_set_pos(ctx->image, 0, 0);
 
     updateZoomButtons(ctx);
+
+    // A window that is being rebuilt - which happens on resume, since the destroy hook fires on
+    // suspend too - can put the image it already has back, rather than coming back to an empty frame
+    // until the app is opened again. The bytes are still in the context, so this costs nothing.
+    if (ctx->hasImage) {
+        lv_gif_set_src(ctx->image, &ctx->imageDescriptor);
+        applyZoom(ctx);
+    }
 }
 
 /**
