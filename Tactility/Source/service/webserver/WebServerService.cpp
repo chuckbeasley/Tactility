@@ -1790,8 +1790,14 @@ esp_err_t WebServerService::handleApiScreenshot(httpd_req_t* request) {
     // LVGL's lodepng uses lv_fs which requires the "A:" prefix
     std::string lvgl_screenshot_path = lvgl::PATH_PREFIX + screenshot_path;
 
-    // Capture screenshot using LVGL
-    if (lvgl_try_lock(pdMS_TO_TICKS(100))) {
+    // Capture screenshot using LVGL.
+    //
+    // Two seconds, not the 100ms this used to wait. The LVGL lock is held for the whole of
+    // lv_timer_handler(), so any continuously animating screen - an animated GIF holds it for most
+    // of every frame delay - makes a short wait fail rather than merely be slow, and the caller gets
+    // a 500 back from an endpoint that would have worked. This task has nothing else to do while it
+    // waits, and the wait only lasts as long as the current frame.
+    if (lvgl_try_lock(pdMS_TO_TICKS(2000))) {
         bool success = lv_screenshot_create(lv_scr_act(), LV_100ASK_SCREENSHOT_SV_PNG, lvgl_screenshot_path.c_str());
         lvgl_unlock();
 
@@ -1802,7 +1808,7 @@ esp_err_t WebServerService::handleApiScreenshot(httpd_req_t* request) {
         }
         LOG_I(TAG, "Screenshot captured successfully");
     } else {
-        LOG_E(TAG, "Could not acquire LVGL lock within 100ms");
+        LOG_E(TAG, "Could not acquire LVGL lock within 2s");
         httpd_resp_send_err(request, HTTPD_500_INTERNAL_SERVER_ERROR, "could not acquire LVGL lock");
         return ESP_FAIL;
     }
