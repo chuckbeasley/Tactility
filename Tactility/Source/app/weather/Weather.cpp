@@ -27,6 +27,7 @@
 #include <app/manifest.h>
 #include <app/paths.h>
 #include <app/scheduler.h>
+#include <app/start.h>
 #include <app/stream.h>
 
 #include <gps/gps.h>
@@ -291,6 +292,9 @@ struct Context {
     lv_obj_t* detailLabel = nullptr;
     lv_obj_t* shortTermLabel = nullptr;
     lv_obj_t* periodContainer = nullptr;
+    /** Null while the window has no live widget, and also until a report has arrived - the radar
+     *  has nothing to point at before then, so the button stays hidden. */
+    lv_obj_t* radarButton = nullptr;
 
     bool hasWidgets() const {
         return statusLabel != nullptr;
@@ -302,6 +306,7 @@ struct Context {
         detailLabel = nullptr;
         shortTermLabel = nullptr;
         periodContainer = nullptr;
+        radarButton = nullptr;
     }
 };
 
@@ -366,6 +371,15 @@ void render(Context* ctx) {
 
     if (ctx->hasWidgets()) {
         lv_label_set_text(ctx->statusLabel, ctx->status.c_str());
+
+        // Revealed by the first report: before that there is no location for the radar to show.
+        if (ctx->radarButton != nullptr) {
+            if (ctx->report.valid) {
+                lv_obj_remove_flag(ctx->radarButton, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(ctx->radarButton, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
 
         const CurrentConditions& current = ctx->report.current;
         if (current.valid) {
@@ -540,6 +554,23 @@ void onRefreshPressed(lv_event_t* event) {
     ctx->refreshRequested.store(true);
 }
 
+/**
+ * Opens the radar screen on the location the report was fetched for, so the button means "the radar
+ * for what you are looking at" rather than "a radar map you then have to navigate".
+ */
+void onRadarPressed(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+
+    const std::string latitude = std::format("{:.4f}", ctx->position.coordinates.latitude);
+    const std::string longitude = std::format("{:.4f}", ctx->position.coordinates.longitude);
+    const char* arguments[] = { ctx->report.locationName.c_str(), latitude.c_str(), longitude.c_str() };
+
+    uint32_t instanceId = 0;
+    if (app_start("tactility.radar", 3, arguments, &instanceId) != ERROR_NONE) {
+        LOG_W(TAG, "Failed to open the radar");
+    }
+}
+
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
 
@@ -551,6 +582,13 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     auto* toolbar = lvgl_toolbar_create(parent, "Weather");
     // The global toolbar nav callback only knows how to stop old-model apps.
     lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
+    // "Map", not "Radar": the toolbar sizes its text buttons as squares, so a five-letter label is
+    // clipped to "Rada". Three characters fit, as the neighbouring ZIP button shows, and the screen
+    // it opens is titled Radar.
+    ctx->radarButton = lvgl_toolbar_add_text_button_action(toolbar, "Map", onRadarPressed, ctx);
+    // Hidden until a report arrives: the radar link is built from the coordinates the report was
+    // fetched for, and offering it before there are any would open a map pointed at nowhere.
+    lv_obj_add_flag(ctx->radarButton, LV_OBJ_FLAG_HIDDEN);
     lvgl_toolbar_add_text_button_action(toolbar, "ZIP", onZipPressed, ctx);
     lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_REFRESH, onRefreshPressed, ctx);
     lv_obj_set_style_margin_bottom(toolbar, margin, LV_STATE_DEFAULT);
