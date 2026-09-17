@@ -648,7 +648,14 @@
 #define LV_USE_LIBJPEG_TURBO 0
 
 /*GIF decoder library*/
-#define LV_USE_GIF 0
+// Enabled for the radar screen: the National Weather Service publishes its radar imagery as GIF
+// (a ten-frame animation of the last hour, 600x550), and that is the only format it serves - there
+// is no PNG or JPEG variant of the same product.
+//
+// This file configures the LVGL copy that non-ESP targets build from. The ESP32 build takes the
+// same setting from Kconfig instead (CONFIG_LV_USE_GIF, set per board in its device.properties),
+// so the two have to be kept in step by hand.
+#define LV_USE_GIF 1
 #if LV_USE_GIF
 /*GIF decoder accelerate*/
 #define LV_GIF_CACHE_DECODE_DATA 0

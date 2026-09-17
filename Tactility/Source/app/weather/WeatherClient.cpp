@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "WeatherClient.h"
 
+#include <Tactility/network/HttpClient.h>
+
 #include <cJSON.h>
 
 #include <tactility/log.h>
@@ -9,9 +11,9 @@
 #include <format>
 
 #ifdef ESP_PLATFORM
-#include <esp_crt_bundle.h>
+// For the heap figures logged around the forecast parse, which is the one place in this app whose
+// cost lands in internal RAM rather than PSRAM.
 #include <esp_heap_caps.h>
-#include <esp_http_client.h>
 #endif
 
 namespace tt::app::weather {
@@ -20,131 +22,8 @@ namespace {
 
 constexpr auto* TAG = "Weather";
 
-/**
- * Both services require a User-Agent that identifies the caller: api.weather.gov rejects requests
- * without one outright, and Nominatim's usage policy requires it. Nominatim additionally asks that
- * the value identify the application rather than masquerade as a browser, and that clients stay at
- * or below one request per second - this app makes one geocoding request per location change, which
- * is well inside that.
- */
-constexpr auto* USER_AGENT = "TactilityWeather/1.0 (Tactility OS; +https://github.com/chuckbeasley/Tactility)";
-
-constexpr int HTTP_TIMEOUT_MS = 10000;
-
-/** The largest response any of these endpoints returns is the seven-day forecast, a few tens of KB.
- *  This is a guard against a misbehaving server rather than a real limit. */
-constexpr size_t MAX_RESPONSE_BYTES = 256 * 1024;
-
-/** Only enough of an error body to read the explanation out of it. */
-constexpr size_t MAX_ERROR_BODY_BYTES = 2048;
-
-/** Defined below with the other JSON helpers; declared here because httpGet() reports errors with
- *  whatever the server said rather than just the status code. */
-std::string describeApiError(const std::string& body, int status);
-
-bool httpGet(const std::string& url, std::string& outBody, std::string& outError) {
-#ifdef ESP_PLATFORM
-    LOG_I(TAG, "GET %s (internal heap %u)", url.c_str(), static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
-
-    esp_http_client_config_t config = {};
-    config.url = url.c_str();
-    // The certificate bundle rather than one pinned certificate: this talks to two unrelated hosts
-    // (api.weather.gov and nominatim.openstreetmap.org) whose chains have nothing in common. The
-    // full Mozilla bundle is already compiled in - see CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL.
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    config.timeout_ms = HTTP_TIMEOUT_MS;
-    config.method = HTTP_METHOD_GET;
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == nullptr) {
-        outError = "Failed to create HTTP client";
-        return false;
-    }
-
-    bool opened = false;
-    bool ok = false;
-
-    do {
-        esp_http_client_set_header(client, "User-Agent", USER_AGENT);
-        // The geocoder answers JSON; the NWS endpoints answer either. Asking for both keeps one
-        // code path for two services.
-        esp_http_client_set_header(client, "Accept", "application/geo+json, application/json");
-
-        if (esp_http_client_open(client, 0) != ESP_OK) {
-            outError = "Failed to connect";
-            break;
-        }
-        opened = true;
-
-        // Reads the status line and headers. The return value is the content length, or -1 when the
-        // server uses chunked encoding - neither is needed here, because the body is read until the
-        // client reports it is finished.
-        esp_http_client_fetch_headers(client);
-
-        const int status = esp_http_client_get_status_code(client);
-        if (status != 200) {
-            // The NWS answers errors with a JSON body explaining the problem ("Data unavailable",
-            // "Invalid request"), which is far more useful on screen than the status code alone.
-            std::string errorBody;
-            char errorBuffer[256];
-            while (errorBody.size() < MAX_ERROR_BODY_BYTES) {
-                const int read = esp_http_client_read(client, errorBuffer, sizeof(errorBuffer));
-                if (read <= 0) {
-                    break;
-                }
-                errorBody.append(errorBuffer, static_cast<size_t>(read));
-            }
-            outError = describeApiError(errorBody, status);
-            break;
-        }
-
-        outBody.clear();
-        char buffer[1024];
-        while (true) {
-            const int read = esp_http_client_read(client, buffer, sizeof(buffer));
-            if (read < 0) {
-                outError = "Failed to read response";
-                outBody.clear();
-                break;
-            }
-            if (read == 0) {
-                ok = true;
-                break;
-            }
-            if (outBody.size() + static_cast<size_t>(read) > MAX_RESPONSE_BYTES) {
-                outError = "Response is too large";
-                outBody.clear();
-                break;
-            }
-            outBody.append(buffer, static_cast<size_t>(read));
-        }
-    } while (false);
-
-    if (opened) {
-        esp_http_client_close(client);
-    }
-    esp_http_client_cleanup(client);
-
-    if (!ok && outError.empty()) {
-        outError = "Empty response";
-    }
-
-    if (ok) {
-        LOG_I(
-            TAG,
-            "  %u bytes (internal heap %u)",
-            static_cast<unsigned>(outBody.size()),
-            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL))
-        );
-    }
-    return ok;
-#else
-    (void)url;
-    outBody.clear();
-    outError = "Networking is unavailable on this platform";
-    return false;
-#endif
-}
+// Shared with the radar screen, which fetches its imagery through the same path.
+using tt::network::httpGet;
 
 // region JSON helpers
 
@@ -183,21 +62,6 @@ cJSON* parseJson(const std::string& body, std::string& outError) {
         outError = "Failed to parse the server's response";
     }
     return json;
-}
-
-/** The NWS APIs answer errors with a JSON body describing the problem; prefer that to "HTTP 404". */
-std::string describeApiError(const std::string& body, int status) {
-    cJSON* json = cJSON_Parse(body.c_str());
-    if (json != nullptr) {
-        const cJSON* detail = cJSON_GetObjectItemCaseSensitive(json, "detail");
-        if (cJSON_IsString(detail) && detail->valuestring != nullptr) {
-            std::string text = detail->valuestring;
-            cJSON_Delete(json);
-            return text;
-        }
-        cJSON_Delete(json);
-    }
-    return std::format("Server returned {}", status);
 }
 
 // endregion
@@ -421,6 +285,7 @@ bool fetchReport(const Coordinates& coordinates, WeatherReport& outReport, const
 
     const std::string forecastUrl = stringField(properties, "forecast");
     const std::string stationsUrl = stringField(properties, "observationStations");
+    outReport.radarStation = stringField(properties, "radarStation");
 
     // "City, ST" for the screen. Both parts are optional in the response, so the separator is only
     // added when there is something on both sides of it.

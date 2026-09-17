@@ -563,10 +563,16 @@ void onRadarPressed(lv_event_t* event) {
 
     const std::string latitude = std::format("{:.4f}", ctx->position.coordinates.latitude);
     const std::string longitude = std::format("{:.4f}", ctx->position.coordinates.longitude);
-    const char* arguments[] = { ctx->report.locationName.c_str(), latitude.c_str(), longitude.c_str() };
+    // The radar site comes from the report: the imagery is published per site, not per coordinate.
+    const char* arguments[] = {
+        ctx->report.locationName.c_str(),
+        latitude.c_str(),
+        longitude.c_str(),
+        ctx->report.radarStation.c_str()
+    };
 
     uint32_t instanceId = 0;
-    if (app_start("tactility.radar", 3, arguments, &instanceId) != ERROR_NONE) {
+    if (app_start("tactility.radar", 4, arguments, &instanceId) != ERROR_NONE) {
         LOG_W(TAG, "Failed to open the radar");
     }
 }

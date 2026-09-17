@@ -67,6 +67,8 @@ struct WeatherReport {
     std::string error;
     /** "City, ST" from the NWS point metadata, or empty if the API did not supply it. */
     std::string locationName;
+    /** The radar site the NWS associates with this point, e.g. "KOKX". Empty if not supplied. */
+    std::string radarStation;
     Coordinates coordinates;
     CurrentConditions current;
     Forecast forecast;
