@@ -19,6 +19,12 @@
 // held, five times a second for as long as the screen is open; with the loop on screen a screenshot
 // request measured nine seconds end to end against five for the still frame, most of it waiting for
 // that lock. That is a diagnostic tool's cost, not a user's, so it is accepted here.
+//
+// The view is centred on the location rather than on the radar site. The product is a fixed grid
+// with the site at its middle - and a site is often far enough away that centring on it pushes the
+// place being looked at off to one side, which is what "the ZIP code should be in the center" was
+// about. The screen is therefore a window into the frame, scrolled to the coordinate that was asked
+// for, and the map can be dragged from there.
 #include <Tactility/file/File.h>
 #include <Tactility/lvgl/Lvgl.h>
 #include <Tactility/network/HttpClient.h>
@@ -35,6 +41,10 @@
 #include <tactility/check.h>
 #include <tactility/log.h>
 
+#include <cJSON.h>
+
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <format>
@@ -49,7 +59,22 @@ extern const ::AppManifest manifest;
 namespace {
 
 constexpr auto* RADAR_BASE_URL = "https://radar.weather.gov/ridge/standard";
+constexpr auto* STATION_URL_BASE = "https://api.weather.gov/radar/stations";
 constexpr auto* IMAGE_FILE_NAME = "radar.gif";
+
+/**
+ * The standard product is a 600x550 grid drawn on a latitude/longitude grid with the radar site at
+ * its centre, so where any coordinate falls in it is arithmetic. This value was measured against
+ * the product rather than taken from a specification: with it, the labelled dots for Atlanta,
+ * Macon, Columbus, Gainesville and Montgomery all land within a few pixels of their real
+ * coordinates in the frame. That is the accuracy that matters here, because the number only decides
+ * which part of the map sits in the middle of the screen.
+ */
+constexpr double PIXELS_PER_DEGREE = 133.0;
+
+/** 100 shows the product at its own resolution; above that the image is magnified and softens.
+ *  The whole 600x550 frame is never on screen at once - the view is a window into it. */
+constexpr int32_t ZOOM_PERCENT = 100;
 
 /** The GIF header puts the logical screen size in little-endian at byte 6, which is read back so
  *  the image can be scaled from what it actually is rather than from a guess at the product size. */
@@ -61,6 +86,15 @@ struct Context {
     uint32_t appInstanceId = 0;
     std::string place;
     std::string station;
+
+    // The location the weather app asked for, and the radar site whose grid the product is drawn
+    // on. The difference between the two is what the view is centred on.
+    double latitude = 0.0;
+    double longitude = 0.0;
+    bool hasLocation = false;
+    double stationLatitude = 0.0;
+    double stationLongitude = 0.0;
+    bool hasStationPosition = false;
 
     // Widgets; null whenever this window has no live widget, which happens on suspend as well as on
     // close, so every update checks first.
@@ -116,6 +150,53 @@ bool fetchImage(const std::string& station, std::string& outData, std::string& o
     }
     LOG_W(TAG, "Radar frame failed: %s", outError.c_str());
     return false;
+}
+
+/**
+ * Looks up the radar site's own coordinates, which is the centre of the product's grid.
+ *
+ * Fetched rather than tabulated because the whole point of knowing it is to work out where the
+ * location being displayed falls inside the image, and the arithmetic is only as good as that
+ * centre. A failure here is not fatal: the view then centres on the site, as it did before.
+ *
+ * The response is GeoJSON, with the coordinates as [longitude, latitude] - the opposite order to
+ * how they are usually written, which is worth stating because getting it backwards would put the
+ * view in the wrong state.
+ */
+bool fetchStationPosition(const std::string& station, double& outLatitude, double& outLongitude) {
+    const std::string url = std::format("{}/{}", STATION_URL_BASE, station);
+
+    std::string body;
+    std::string error;
+    if (!tt::network::httpGet(url, body, error)) {
+        LOG_W(TAG, "Radar station lookup failed: %s", error.c_str());
+        return false;
+    }
+
+    cJSON* json = cJSON_Parse(body.c_str());
+    if (json == nullptr) {
+        LOG_W(TAG, "Radar station lookup returned something that is not JSON");
+        return false;
+    }
+
+    const cJSON* geometry = cJSON_GetObjectItemCaseSensitive(json, "geometry");
+    const cJSON* coordinates = cJSON_IsObject(geometry)
+        ? cJSON_GetObjectItemCaseSensitive(geometry, "coordinates")
+        : nullptr;
+    const cJSON* longitude = cJSON_IsArray(coordinates) ? cJSON_GetArrayItem(coordinates, 0) : nullptr;
+    const cJSON* latitude = cJSON_IsArray(coordinates) ? cJSON_GetArrayItem(coordinates, 1) : nullptr;
+
+    const bool found = cJSON_IsNumber(longitude) && cJSON_IsNumber(latitude);
+    if (found) {
+        outLongitude = longitude->valuedouble;
+        outLatitude = latitude->valuedouble;
+        LOG_I(TAG, "Radar site %s is at %.4f, %.4f", station.c_str(), outLatitude, outLongitude);
+    } else {
+        LOG_W(TAG, "Radar station lookup has no usable coordinates");
+    }
+
+    cJSON_Delete(json);
+    return found;
 }
 
 /** Scales the image to fit the space it has, in whole 1/256ths as LVGL expects. */
@@ -175,17 +256,60 @@ void showImage(Context* ctx, const std::string& data) {
         // because the file is what makes a repeat visit instant.
         const std::string lvgl_path = std::string(tt::lvgl::PATH_PREFIX) + path;
 
-        // Filled, not fitted. Fitting the whole 600x550 frame into this space only reaches 0.42x,
-        // which draws the map 250px wide in a 480px panel with the rest empty - the entire product
-        // on screen and too small to read, which is what "zoomed out too far" means here. COVER
-        // scales the image up until it covers the widget, 0.8x for this frame, and centres what does
-        // not fit, so the map is nearly twice the size. What is cut off is the top and bottom of the
-        // coverage area, and that band is where the NWS legend and the observation stamp sit, so
-        // those are no longer on screen; the caption still names the place and the site.
+        // The image is drawn at its own size inside the holder and the holder is scrolled, rather
+        // than the image being scaled to the holder. Two things follow from that: the view is a
+        // window into the product instead of the whole of it shrunk to fit (which at 0.42x drew the
+        // map 250px wide in a 480px panel), and which part of the map is in that window is a scroll
+        // offset - which is how the view gets centred on a coordinate rather than on the middle of
+        // the product. Dragging the map around comes free with a scrollable holder.
+        const int32_t scale = LV_SCALE_NONE * ZOOM_PERCENT / 100;
+        const int32_t scaled_width = width * scale / LV_SCALE_NONE;
+        const int32_t scaled_height = height * scale / LV_SCALE_NONE;
+
+        // The product's grid is centred on the radar site, so the requested location sits at the
+        // site's pixel offset by the difference between them in degrees.
+        int32_t centre_x = width / 2;
+        int32_t centre_y = height / 2;
+        if (ctx->hasLocation && ctx->hasStationPosition) {
+            centre_x += static_cast<int32_t>(std::lround((ctx->longitude - ctx->stationLongitude) * PIXELS_PER_DEGREE));
+            centre_y -= static_cast<int32_t>(std::lround((ctx->latitude - ctx->stationLatitude) * PIXELS_PER_DEGREE));
+        }
+        // Kept inside the frame, so the arithmetic cannot ask for a window that does not exist.
+        if (centre_x < 0) centre_x = 0;
+        if (centre_x > width - 1) centre_x = width - 1;
+        if (centre_y < 0) centre_y = 0;
+        if (centre_y > height - 1) centre_y = height - 1;
+
         lv_gif_set_src(ctx->image, lvgl_path.c_str());
-        lv_image_set_inner_align(ctx->image, LV_IMAGE_ALIGN_COVER);
-        lv_obj_set_size(ctx->image, available_width, available_height);
-        LOG_I(TAG, "Radar image %dx%d covering %dx%d", width, height, available_width, available_height);
+        lv_image_set_scale(ctx->image, scale);
+        lv_obj_set_size(ctx->image, scaled_width, scaled_height);
+        lv_obj_update_layout(ctx->imageHolder);
+
+        // Scroll so that pixel is in the middle of the window. LVGL clamps this to the scrollable
+        // range, so a location near the edge of the coverage simply sits as close to the centre as
+        // the product allows.
+        lv_obj_scroll_to_x(
+            ctx->imageHolder,
+            centre_x * scale / LV_SCALE_NONE - available_width / 2,
+            LV_ANIM_OFF
+        );
+        lv_obj_scroll_to_y(
+            ctx->imageHolder,
+            centre_y * scale / LV_SCALE_NONE - available_height / 2,
+            LV_ANIM_OFF
+        );
+
+        LOG_I(
+            TAG,
+            "Radar image %dx%d at %d%%, centred on pixel %d,%d in a %dx%d window",
+            width,
+            height,
+            ZOOM_PERCENT,
+            centre_x,
+            centre_y,
+            available_width,
+            available_height
+        );
     }
     lvgl_unlock();
 }
@@ -198,6 +322,10 @@ void loadRadar(Context* ctx) {
 
     setStatus(ctx, "Loading radar...");
     LOG_I(TAG, "Radar station %s", ctx->station.c_str());
+
+    // Before the image, because the image is drawn where this says the site is. A failure only
+    // costs the centring: the view falls back to the middle of the product.
+    ctx->hasStationPosition = fetchStationPosition(ctx->station, ctx->stationLatitude, ctx->stationLongitude);
 
     std::string data;
     std::string error;
@@ -226,7 +354,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lvgl_toolbar_set_nav_action(toolbar, LV_SYMBOL_CLOSE, onBackPressed, ctx);
     lv_obj_set_style_margin_bottom(toolbar, margin, LV_STATE_DEFAULT);
 
-    // One line for the place and the site, then the image, which is centred in whatever is left.
+    // One line for the place and the site, then the map window below it.
     ctx->statusLabel = lv_label_create(parent);
     lv_obj_set_width(ctx->statusLabel, LV_PCT(100));
     lv_label_set_long_mode(ctx->statusLabel, LV_LABEL_LONG_WRAP);
@@ -236,18 +364,20 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     // no way to read one - which is how the first attempt produced a blank screen with no error.
     // It is an image widget underneath, so scaling it works the same way.
     //
-    // The holder is what makes the image fit rather than roughly fit: it is the flex child that
-    // absorbs the space the toolbar and the caption leave (flex_grow), and centring is left to it
-    // because a flex parent positions its own children - an align call on the image is ignored.
+    // The holder is the window the map is seen through: it takes the space the toolbar and the
+    // caption leave (flex_grow) and clips what does not fit. It is deliberately not a flex container
+    // and the image is not aligned inside it - the image is positioned at the content origin and the
+    // holder is scrolled, which is what puts a chosen coordinate in the middle. Scrollbars are off
+    // because a scrollbar here is noise over a map; dragging still works.
     ctx->imageHolder = lv_obj_create(parent);
     lv_obj_set_width(ctx->imageHolder, LV_PCT(100));
     lv_obj_set_flex_grow(ctx->imageHolder, 1);
     lv_obj_set_style_pad_all(ctx->imageHolder, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(ctx->imageHolder, 0, LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(ctx->imageHolder, LV_OPA_TRANSP, LV_STATE_DEFAULT);
-    lv_obj_set_flex_flow(ctx->imageHolder, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(ctx->imageHolder, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scrollbar_mode(ctx->imageHolder, LV_SCROLLBAR_MODE_OFF);
     ctx->image = lv_gif_create(ctx->imageHolder);
+    lv_obj_set_pos(ctx->image, 0, 0);
 }
 
 /**
@@ -271,6 +401,17 @@ int32_t appMain(int argc, char* argv[]) {
     // through the web API's app runner - and reading past the end there is a null dereference.
     if (argc > 0 && argv[0] != nullptr) {
         ctx.place = argv[0];
+    }
+    // The coordinates are what the view gets centred on, so they are only used together and only
+    // when they parse: a zero here would silently centre the map on the Gulf of Guinea.
+    if (argc > 2 && argv[1] != nullptr && argv[2] != nullptr) {
+        const double latitude = std::strtod(argv[1], nullptr);
+        const double longitude = std::strtod(argv[2], nullptr);
+        if (latitude != 0.0 && longitude != 0.0) {
+            ctx.latitude = latitude;
+            ctx.longitude = longitude;
+            ctx.hasLocation = true;
+        }
     }
     if (argc > 3 && argv[3] != nullptr) {
         ctx.station = argv[3];
