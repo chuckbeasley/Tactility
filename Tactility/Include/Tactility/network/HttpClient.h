@@ -17,13 +17,26 @@ namespace tt::network {
  * same as one with a Content-Length - which is also why the body is returned as a string rather
  * than a buffer: it can be a binary payload such as an image.
  *
+ * The size cap is the caller's, because the sizes are the caller's business: the radar loop is
+ * around a megabyte when there is weather to see, while a forecast is tens of kilobytes and a
+ * megabyte of JSON would be a problem rather than a product. It exists to stop a misbehaving server
+ * filling memory, not to limit a legitimate response.
+ *
  * @param[in] url the URL to fetch
  * @param[out] outBody the response body on success, cleared on failure
  * @param[out] outError a short description of the failure, fit to show on screen
- * @param[in] timeoutMs how long the whole request may take
+ * @param[in] timeoutMs how long a single read may take - not a cap on the whole transfer, so a slow
+ *                      but steady download is allowed to finish
+ * @param[in] maxResponseBytes largest body to accept before giving up
  * @return true on a 200 response
  */
-bool httpGet(const std::string& url, std::string& outBody, std::string& outError, int32_t timeoutMs = 10000);
+bool httpGet(
+    const std::string& url,
+    std::string& outBody,
+    std::string& outError,
+    int32_t timeoutMs = 10000,
+    size_t maxResponseBytes = 512 * 1024
+);
 
 /**
  * Percent-encode everything outside the unreserved set, for use in a query string.

@@ -162,8 +162,15 @@ void setStatus(Context* ctx, const std::string& text) {
  * @return true when an image arrived
  */
 bool fetchImage(const std::string& station, std::string& outData, std::string& outError) {
+    // The loop's size follows the weather: 47 KB for KFFC in calm conditions, 1,008,766 bytes for
+    // KMPX with a system overhead - which is over the shared client's 512 KB default and is how this
+    // screen ended up showing a single still frame while asking for the loop. Hence a cap of its own,
+    // and a read timeout generous enough for a megabyte over a slow link.
+    constexpr size_t MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+    constexpr int32_t IMAGE_TIMEOUT_MS = 45000;
+
     const std::string loopUrl = std::format("{}/{}_loop.gif", RADAR_BASE_URL, station);
-    if (tt::network::httpGet(loopUrl, outData, outError)) {
+    if (tt::network::httpGet(loopUrl, outData, outError, IMAGE_TIMEOUT_MS, MAX_IMAGE_BYTES)) {
         LOG_I(TAG, "Fetched %u bytes of radar loop", static_cast<unsigned>(outData.size()));
         return true;
     }
@@ -171,7 +178,7 @@ bool fetchImage(const std::string& station, std::string& outData, std::string& o
 
     const std::string frameUrl = std::format("{}/{}_0.gif", RADAR_BASE_URL, station);
     outData.clear();
-    if (tt::network::httpGet(frameUrl, outData, outError)) {
+    if (tt::network::httpGet(frameUrl, outData, outError, IMAGE_TIMEOUT_MS, MAX_IMAGE_BYTES)) {
         LOG_I(TAG, "Fetched %u bytes of radar frame", static_cast<unsigned>(outData.size()));
         return true;
     }

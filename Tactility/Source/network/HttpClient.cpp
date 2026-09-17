@@ -27,10 +27,6 @@ constexpr auto* TAG = "HttpClient";
  */
 constexpr auto* USER_AGENT = "Tactility/1.0 (+https://github.com/chuckbeasley/Tactility)";
 
-/** A guard against a misbehaving server rather than a working limit: the largest legitimate
- *  response here is a seven-day forecast or a radar image, tens of kilobytes either way. */
-constexpr size_t MAX_RESPONSE_BYTES = 512 * 1024;
-
 /** Only enough of an error body to read the explanation out of it. */
 constexpr size_t MAX_ERROR_BODY_BYTES = 2048;
 
@@ -52,7 +48,13 @@ std::string describeError(const std::string& body, int status) {
 
 }
 
-bool httpGet(const std::string& url, std::string& outBody, std::string& outError, int32_t timeoutMs) {
+bool httpGet(
+    const std::string& url,
+    std::string& outBody,
+    std::string& outError,
+    int32_t timeoutMs,
+    size_t maxResponseBytes
+) {
 #ifdef ESP_PLATFORM
     LOG_I(TAG, "GET %s (internal heap %u)", url.c_str(), static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
 
@@ -114,8 +116,8 @@ bool httpGet(const std::string& url, std::string& outBody, std::string& outError
                 ok = true;
                 break;
             }
-            if (outBody.size() + static_cast<size_t>(read) > MAX_RESPONSE_BYTES) {
-                outError = "The response is too large";
+            if (outBody.size() + static_cast<size_t>(read) > maxResponseBytes) {
+                outError = std::format("The response is larger than {} bytes", static_cast<unsigned>(maxResponseBytes));
                 outBody.clear();
                 break;
             }
