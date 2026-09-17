@@ -3,10 +3,10 @@
 #include "Tactility/PanicHandler.h"
 
 
-#include <Tactility/app/crashdiagnostics/QrHelpers.h>
 #include <Tactility/app/crashdiagnostics/QrUrl.h>
 #include <Tactility/app/launcher/Launcher.h>
 #include <Tactility/file/File.h>
+#include <Tactility/lvgl/QrCode.h>
 #include <Tactility/lvgl/Statusbar.h>
 
 #include <app/event.h>
@@ -146,80 +146,25 @@ void createWidgets(lv_obj_t* parent, void* userData) {
 
     std::string url = getUrlFromCrashData(crash_data);
     LOG_I(TAG, "%s", url.c_str());
-    size_t url_length = url.length();
 
-    int qr_version;
-    if (!getQrVersionForBinaryDataLength(url_length, qr_version)) {
-        LOG_E(TAG, "QR is too large");
+    // Sized from the space the labels leave behind, then handed to the shared QR helper, which
+    // scales the code in whole modules and reports whether it fitted.
+    const int32_t top_label_height = lv_obj_get_height(top_label) + 2;
+    const int32_t bottom_label_height = lv_obj_get_height(bottom_label) + 2;
+    const int32_t available_height = parent_height - top_label_height - bottom_label_height;
+    const int32_t available_width = lv_display_get_horizontal_resolution(display);
+    const int32_t smallest_size = std::min(available_height, available_width);
+
+    int32_t qr_size = 0;
+    // Light on dark, as this screen has always drawn it.
+    lv_obj_t* canvas = tt::lvgl::qr_code_create(parent, url, smallest_size, false, &qr_size);
+    if (canvas == nullptr) {
+        LOG_E(TAG, "Failed to create a QR code for the report URL");
         ctx->hasFatalError = true;
         return;
     }
-
-    LOG_I(TAG, "QR version %d (length: %d)", qr_version, (int)url_length);
-    auto qrcodeData = std::make_shared<uint8_t[]>(qrcode_getBufferSize(qr_version));
-    if (qrcodeData == nullptr) {
-        LOG_E(TAG, "Failed to allocate QR buffer");
-        ctx->hasFatalError = true;
-        return;
-    }
-
-    QRCode qrcode;
-    LOG_I(TAG, "QR init text");
-    if (qrcode_initText(&qrcode, qrcodeData.get(), qr_version, ECC_LOW, url.c_str()) != 0) {
-        LOG_E(TAG, "QR init text failed");
-        ctx->hasFatalError = true;
-        return;
-    }
-
-    LOG_I(TAG, "QR size: %d", qrcode.size);
-
-    // Calculate QR dot size
-    int32_t top_label_height = lv_obj_get_height(top_label) + 2;
-    int32_t bottom_label_height = lv_obj_get_height(bottom_label) + 2;
-    LOG_I(TAG, "Create canvas");
-    int32_t available_height = parent_height - top_label_height - bottom_label_height;
-    int32_t available_width = lv_display_get_horizontal_resolution(display);
-    int32_t smallest_size = std::min(available_height, available_width);
-    // Target ~60% of the available space so the code scales with screen size but keeps a margin
-    // from the labels/screen edges.
-    int32_t target_size = smallest_size * 6 / 10;
-    int32_t pixel_size = std::max<int32_t>(1, target_size / qrcode.size);
-    if (pixel_size * qrcode.size > smallest_size) {
-        LOG_E(TAG, "QR code won't fit screen");
-        ctx->hasFatalError = true;
-        return;
-    }
-
-    auto* canvas = lv_canvas_create(parent);
-    lv_obj_set_size(canvas, pixel_size * qrcode.size, pixel_size * qrcode.size);
+    LOG_I(TAG, "QR is %d pixels", static_cast<int>(qr_size));
     lv_obj_align(canvas, LV_ALIGN_CENTER, 0, 0);
-    lv_canvas_fill_bg(canvas, lv_color_black(), LV_OPA_COVER);
-    lv_obj_set_content_height(canvas, qrcode.size * pixel_size);
-    lv_obj_set_content_width(canvas, qrcode.size * pixel_size);
-
-    LOG_I(TAG, "Create draw buffer");
-    auto* draw_buf = lv_draw_buf_create(pixel_size * qrcode.size, pixel_size * qrcode.size, LV_COLOR_FORMAT_RGB565, LV_STRIDE_AUTO);
-    if (draw_buf == nullptr) {
-        LOG_E(TAG, "Failed to allocate draw buffer");
-        ctx->hasFatalError = true;
-        return;
-    }
-
-    lv_canvas_set_draw_buf(canvas, draw_buf);
-
-    for (uint8_t y = 0; y < qrcode.size; y++) {
-        for (uint8_t x = 0; x < qrcode.size; x++) {
-            bool colored = qrcode_getModule(&qrcode, x, y);
-            auto color = colored ? lv_color_white() : lv_color_black();
-            int32_t pos_x = x * pixel_size;
-            int32_t pos_y = y * pixel_size;
-            for (int px = 0; px < pixel_size; px++) {
-                for (int py = 0; py < pixel_size; py++) {
-                    lv_canvas_set_px(canvas, pos_x + px, pos_y + py, color, LV_OPA_COVER);
-                }
-            }
-        }
-    }
 }
 
 int32_t appMain(int argc, char* argv[]) {
