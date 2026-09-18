@@ -27,6 +27,7 @@
 // for, and the map can be dragged from there.
 #include <Tactility/lvgl/Lvgl.h>
 #include <Tactility/network/HttpClient.h>
+#include <Tactility/service/wifi/Wifi.h>
 
 #include "RadarMap.h"
 
@@ -686,6 +687,34 @@ void showImage(Context* ctx, tt::network::HttpBody data) {
 }
 
 /**
+ * Keeps the radio awake for as long as it is alive.
+ *
+ * A series is nine or more round trips, and with power save on the radio only wakes once per beacon
+ * to hear the access point: this AP's beacon interval is 102.4 ms, which is what the mirror measured
+ * as the floor on a round trip that did no work at all. Put back what was found rather than enabling
+ * it unconditionally, because the screen mirror borrows the same radio and may still want it off.
+ */
+struct LowLatencyFetch {
+    bool restore = false;
+
+    LowLatencyFetch() {
+        restore = tt::service::wifi::isPowerSaveEnabled();
+        if (restore) {
+            tt::service::wifi::setPowerSaveEnabled(false);
+        }
+    }
+
+    ~LowLatencyFetch() {
+        if (restore) {
+            tt::service::wifi::setPowerSaveEnabled(true);
+        }
+    }
+
+    LowLatencyFetch(const LowLatencyFetch&) = delete;
+    LowLatencyFetch& operator=(const LowLatencyFetch&) = delete;
+};
+
+/**
  * Called by the fetch as each frame is flattened, on whichever thread finished it.
  *
  * On a worker thread, so the graphics lock has to be taken here - the same rule the decode follows.
@@ -706,6 +735,10 @@ void loadRadar(Context* ctx) {
     }
     setStatus(ctx, "Loading map...");
     LOG_I(TAG, "Radar station %s at map zoom %d", ctx->station.c_str(), static_cast<int>(ctx->mapZoom));
+
+    // Held for the whole load, including the GIF fallback below: every path out of this function
+    // restores the radio, which is what the guard is for.
+    const LowLatencyFetch lowLatency;
 
     // The size the map has to be rendered at is the window's size, measured after a layout pass.
     int32_t window_width = 0;

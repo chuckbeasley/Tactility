@@ -103,6 +103,15 @@ void setAutoScanPaused(bool paused);
  */
 void setPowerSaveEnabled(bool enabled);
 
+/**
+ * @return whether power save is currently wanted.
+ *
+ * Added for callers that disable it for a while and then want to put back what they found rather than
+ * assume: the mirror and the radar screen both do this, and re-enabling it for one of them while the
+ * other still wants it off is a latency bug that is invisible until someone measures the round trip.
+ */
+bool isPowerSaveEnabled();
+
 /** @return the RSSI value (negative number) or return 1 when not connected. */
 int getRssi();
 

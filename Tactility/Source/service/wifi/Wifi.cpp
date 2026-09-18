@@ -98,6 +98,14 @@ struct WifiServiceState {
 WifiServiceState state;
 bool started = false;
 
+/**
+ * Whether power save is wanted, which is what the driver is set to except when the radio is off.
+ *
+ * Tracked rather than asked of the driver because the mirror and now the radar screen both borrow the
+ * radio for a low-latency stretch and want to put back what they found.
+ */
+bool powerSaveEnabled = true;
+
 void onWifiDeviceEvent(Device* device, ::WifiEvent event);
 
 // ---- Helpers ----
@@ -464,6 +472,7 @@ void setAutoScanPaused(bool paused) {
 }
 
 void setPowerSaveEnabled(bool enabled) {
+    powerSaveEnabled = enabled;
 #ifdef ESP_PLATFORM
     // Only meaningful while the station is up; the driver rejects the call before that, and a
     // failed call here is logged rather than asserted because it is a latency optimisation, not
@@ -480,6 +489,10 @@ void setPowerSaveEnabled(bool enabled) {
 #else
     (void)enabled;
 #endif
+}
+
+bool isPowerSaveEnabled() {
+    return powerSaveEnabled;
 }
 
 void setScanRecords(uint16_t records) {
