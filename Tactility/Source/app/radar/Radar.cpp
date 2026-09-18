@@ -160,7 +160,17 @@ struct Context {
     lv_timer_t* frameTimer = nullptr;
     size_t frameIndex = 0;
     bool usingServerMap = false;
+    /** The zoom the buttons are aiming at: what a press changes, and what gets fetched next. */
     int32_t mapZoom = MAP_ZOOM_DEFAULT;
+    /**
+     * The zoom of the series that is on screen right now.
+     *
+     * A fetch takes seconds, so between a press and the new frames the two differ, and the caption
+     * says so instead of claiming the map already changed. Keeping them apart is what stops a press
+     * from appearing to do nothing: the number used to move on the first frame tick after the press,
+     * up to half a minute before the imagery it named had arrived.
+     */
+    int32_t displayedZoom = MAP_ZOOM_DEFAULT;
 
     // Raised by the zoom buttons, which run on the LVGL task; the fetch happens on this app's task.
     std::atomic<bool> reloadRequested { false };
@@ -272,6 +282,16 @@ void updateCaption(Context* ctx) {
 
     const std::string where = ctx->place.empty() ? ctx->station : std::format("{} - {}", ctx->place, ctx->station);
     if (ctx->usingServerMap) {
+        // Until the frames for the zoom being aimed at arrive, the caption names that zoom and says
+        // it is still coming rather than showing the clock of a series that is on its way out.
+        if (ctx->mapZoom != ctx->displayedZoom) {
+            lv_label_set_text(
+                ctx->statusLabel,
+                std::format("{}   zoom {}   loading...", where, static_cast<int>(ctx->mapZoom)).c_str()
+            );
+            return;
+        }
+
         // The map zoom, because that is what the buttons change on this path, and the frame's own
         // time: these frames have no timestamp in the pixels, so in calm weather - when every frame
         // is the same picture - this is the only thing on screen that moves, and it is how the user
@@ -285,7 +305,7 @@ void updateCaption(Context* ctx) {
         }
         lv_label_set_text(
             ctx->statusLabel,
-            std::format("{}   zoom {}   {}", where, static_cast<int>(ctx->mapZoom), observed).c_str()
+            std::format("{}   zoom {}   {}", where, static_cast<int>(ctx->displayedZoom), observed).c_str()
         );
     } else {
         const std::string zoom = (ZOOM_PERCENTS[ctx->zoomStep] == 0)
@@ -449,6 +469,9 @@ void startPlayback(Context* ctx) {
     ctx->frameIndex = 0;
     ctx->usingServerMap = true;
     ctx->hasImage = true;
+    // From the series itself, not from the zoom that was asked for: this is the map that is now on
+    // screen, and the caption tells the user which one that is.
+    ctx->displayedZoom = ctx->radarFrames.zoom;
     if (ctx->frameTimer == nullptr) {
         ctx->frameTimer = lv_timer_create(onFrameTimer, FRAME_DURATION_MS, ctx);
     }
@@ -513,6 +536,11 @@ void onZoomInPressed(lv_event_t* event) {
         if (ctx->mapZoom < MAP_ZOOM_MAX) {
             ctx->mapZoom++;
             ctx->reloadRequested.store(true);
+            // Both of these reflect the zoom being aimed at rather than the one on screen, so they
+            // have to be redrawn here: the caption otherwise keeps the old number until the new
+            // series lands, and the button that has run out of levels stays lit until then too.
+            updateCaption(ctx);
+            updateZoomButtons(ctx);
         }
         return;
     }
@@ -532,6 +560,8 @@ void onZoomOutPressed(lv_event_t* event) {
         if (ctx->mapZoom > MAP_ZOOM_MIN) {
             ctx->mapZoom--;
             ctx->reloadRequested.store(true);
+            updateCaption(ctx);
+            updateZoomButtons(ctx);
         }
         return;
     }
@@ -675,6 +705,17 @@ void loadRadar(Context* ctx) {
         }
 
         LOG_W(TAG, "Server-rendered map unavailable: %s", error.c_str());
+
+        // The zoom that was asked for never arrived, so the buttons fall back to the level that is
+        // actually on screen: a press that failed must not leave the caption naming a map that does
+        // not exist, which is the other way this screen can look like the zoom controls are dead.
+        lvgl_lock();
+        if (ctx->hasWidgets()) {
+            ctx->mapZoom = ctx->displayedZoom;
+            updateZoomButtons(ctx);
+            updateCaption(ctx);
+        }
+        lvgl_unlock();
     } else {
         LOG_W(TAG, "No location or window size to build a map view from");
     }

@@ -67,6 +67,15 @@ public:
     std::string description;
 
     /**
+     * The zoom level these frames were rendered at.
+     *
+     * Kept on the series rather than read back from the screen's own "zoom wanted" field, because a
+     * zoom press changes that field long before the frames it asks for arrive: the caption has to
+     * describe the map that is actually on screen.
+     */
+    int32_t zoom = 0;
+
+    /**
      * Fetches the base map and the radar series for @a view and flattens them into RGB565 frames.
      *
      * @param[in] view where to look and how closely

@@ -483,6 +483,7 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
         station.empty() ? std::string("radar") : station,
         static_cast<int>(view.zoom)
     );
+    zoom = view.zoom;
     LOG_I(TAG, "Map ready: %u frames, %s", static_cast<unsigned>(frames.size()), description.c_str());
     return true;
 }
