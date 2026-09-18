@@ -50,7 +50,17 @@ constexpr int32_t NEWEST_FRAME_LAG_SECONDS = 180;
 /** A frame is around 30 KB and the base map around 190 KB, but a busy radar mosaic is bigger. */
 constexpr size_t MAX_BASEMAP_BYTES = 4 * 1024 * 1024;
 constexpr size_t MAX_FRAME_BYTES = 4 * 1024 * 1024;
-constexpr int32_t FETCH_TIMEOUT_MS = 45000;
+
+/** How long one request may take before it is given up on. Short, because a series is many requests
+ *  and one that is never going to finish must not hold the screen up behind it. */
+constexpr int32_t FETCH_TIMEOUT_MS = 15000;
+
+/**
+ * How long the whole series may take. Whatever has arrived by then is what gets played: six frames
+ * that are all here beat a seventh that is not, and a minute of "Loading map..." is worse than an
+ * animation that starts missing a frame.
+ */
+constexpr int32_t SERIES_BUDGET_MS = 30000;
 
 /**
  * How many frames are fetched at once, counting this task.
@@ -117,8 +127,11 @@ std::string formatTime(long long unixSeconds) {
 }
 
 std::string basemapUrl(const MapView& view) {
+    // png8 rather than png32: a topographic map has few enough colours that 256 of them look the
+    // same on a 480x231 panel, and it is 87 KB instead of 296 KB - the single largest thing this
+    // screen downloads, and the one download it cannot overlap with anything.
     return std::format(
-        "{}?bbox={}&bboxSR=3857&imageSR=3857&size={},{}&format=png32&f=image",
+        "{}?bbox={}&bboxSR=3857&imageSR=3857&size={},{}&format=png8&f=image",
         BASEMAP_URL,
         formatBoundingBox(view),
         view.width,
@@ -268,11 +281,24 @@ struct FrameWork {
     std::atomic<int32_t>* nextIndex = nullptr;
     std::atomic<int32_t>* producedCount = nullptr;
     std::atomic<bool>* succeeded = nullptr;
+    /** Tick after which no new frame is started; frames already in flight are still waited for. */
+    TickType_t deadline = 0;
 };
 
 /** Fetches, decodes and blends frames until there are none left to claim. */
 int32_t runFrameWork(FrameWork& work) {
     while (true) {
+        // Checked between frames rather than during one, so the wait is bounded by the budget plus a
+        // single request's timeout rather than by the number of frames left.
+        if (work.deadline != 0 && xTaskGetTickCount() > work.deadline) {
+            LOG_W(
+                TAG,
+                "Time is up with %d frame(s) in hand; starting no more",
+                static_cast<int>(work.producedCount->load())
+            );
+            break;
+        }
+
         const int32_t index = work.nextIndex->fetch_add(1);
         if (index >= RadarFrames::FRAME_COUNT) {
             break;
@@ -380,7 +406,8 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
         .now = now,
         .nextIndex = &nextIndex,
         .producedCount = &producedCount,
-        .succeeded = succeeded
+        .succeeded = succeeded,
+        .deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SERIES_BUDGET_MS)
     };
 
     // One worker thread, and this task is the other worker: two requests in flight, one of which
