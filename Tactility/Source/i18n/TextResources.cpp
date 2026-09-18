@@ -57,6 +57,10 @@ std::string TextResources::ERROR_RESULT = "TXT_RES_ERROR";
 
 bool TextResources::load() {
     std::vector<std::string> new_data;
+    // Without this the vector grows by doubling through every line of a translation file, and each
+    // entry is a separately allocated string: log2(N) reallocations of a growing pointer array, on a
+    // heap that has ~100 KB free.
+    new_data.reserve(192);
 
     // Resolve the language file that we need (depends on system language selection)
     auto file_path = getI18nDataFilePath(path);

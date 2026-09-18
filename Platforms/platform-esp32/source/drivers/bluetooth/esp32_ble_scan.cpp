@@ -37,7 +37,8 @@ static size_t s_name_resolve_count = 0;
 // + read-by-uuid + terminate cycle (and its transient GATT/connection buffers) for devices whose
 // name we already know, which keeps repeated scans fast and the peak memory bounded. The cache is
 // small and fixed-size; it persists across scans and app launches.
-static constexpr size_t NAME_CACHE_MAX = 64;
+static constexpr size_t NAME_CACHE_MAX = 24; // 24 entries x 72 bytes. At 64 this was 4.6 KB of .bss
+                                             // for a list a UI shows a handful of names from at once.
 static constexpr size_t CACHE_NAME_MAX = 64; // most BLE names fit well under this; keeps the table small
 struct CachedName {
     ble_addr_t addr;

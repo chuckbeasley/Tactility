@@ -315,7 +315,9 @@ bool readLines(const std::string& filePath, bool stripNewLine, std::function<voi
         return false;
     }
 
-    char line[1024];
+    // 1024 was four times the longest line any caller here reads - a timezone line is 96 bytes and a
+    // settings path 224 - and this is stack on whatever task calls it, 4 KB at the smallest.
+    char line[256];
 
     while (fgets(line, sizeof(line), file) != nullptr) {
         // Strip newline
