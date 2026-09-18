@@ -182,8 +182,7 @@ struct Context {
 
 void setStatus(Context* ctx, const std::string& text) {
     lvgl_lock();
-    if (ctx->hasWidgets()) {
-        lv_label_set_text(ctx->statusLabel, text.c_str());
+    if (ctx->hasWidgets()) {        lv_label_set_text(ctx->statusLabel, text.c_str());
     }
     lvgl_unlock();
 }
@@ -410,6 +409,10 @@ void onFrameTimer(lv_timer_t* timer) {
     // running when the frames themselves are identical.
     updateCaption(ctx);
 }
+
+// Defined below, next to the other playback state helpers; declared here because starting playback
+// needs to apply the current paused state to the fresh timer.
+void applyPaused(Context* ctx);
 
 /**
  * Puts the fetched series on screen and starts playing it. Expects the LVGL lock to be held, since it
