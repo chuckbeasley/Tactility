@@ -874,11 +874,19 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     // until the app is opened again. Nothing here is fetched again, so it costs nothing.
     if (ctx->usingServerMap && !ctx->frameDescriptors.empty()) {
         publishFrames(ctx, ctx->radarFrames, nullptr);
-    } else if (ctx->hasImage) {
+    } else if (ctx->imageDescriptor.data != nullptr) {
         lv_obj_remove_flag(ctx->gifImage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ctx->image, LV_OBJ_FLAG_HIDDEN);
         lv_gif_set_src(ctx->gifImage, &ctx->imageDescriptor);
         applyZoom(ctx);
+    } else if (ctx->hasImage) {
+        // The descriptor is what says which of the two products was on screen, so it has to be the
+        // test rather than hasImage: the series a server-rendered map is drawn from is freed with the
+        // window, so on resume hasImage is still true while the descriptor it implies was never filled
+        // in at all. Taking the GIF branch on that is a crash with an empty image source - the
+        // coredump shows gifdec's memcpy reading a GIF from address zero, via lv_gif_set_src. What was
+        // on screen is genuinely gone, so the honest thing is to ask for it again.
+        ctx->reloadRequested.store(true);
     }
 }
 
