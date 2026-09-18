@@ -133,6 +133,38 @@ bool HttpSession::get(
     size_t maxResponseBytes
 ) {
 #ifdef ESP_PLATFORM
+    // Twice, because the first attempt can fail for a reason that says nothing about the request: a
+    // kept-alive connection that the server has since closed looks exactly like a broken one, and a
+    // request written onto that dead socket simply waits. The failed attempt closes the connection,
+    // so the retry is a new one. Measured before this: one request in six stalled for 32 seconds and
+    // then failed, while its neighbours on the same session answered in under a second.
+    for (int32_t attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+            LOG_I(TAG, "Retrying %s on a new connection", url.c_str());
+        }
+        if (getOnce(url, outBody, outError, timeoutMs, maxResponseBytes)) {
+            return true;
+        }
+    }
+    return false;
+#else
+    (void)url;
+    (void)outBody;
+    (void)timeoutMs;
+    (void)maxResponseBytes;
+    outError = "Networking is unavailable on this platform";
+    return false;
+#endif
+}
+
+bool HttpSession::getOnce(
+    const std::string& url,
+    std::string& outBody,
+    std::string& outError,
+    int32_t timeoutMs,
+    size_t maxResponseBytes
+) {
+#ifdef ESP_PLATFORM
     if (client == nullptr) {
         LOG_I(TAG, "GET %s (new connection)", url.c_str());
 

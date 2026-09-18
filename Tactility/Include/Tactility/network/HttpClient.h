@@ -78,6 +78,15 @@ public:
     void close();
 
 private:
+    /** One attempt; get() wraps this so a dead kept-alive connection costs one retry, not a frame. */
+    bool getOnce(
+        const std::string& url,
+        std::string& outBody,
+        std::string& outError,
+        int32_t timeoutMs,
+        size_t maxResponseBytes
+    );
+
     esp_http_client* client = nullptr;
 };
 
