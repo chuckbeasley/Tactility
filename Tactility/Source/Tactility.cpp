@@ -592,9 +592,11 @@ void run(Module* const dtsModules[], const DtsDevice dtsDevices[]) {
 
     const uint32_t lvglTaskStackSize =
 #if defined(CONFIG_IDF_TARGET_ESP32C5)
-        // C5 boot path decodes PNG splash via lodepng on the LVGL task; keep extra
-        // headroom to avoid deep-call-chain stack pressure corrupting heap metadata.
-        12288;
+        // C5 boot path decodes PNG splash via lodepng on the LVGL task, so it keeps more headroom
+        // than the other targets. Measured high-water mark on this board is 4,356 bytes used, and
+        // that minimum-ever figure already includes the splash: 8192 leaves 3.8 KB spare, against
+        // the 12,288 this used to reserve from a heap with ~88 KB free.
+        8192;
 #else
         9120;
 #endif

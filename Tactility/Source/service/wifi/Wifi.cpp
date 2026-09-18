@@ -137,7 +137,9 @@ RadioState combineRadioState(WifiRadioState radio, WifiStationState station) {
 // ---- WifiEvent consumer thread ----
 // Runs onWifiDeviceEvent() on its own stack (see WifiServiceState::wifiEventGroup's comment).
 
-constexpr configSTACK_DEPTH_TYPE WIFI_EVENT_THREAD_STACK_SIZE = 4096;
+// Measured on the ESP32-C5: 808 bytes used. This thread only waits on an event group and forwards
+// to the dispatcher, so 4096 was five times what it needs.
+constexpr configSTACK_DEPTH_TYPE WIFI_EVENT_THREAD_STACK_SIZE = 2048;
 
 int32_t wifiEventThreadMain() {
     // The 250ms timeout only bounds how promptly a stop request (wifiEventThreadRunning going

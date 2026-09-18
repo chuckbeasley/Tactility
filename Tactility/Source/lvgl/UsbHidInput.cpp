@@ -26,7 +26,8 @@ constexpr auto* TAG = "UsbHidInput";
 
 constexpr auto HID_EVENT_QUEUE_SIZE    = 64;
 constexpr auto KEY_EVENT_QUEUE_SIZE    = 64;
-constexpr auto TASK_STACK              = 3072;
+constexpr auto TASK_STACK              = 2560; // measured 1412 used; the thinnest margin of the
+                                               // stack reductions, so this one keeps real headroom
 constexpr auto TASK_PRIORITY           = 5;
 constexpr auto STOP_TIMEOUT_MS         = 2000;
 constexpr uint32_t KEY_REPEAT_DELAY_MS = 500;
