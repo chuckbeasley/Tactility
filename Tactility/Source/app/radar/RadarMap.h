@@ -20,6 +20,7 @@
 // one buffer per frame instead of an alpha channel and lets playback be a pointer swap.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -61,6 +62,11 @@ class RadarFrames {
 public:
     static constexpr int32_t FRAME_COUNT = 6;
 
+    /**
+     * One entry per time slot, oldest first. A slot whose pixels are null is one that never arrived,
+     * which is why this keeps its shape instead of being closed up: the index of a slot is its
+     * position in time, and the screen publishes slots as they arrive rather than all at the end.
+     */
     std::vector<MapFrame> frames;
 
     /** What was fetched, for the caption and the log. */
@@ -76,19 +82,48 @@ public:
     int32_t zoom = 0;
 
     /**
-     * Fetches the base map and the radar series for @a view and flattens them into RGB565 frames.
+     * Reports that one more slot has become displayable.
+     *
+     * Called from whichever thread finished the frame, so an implementation that touches widgets has
+     * to take the graphics lock, exactly as the decode path does. @a ready is the slot array and must
+     * be read with acquire: a frame's pixels are only complete once its own flag has been set.
+     */
+    using FrameReady = void (*)(void* userData, const RadarFrames& series, const std::atomic<bool>* ready);
+
+    /**
+     * Fetches the base map, the boundaries and the radar series for @a view, flattening each frame
+     * into RGB565 over a base that is blended once instead of six times.
      *
      * @param[in] view where to look and how closely
      * @param[in] station the radar site being shown, used only to describe the result
      * @param[out] outError a short reason on failure, fit to show on screen
+     * @param[in] onFrameReady called as each frame arrives, or null to wait for the whole series
+     * @param[in] userData passed back to @a onFrameReady
      * @return true when at least one frame was produced
      */
-    bool fetch(const MapView& view, const std::string& station, std::string& outError);
+    bool fetch(
+        const MapView& view,
+        const std::string& station,
+        std::string& outError,
+        FrameReady onFrameReady = nullptr,
+        void* userData = nullptr
+    );
 
     /** Drops every frame and the pixels behind them. */
     void clear();
 
-    bool isEmpty() const { return frames.empty(); }
+    /** How many slots hold a frame. */
+    int32_t readyCount() const {
+        int32_t count = 0;
+        for (const auto& frame : frames) {
+            if (frame.pixels != nullptr) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    bool isEmpty() const { return readyCount() == 0; }
 
 private:
     /** One block for every frame, so this is the only thing that owns imagery. */

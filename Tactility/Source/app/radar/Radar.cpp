@@ -157,6 +157,14 @@ struct Context {
     // so playback is a source swap, and the timer that does the swapping.
     RadarFrames radarFrames;
     std::vector<lv_image_dsc_t> frameDescriptors;
+    /**
+     * The observation time of each descriptor, in the same order as @a frameDescriptors.
+     *
+     * Carried beside the descriptors rather than read back out of the series, because the series keeps
+     * a slot per time step and a frame that never arrived leaves a hole: a descriptor's position is
+     * not a slot's position.
+     */
+    std::vector<long long> frameEpochs;
     lv_timer_t* frameTimer = nullptr;
     size_t frameIndex = 0;
     bool usingServerMap = false;
@@ -192,7 +200,8 @@ struct Context {
 
 void setStatus(Context* ctx, const std::string& text) {
     lvgl_lock();
-    if (ctx->hasWidgets()) {        lv_label_set_text(ctx->statusLabel, text.c_str());
+    if (ctx->hasWidgets()) {
+        lv_label_set_text(ctx->statusLabel, text.c_str());
     }
     lvgl_unlock();
 }
@@ -297,8 +306,8 @@ void updateCaption(Context* ctx) {
         // is the same picture - this is the only thing on screen that moves, and it is how the user
         // can tell the series is advancing rather than stuck.
         std::string observed = "--:--";
-        if (ctx->frameIndex < ctx->radarFrames.frames.size()) {
-            const auto epoch = static_cast<time_t>(ctx->radarFrames.frames[ctx->frameIndex].epochSeconds);
+        if (ctx->frameIndex < ctx->frameEpochs.size()) {
+            const auto epoch = static_cast<time_t>(ctx->frameEpochs[ctx->frameIndex]);
             std::tm local {};
             localtime_r(&epoch, &local);
             observed = std::format("{:02}:{:02}", local.tm_hour, local.tm_min);
@@ -435,19 +444,29 @@ void onFrameTimer(lv_timer_t* timer) {
 void applyPaused(Context* ctx);
 
 /**
- * Puts the fetched series on screen and starts playing it. Expects the LVGL lock to be held, since it
- * creates a timer and touches widgets.
+ * Puts every frame of @a series that is ready on screen, and starts playing them.
  *
- * Each frame gets its own descriptor pointing into the block of pixels the series owns, so advancing
- * a frame is a source swap rather than an assignment of pixels.
+ * Called once per frame as they arrive, not once per series: the fetch publishes each slot the moment
+ * it is flattened, so the map appears as soon as its first frame does rather than when the last one
+ * does. @a ready is the series' slot flags when this is called mid-fetch, and null when the fetch has
+ * finished and the slots speak for themselves.
+ *
+ * Expects the LVGL lock to be held, since it creates a timer and touches widgets.
  */
-void startPlayback(Context* ctx) {
-    if (!ctx->hasWidgets() || ctx->radarFrames.isEmpty()) {
+void publishFrames(Context* ctx, const RadarFrames& series, const std::atomic<bool>* ready) {
+    if (!ctx->hasWidgets()) {
         return;
     }
 
+    // Rebuilt from scratch each time, because a descriptor points into the descriptor vector that
+    // holds it: appending to a vector that a widget is pointing into is how a dangling source happens.
     ctx->frameDescriptors.clear();
-    for (const auto& frame : ctx->radarFrames.frames) {
+    ctx->frameEpochs.clear();
+    for (size_t slot = 0; slot < series.frames.size(); slot++) {
+        const auto& frame = series.frames[slot];
+        if (frame.pixels == nullptr || (ready != nullptr && !ready[slot].load())) {
+            continue;
+        }
         lv_image_dsc_t descriptor {};
         descriptor.header.magic = LV_IMAGE_HEADER_MAGIC;
         descriptor.header.cf = LV_COLOR_FORMAT_RGB565;
@@ -456,22 +475,29 @@ void startPlayback(Context* ctx) {
         descriptor.data_size = static_cast<uint32_t>(frame.width) * static_cast<uint32_t>(frame.height) * 2;
         descriptor.data = frame.pixels;
         ctx->frameDescriptors.push_back(descriptor);
+        ctx->frameEpochs.push_back(frame.epochSeconds);
+    }
+
+    if (ctx->frameDescriptors.empty()) {
+        return;
     }
 
     // The frames are rendered at exactly this window's size, so there is no scaling and no scrolling.
-    const auto& first = ctx->radarFrames.frames.front();
-    lv_obj_set_size(ctx->image, first.width, first.height);
+    // Measured from the first frame that is ready rather than from the first slot, which may be the
+    // hole left by a frame that never arrived.
+    const auto& first = ctx->frameDescriptors.front();
+    lv_obj_set_size(ctx->image, first.header.w, first.header.h);
     lv_obj_set_pos(ctx->image, 0, 0);
-    lv_image_set_src(ctx->image, &ctx->frameDescriptors.front());
+    ctx->frameIndex = ctx->frameIndex % ctx->frameDescriptors.size();
+    lv_image_set_src(ctx->image, &ctx->frameDescriptors[ctx->frameIndex]);
     lv_obj_remove_flag(ctx->image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ctx->gifImage, LV_OBJ_FLAG_HIDDEN);
 
-    ctx->frameIndex = 0;
     ctx->usingServerMap = true;
     ctx->hasImage = true;
     // From the series itself, not from the zoom that was asked for: this is the map that is now on
     // screen, and the caption tells the user which one that is.
-    ctx->displayedZoom = ctx->radarFrames.zoom;
+    ctx->displayedZoom = series.zoom;
     if (ctx->frameTimer == nullptr) {
         ctx->frameTimer = lv_timer_create(onFrameTimer, FRAME_DURATION_MS, ctx);
     }
@@ -481,7 +507,7 @@ void startPlayback(Context* ctx) {
 
     updateCaption(ctx);
     updateZoomButtons(ctx);
-    LOG_I(TAG, "Playing %u frames", static_cast<unsigned>(ctx->frameDescriptors.size()));
+    LOG_I(TAG, "Playing %u of %d frames", static_cast<unsigned>(ctx->frameDescriptors.size()), static_cast<int>(RadarFrames::FRAME_COUNT));
 }
 
 /**
@@ -659,12 +685,25 @@ void showImage(Context* ctx, tt::network::HttpBody data) {
     lvgl_unlock();
 }
 
+/**
+ * Called by the fetch as each frame is flattened, on whichever thread finished it.
+ *
+ * On a worker thread, so the graphics lock has to be taken here - the same rule the decode follows.
+ * Publishing each frame as it arrives is what puts the map on screen without waiting for the last of
+ * the six, which measured over a second on its own.
+ */
+void onFrameReady(void* userData, const RadarFrames& series, const std::atomic<bool>* ready) {
+    auto* ctx = static_cast<Context*>(userData);
+    lvgl_lock();
+    publishFrames(ctx, series, ready);
+    lvgl_unlock();
+}
+
 void loadRadar(Context* ctx) {
     if (ctx->station.empty()) {
         setStatus(ctx, "No radar site is published for this location");
         return;
     }
-
     setStatus(ctx, "Loading map...");
     LOG_I(TAG, "Radar station %s at map zoom %d", ctx->station.c_str(), static_cast<int>(ctx->mapZoom));
 
@@ -690,16 +729,18 @@ void loadRadar(Context* ctx) {
             .height = window_height
         };
 
-        // Fetched into a series of its own so that a failure leaves whatever is already on screen
-        // alone - a failed zoom must not cost the user the map they were looking at.
+        // Fetched into a series of its own so that a total failure leaves whatever is already on
+        // screen alone - a failed zoom must not cost the user the map they were looking at. Frames
+        // that do arrive are published as they land: see onFrameReady.
         RadarFrames fetched;
         std::string error;
-        if (fetched.fetch(view, ctx->station, error)) {
+        if (fetched.fetch(view, ctx->station, error, onFrameReady, ctx)) {
+            // The pixels have to outlive this function, because the descriptors already on screen
+            // point into them; the move keeps the block and changes only who owns it.
             lvgl_lock();
             if (ctx->hasWidgets()) {
-                stopPlayback(ctx);
                 ctx->radarFrames = std::move(fetched);
-                startPlayback(ctx);
+                publishFrames(ctx, ctx->radarFrames, nullptr);
             }
             lvgl_unlock();
             return;
@@ -799,7 +840,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     // suspend too - can put what it already has back, rather than coming back to an empty frame
     // until the app is opened again. Nothing here is fetched again, so it costs nothing.
     if (ctx->usingServerMap && !ctx->frameDescriptors.empty()) {
-        startPlayback(ctx);
+        publishFrames(ctx, ctx->radarFrames, nullptr);
     } else if (ctx->hasImage) {
         lv_obj_remove_flag(ctx->gifImage, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ctx->image, LV_OBJ_FLAG_HIDDEN);
