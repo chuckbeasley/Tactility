@@ -48,6 +48,15 @@ struct DeviceEntry {
 struct Context {
     uint32_t appInstanceId;
     std::unique_ptr<Timer> timer;
+    /**
+     * Whether this app's window exists right now.
+     *
+     * The window manager destroys the window on suspend as well as on close, and this timer refreshes
+     * widgets every second: without the check it walks objects that have already been deleted, which
+     * faults inside LVGL rather than being harmless. Checked after taking the graphics lock, because a
+     * callback already waiting on that lock runs once the destroyer has finished with the widgets.
+     */
+    std::atomic<bool> windowAlive{false};
     std::vector<DeviceEntry> entries;
 };
 
@@ -140,6 +149,10 @@ void onQuickChargeChanged(lv_event_t* event) {
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
 
+    // Also the resume path, so the flags and the timer follow the window.
+    ctx->windowAlive.store(true);
+    if (ctx->timer != nullptr) ctx->timer->start();
+
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
 
@@ -226,6 +239,13 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     }
 }
 
+/** Called when this window's widget is deleted, which happens on suspend as well as on close. */
+void destroyWidgets(void* userData) {
+    auto* ctx = static_cast<Context*>(userData);
+    ctx->windowAlive.store(false);
+    if (ctx->timer != nullptr) ctx->timer->stop();
+}
+
 int32_t appMain(int argc, char* argv[]) {
     uint32_t appInstanceId = app_scheduler_current_app_id();
     Context ctx {};
@@ -235,6 +255,8 @@ int32_t appMain(int argc, char* argv[]) {
     // push notification for power-supply property changes, so this is the only way this screen
     // finds out about them.
     ctx.timer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(1000), [&ctx] {
+        // Started by createWidgets, so the timer follows the window rather than the app instance.
+        if (!ctx.windowAlive.load()) return;
         updateUi(&ctx);
     });
 
@@ -244,8 +266,7 @@ int32_t appMain(int argc, char* argv[]) {
     AppEventSubscription sub {};
     check(app_event_subscribe(&sub, &event_group) == ERROR_NONE);
 
-    WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
-    ctx.timer->start();
+    WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
 
     bool shouldClose = false;
     while (!shouldClose) {

@@ -55,6 +55,14 @@ struct Context {
     // LVGL, so it must not run once the widget tree is going away - and stopping the timer does not
     // wait for a callback that has already begun. See the close path for how the two are ordered.
     std::atomic<bool> closing{false};
+    /**
+     * Whether this app's window exists right now.
+     *
+     * Separate from `closing`, which only the close path sets: the window manager also destroys the
+     * window on suspend, and the refresh timer below would otherwise keep walking widgets that no
+     * longer exist.
+     */
+    std::atomic<bool> windowAlive{false};
 
     // Set when a delete confirmation is pending; read/cleared on this app's own thread when
     // the dialog's result arrives.
@@ -262,12 +270,18 @@ void updateDeviceStates(Context* ctx) {
  */
 void destroyWidgets(void* userData) {
     auto* ctx = static_cast<Context*>(userData);
+    ctx->windowAlive.store(false);
+    if (ctx->timer != nullptr) ctx->timer->stop();
     ctx->deviceRows.clear();
     ctx->deviceListWrapper = nullptr;
 }
 
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
+
+    // Also the resume path, so the timer follows the window rather than the app instance.
+    ctx->windowAlive.store(true);
+    if (ctx->timer != nullptr) ctx->timer->start();
 
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
@@ -304,7 +318,7 @@ int32_t appMain(int argc, char* argv[]) {
     ctx.timer = std::make_unique<Timer>(Timer::Type::Periodic, seconds_to_ticks(1), [&ctx] {
         // A callback that has not started yet is dropped here; one already running is waited for by
         // the close path taking the LVGL lock, which this callback holds for its whole body.
-        if (ctx.closing.load()) return;
+        if (ctx.closing.load() || !ctx.windowAlive.load()) return;
         updateDeviceStates(&ctx);
     });
 
