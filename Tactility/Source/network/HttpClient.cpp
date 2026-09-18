@@ -327,6 +327,12 @@ bool HttpSession::getOnce(
         // What makes a session worth having: without this the connection is torn down when the
         // request completes and the next one pays for the handshake again.
         config.keep_alive_enable = true;
+#if CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
+        // A kept-alive connection that the server has since closed, or the retry below, means a new
+        // handshake - and a handshake on this board measures about 1.3 seconds, nearly all of it
+        // certificate work. Session tickets let that handshake resume instead of starting over.
+        config.save_client_session = true;
+#endif
         // The receive buffer reads from the transport into, and the only square feet this has: it is
         // a plain malloc, so it comes out of internal RAM, and it bounds how much is moved per trip
         // through the parser. Four times the 512-byte default trades 1.5 KB of internal heap per
@@ -394,6 +400,11 @@ bool httpGet(
     // Matches the session's receive buffer, for the same reason and with the same cost: this one is
     // a plain malloc out of internal RAM, so its size is a trade against trips through the parser.
     config.buffer_size = 2048;
+#if CONFIG_ESP_TLS_CLIENT_SESSION_TICKETS
+    // Nothing to reuse within a one-off request, but the ticket it saves is what a later request can
+    // resume from when the same server is asked for something else.
+    config.save_client_session = true;
+#endif
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == nullptr) {

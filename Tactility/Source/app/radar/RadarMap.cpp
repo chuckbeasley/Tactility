@@ -535,6 +535,12 @@ bool RadarFrames::fetch(
     // are then drawn over the result, which is why the boundaries are no longer part of their request.
     std::vector<uint8_t> composite(framePixels);
     const std::string staticKey = basemapUrl(view);
+
+    // Opened before the boundaries because the boundaries and this task's frames are the same host:
+    // a connection here costs about 1.3 seconds of TLS handshake, and opening one for the boundaries
+    // and then throwing it away left the frames to pay for another.
+    tt::network::HttpSession callerSession;
+
     if (staticLayers().key == staticKey && staticLayers().composite.size() == framePixels) {
         composite = staticLayers().composite;
         LOG_I(TAG, "Base map and boundaries kept from the last time this view was fetched");
@@ -564,7 +570,7 @@ bool RadarFrames::fetch(
         std::string boundaryError;
         DecodedImage boundaries;
         const bool haveBoundaries =
-            tt::network::httpGet(boundaryUrl(view), boundaryData, boundaryError, FETCH_TIMEOUT_MS, MAX_BASEMAP_BYTES) &&
+            callerSession.get(boundaryUrl(view), boundaryData, boundaryError, FETCH_TIMEOUT_MS, MAX_BASEMAP_BYTES) &&
             decodePng(boundaryData.data(), boundaryData.size(), boundaries, boundaryError) &&
             boundaries.width == basemap.width &&
             boundaries.height == basemap.height;
@@ -581,7 +587,6 @@ bool RadarFrames::fetch(
         staticLayers().key = staticKey;
         staticLayers().composite = composite;
     }
-
     const long long now = static_cast<long long>(std::time(nullptr));
 
     // Frames are claimed from a shared counter rather than handed out in advance, so a worker that
@@ -594,7 +599,7 @@ bool RadarFrames::fetch(
 
     // One session per slot, so two connections rather than one per frame: each worker keeps its
     // connection open and issues its frames over it, which is where the handshakes stop being paid.
-    tt::network::HttpSession callerSession;
+    // The caller's is the one the boundaries were fetched over.
     tt::network::HttpSession workerSession;
 
     FrameWork work {
