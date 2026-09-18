@@ -385,102 +385,147 @@ struct FrameWork {
     size_t framePixels = 0;
     long long now = 0;
     std::atomic<int32_t>* nextIndex = nullptr;
+    /** Claimed by the decode pass, which is a separate pass because the bodies arrive first. */
+    std::atomic<int32_t>* nextDecode = nullptr;
     std::atomic<int32_t>* producedCount = nullptr;
     std::atomic<bool>* succeeded = nullptr;
+    /** Set by the fetch that owns a slot once its body has been read, successfully or not. */
+    std::atomic<bool>* bodyFetched = nullptr;
+    /** One body per slot, fetched during the static phase and decoded after it. */
+    std::vector<tt::network::HttpBody>* bodies = nullptr;
     /** One connection for this slot's frames, instead of a TLS handshake per frame. */
     tt::network::HttpSession* session = nullptr;
     /** The series being filled, so a finished slot can be published the moment it is ready. */
     RadarFrames* series = nullptr;
     RadarFrames::FrameReady onFrameReady = nullptr;
     void* userData = nullptr;
+    /** Raised once the base map and the boundaries exist, or once building them has failed. */
+    std::atomic<bool>* compositeReady = nullptr;
+    std::atomic<bool>* compositeFailed = nullptr;
     /** Tick after which no new frame is started; frames already in flight are still waited for. */
     TickType_t deadline = 0;
 };
 
-/** Fetches, decodes and blends frames until there are none left to claim. */
+/** The observation time slot @a index is asked for: oldest first, so playback runs forward in time. */
+std::string frameTime(const FrameWork& work, int32_t index) {
+    const int32_t ageSeconds = NEWEST_FRAME_LAG_SECONDS +
+        (RadarFrames::FRAME_COUNT - 1 - index) * FRAME_INTERVAL_SECONDS;
+    return formatTime(work.now - ageSeconds);
+}
+
+/** True once the whole series has run out of time. */
+bool outOfTime(const FrameWork& work) {
+    return work.deadline != 0 && xTaskGetTickCount() > work.deadline;
+}
+
+bool decodeAndPublish(FrameWork& work, int32_t index, const std::string& time) {
+    auto& body = (*work.bodies)[index];
+    if (body.empty()) {
+        return false;
+    }
+
+    DecodedImage overlay;
+    std::string frameError;
+    bool decoded = false;
+    {
+        // LVGL is not thread safe, so the decode happens under the graphics lock. The blending below
+        // is arithmetic on two buffers and needs nothing.
+        lvgl_lock();
+        decoded = decodePng(body.data(), body.size(), overlay, frameError);
+        lvgl_unlock();
+    }
+    if (!decoded) {
+        LOG_W(TAG, "Frame %s did not decode: %s", time.c_str(), frameError.c_str());
+        return false;
+    }
+    if (static_cast<int32_t>(overlay.width) != work.view->width ||
+        static_cast<int32_t>(overlay.height) != work.view->height) {
+        LOG_W(TAG, "Frame %s is %ux%u", time.c_str(), overlay.width, overlay.height);
+        return false;
+    }
+
+    uint8_t* slot = work.pixels->data() + (static_cast<size_t>(index) * work.framePixels);
+    blendOver(slot, work.composite, overlay);
+
+    // The slot is filled *before* its flag is raised, which is what lets the screen show a frame
+    // without waiting for the rest: a reader that sees the flag is guaranteed to see the pixels.
+    work.series->frames[index] = MapFrame {
+        .pixels = slot,
+        .width = work.view->width,
+        .height = work.view->height,
+        .epochSeconds = work.now - (NEWEST_FRAME_LAG_SECONDS + (RadarFrames::FRAME_COUNT - 1 - index) * FRAME_INTERVAL_SECONDS)
+    };
+    work.succeeded[index].store(true);
+    work.producedCount->fetch_add(1);
+
+    if (work.onFrameReady != nullptr) {
+        work.onFrameReady(work.userData, *work.series, work.succeeded);
+    }
+    LOG_I(
+        TAG,
+        "Frame %d at %s: %u bytes",
+        static_cast<int>(index),
+        time.c_str(),
+        static_cast<unsigned>(body.size())
+    );
+    return true;
+}
+
+/**
+ * Fetches, decodes and blends frames until there are none left to claim.
+ *
+ * Two passes rather than one, because the two halves want opposite things: the bodies are a few
+ * hundred bytes each and want to be in flight as early as possible, while the blend cannot happen
+ * until the base map and the boundaries exist. Doing them in one pass would leave a worker holding a
+ * body it cannot draw while the base map is still downloading.
+ */
 int32_t runFrameWork(FrameWork& work) {
-    // One body for the whole series, not one per frame: the client empties it in place before each
-    // use, so its PSRAM buffer is allocated once and reused for every frame.
-    tt::network::HttpBody frameData;
-
-    while (true) {
-        // Checked between frames rather than during one, so the wait is bounded by the budget plus a
-        // single request's timeout rather than by the number of frames left.
-        if (work.deadline != 0 && xTaskGetTickCount() > work.deadline) {
-            LOG_W(
-                TAG,
-                "Time is up with %d frame(s) in hand; starting no more",
-                static_cast<int>(work.producedCount->load())
-            );
-            break;
-        }
-
+    // Pass one: every body, which is what overlaps the series with the static layers the caller is
+    // building at the same time.
+    while (!outOfTime(work)) {
         const int32_t index = work.nextIndex->fetch_add(1);
         if (index >= RadarFrames::FRAME_COUNT) {
             break;
         }
-
-        // Oldest first, so playback runs forward in time like the loop it replaces.
-        const int32_t ageSeconds = NEWEST_FRAME_LAG_SECONDS +
-            (RadarFrames::FRAME_COUNT - 1 - index) * FRAME_INTERVAL_SECONDS;
-        const std::string time = formatTime(work.now - ageSeconds);
-
+        const std::string time = frameTime(work, index);
         std::string frameError;
         if (!work.session->get(
                 radarUrl(*work.view, time),
-                frameData,
+                (*work.bodies)[index],
                 frameError,
                 FETCH_TIMEOUT_MS,
                 MAX_FRAME_BYTES
             )) {
             LOG_W(TAG, "Frame %s failed: %s", time.c_str(), frameError.c_str());
-            continue;
         }
-
-        DecodedImage overlay;
-        bool decoded = false;
-        {
-            // LVGL is not thread safe, so the decode happens under the graphics lock. The blending
-            // below is arithmetic on two buffers and needs nothing.
-            lvgl_lock();
-            decoded = decodePng(frameData.data(), frameData.size(), overlay, frameError);
-            lvgl_unlock();
-        }
-        if (!decoded) {
-            LOG_W(TAG, "Frame %s did not decode: %s", time.c_str(), frameError.c_str());
-            continue;
-        }
-        if (static_cast<int32_t>(overlay.width) != work.view->width ||
-            static_cast<int32_t>(overlay.height) != work.view->height) {
-            LOG_W(TAG, "Frame %s is %ux%u", time.c_str(), overlay.width, overlay.height);
-            continue;
-        }
-
-        uint8_t* slot = work.pixels->data() + (static_cast<size_t>(index) * work.framePixels);
-        blendOver(slot, work.composite, overlay);
-
-        // The slot is filled *before* its flag is raised, which is what lets the screen show a frame
-        // without waiting for the rest: a reader that sees the flag is guaranteed to see the pixels.
-        work.series->frames[index] = MapFrame {
-            .pixels = slot,
-            .width = work.view->width,
-            .height = work.view->height,
-            .epochSeconds = work.now - ageSeconds
-        };
-        work.succeeded[index].store(true);
-        work.producedCount->fetch_add(1);
-
-        if (work.onFrameReady != nullptr) {
-            work.onFrameReady(work.userData, *work.series, work.succeeded);
-        }
-        LOG_I(
-            TAG,
-            "Frame %d at %s: %u bytes",
-            static_cast<int>(index),
-            time.c_str(),
-            static_cast<unsigned>(frameData.size())
-        );
+        work.bodyFetched[index].store(true);
     }
+
+    // The caller is fetching the base map and the boundaries; nothing can be drawn until it has. Five
+    // milliseconds is a compromise rather than a poll: the wait is seconds long and the radio is
+    // shared with the fetch doing the work.
+    while (!work.compositeReady->load() && !work.compositeFailed->load() && !outOfTime(work)) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    // Pass two: decode and blend, which needs the graphics lock and therefore benefits from being
+    // spread over every thread that is free.
+    while (work.compositeReady->load() && !outOfTime(work)) {
+        const int32_t index = work.nextDecode->fetch_add(1);
+        if (index >= RadarFrames::FRAME_COUNT) {
+            break;
+        }
+        // Claimed by pass one, so this waits for that fetch rather than deciding it failed: the only
+        // way to know a body is missing is to have seen its flag raised.
+        while (!work.bodyFetched[index].load() && !outOfTime(work)) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        if (outOfTime(work)) {
+            break;
+        }
+        decodeAndPublish(work, index, frameTime(work, index));
+    }
+
     return 0;
 }
 
@@ -514,6 +559,62 @@ StaticLayers& staticLayers() {
     return layers;
 }
 
+/**
+ * Fetches the base map and the boundaries and blends them into @a composite, which every frame is
+ * then drawn over. Runs once per series, on the caller's thread, while the frame bodies are already
+ * in flight.
+ *
+ * @return false with @a outError set when the base map cannot be had at all, which is the one failure
+ *         that leaves nothing to draw; missing boundaries are drawn around rather than fatal.
+ */
+bool buildStaticLayers(
+    const MapView& view,
+    std::vector<uint8_t>& composite,
+    tt::network::HttpSession& session,
+    std::string& outError
+) {
+    // The base map is the largest single image in the system - 87 KB as png8 - so its body is the one
+    // that has to come out of PSRAM rather than internal RAM.
+    tt::network::HttpBody basemapData;
+    if (!tt::network::httpGet(basemapUrl(view), basemapData, outError, FETCH_TIMEOUT_MS, MAX_BASEMAP_BYTES)) {
+        LOG_W(TAG, "Base map failed: %s", outError.c_str());
+        return false;
+    }
+    LOG_I(TAG, "Base map: %u bytes", static_cast<unsigned>(basemapData.size()));
+
+    DecodedImage basemap;
+    if (!decodePng(basemapData.data(), basemapData.size(), basemap, outError)) {
+        LOG_W(TAG, "Base map did not decode: %s", outError.c_str());
+        return false;
+    }
+    if (static_cast<int32_t>(basemap.width) != view.width || static_cast<int32_t>(basemap.height) != view.height) {
+        outError = std::format("base map is {}x{}", basemap.width, basemap.height);
+        LOG_W(TAG, "%s", outError.c_str());
+        return false;
+    }
+
+    // The boundaries, once for the whole series rather than once per frame, over the connection the
+    // frames will then use.
+    tt::network::HttpBody boundaryData;
+    std::string boundaryError;
+    DecodedImage boundaries;
+    const bool haveBoundaries =
+        session.get(boundaryUrl(view), boundaryData, boundaryError, FETCH_TIMEOUT_MS, MAX_BASEMAP_BYTES) &&
+        decodePng(boundaryData.data(), boundaryData.size(), boundaries, boundaryError) &&
+        boundaries.width == basemap.width &&
+        boundaries.height == basemap.height;
+
+    if (haveBoundaries) {
+        LOG_I(TAG, "Boundaries: %u bytes", static_cast<unsigned>(boundaryData.size()));
+        flatten(basemap, boundaries, composite.data());
+    } else {
+        // Lines missing off a map are not a reason to show no map, so this is not fatal.
+        LOG_W(TAG, "Boundaries unavailable (%s); drawing the base map alone", boundaryError.c_str());
+        flattenBase(basemap, composite.data());
+    }
+    return true;
+}
+
 bool RadarFrames::fetch(
     const MapView& view,
     const std::string& station,
@@ -541,61 +642,20 @@ bool RadarFrames::fetch(
     // and then throwing it away left the frames to pay for another.
     tt::network::HttpSession callerSession;
 
-    if (staticLayers().key == staticKey && staticLayers().composite.size() == framePixels) {
-        composite = staticLayers().composite;
-        LOG_I(TAG, "Base map and boundaries kept from the last time this view was fetched");
-    } else {
-        // The base map is the largest single image in the system - 87 KB as png8 - so its body is the
-        // one that has to come out of PSRAM rather than internal RAM.
-        tt::network::HttpBody basemapData;
-        if (!tt::network::httpGet(basemapUrl(view), basemapData, outError, FETCH_TIMEOUT_MS, MAX_BASEMAP_BYTES)) {
-            LOG_W(TAG, "Base map failed: %s", outError.c_str());
-            return false;
-        }
-        LOG_I(TAG, "Base map: %u bytes", static_cast<unsigned>(basemapData.size()));
-
-        DecodedImage basemap;
-        if (!decodePng(basemapData.data(), basemapData.size(), basemap, outError)) {
-            LOG_W(TAG, "Base map did not decode: %s", outError.c_str());
-            return false;
-        }
-        if (static_cast<int32_t>(basemap.width) != view.width || static_cast<int32_t>(basemap.height) != view.height) {
-            outError = std::format("base map is {}x{}", basemap.width, basemap.height);
-            LOG_W(TAG, "%s", outError.c_str());
-            return false;
-        }
-
-        // The boundaries, once for the whole series rather than once per frame.
-        tt::network::HttpBody boundaryData;
-        std::string boundaryError;
-        DecodedImage boundaries;
-        const bool haveBoundaries =
-            callerSession.get(boundaryUrl(view), boundaryData, boundaryError, FETCH_TIMEOUT_MS, MAX_BASEMAP_BYTES) &&
-            decodePng(boundaryData.data(), boundaryData.size(), boundaries, boundaryError) &&
-            boundaries.width == basemap.width &&
-            boundaries.height == basemap.height;
-
-        if (haveBoundaries) {
-            LOG_I(TAG, "Boundaries: %u bytes", static_cast<unsigned>(boundaryData.size()));
-            flatten(basemap, boundaries, composite.data());
-        } else {
-            // Lines missing off a map are not a reason to show no map, so this is not fatal.
-            LOG_W(TAG, "Boundaries unavailable (%s); drawing the base map alone", boundaryError.c_str());
-            flattenBase(basemap, composite.data());
-        }
-
-        staticLayers().key = staticKey;
-        staticLayers().composite = composite;
-    }
-    const long long now = static_cast<long long>(std::time(nullptr));
-
     // Frames are claimed from a shared counter rather than handed out in advance, so a worker that
     // finishes early takes the next one instead of idling, and each writes into its own slot - which
     // is what keeps the series in time order however the requests interleave.
     std::atomic<int32_t> nextIndex { 0 };
+    std::atomic<int32_t> nextDecode { 0 };
     std::atomic<int32_t> producedCount { 0 };
     std::atomic<bool> succeeded[FRAME_COUNT] {};
+    std::atomic<bool> bodyFetched[FRAME_COUNT] {};
+    std::atomic<bool> compositeReady { false };
+    std::atomic<bool> compositeFailed { false };
+    /** One body per slot. A frame is a few hundred bytes, so all six are held without a thought. */
+    std::vector<tt::network::HttpBody> bodies(FRAME_COUNT);
 
+    const long long now = static_cast<long long>(std::time(nullptr));
 
     // One session per slot, so two connections rather than one per frame: each worker keeps its
     // connection open and issues its frames over it, which is where the handshakes stop being paid.
@@ -609,12 +669,17 @@ bool RadarFrames::fetch(
         .framePixels = framePixels,
         .now = now,
         .nextIndex = &nextIndex,
+        .nextDecode = &nextDecode,
         .producedCount = &producedCount,
         .succeeded = succeeded,
+        .bodyFetched = bodyFetched,
+        .bodies = &bodies,
         .session = &callerSession,
         .series = this,
         .onFrameReady = onFrameReady,
         .userData = userData,
+        .compositeReady = &compositeReady,
+        .compositeFailed = &compositeFailed,
         .deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SERIES_BUDGET_MS)
     };
 
@@ -646,11 +711,40 @@ bool RadarFrames::fetch(
         LOG_W(TAG, "No room for a frame worker; fetching on this task alone");
     }
 
+    // The worker is already fetching frame bodies while this runs: the base map is the single slowest
+    // thing here at three seconds, and the six frame requests no longer wait behind it.
+    bool haveStatic = false;
+    if (staticLayers().key == staticKey && staticLayers().composite.size() == framePixels) {
+        composite = staticLayers().composite;
+        haveStatic = true;
+        LOG_I(TAG, "Base map and boundaries kept from the last time this view was fetched");
+    } else {
+        haveStatic = buildStaticLayers(view, composite, callerSession, outError);
+        if (haveStatic) {
+            staticLayers().key = staticKey;
+            staticLayers().composite = composite;
+        }
+    }
+
+    if (haveStatic) {
+        compositeReady.store(true);
+    } else {
+        // The workers are waiting on this either way: a failed base map has to release them, not
+        // leave them waiting for something that is never coming.
+        compositeFailed.store(true);
+    }
+
+    // This task joins the second pass - the first is claimed by now, or still in flight - so the
+    // decoding is spread over every thread that is free.
     runFrameWork(work);
 
     if (frameThread != nullptr) {
         thread_join(frameThread, portMAX_DELAY, 10);
         thread_free(frameThread);
+    }
+
+    if (!haveStatic) {
+        return false;
     }
 
     const int32_t produced = producedCount.load();
