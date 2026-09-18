@@ -56,8 +56,8 @@ const cJSON* objectField(const cJSON* parent, const char* name) {
 }
 
 /** Wraps cJSON_Parse with the two checks that make it safe to use the result. */
-cJSON* parseJson(const std::string& body, std::string& outError) {
-    cJSON* json = cJSON_Parse(body.c_str());
+cJSON* parseJson(const char* body, std::string& outError) {
+    cJSON* json = cJSON_Parse(body);
     if (json == nullptr) {
         outError = "Failed to parse the server's response";
     }
@@ -68,7 +68,7 @@ cJSON* parseJson(const std::string& body, std::string& outError) {
 
 bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outConditions, const AbortCheck& shouldAbort) {
     std::string error;
-    std::string body;
+    tt::network::HttpBody body;
 
     if (shouldAbort()) {
         return false;
@@ -84,7 +84,7 @@ bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outCond
         return false;
     }
 
-    cJSON* stations = parseJson(body, error);
+    cJSON* stations = parseJson(body.c_str(), error);
     if (stations == nullptr) {
         LOG_W(TAG, "Station list: %s", error.c_str());
         return false;
@@ -116,7 +116,7 @@ bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outCond
         return false;
     }
 
-    cJSON* observation = parseJson(body, error);
+    cJSON* observation = parseJson(body.c_str(), error);
     if (observation == nullptr) {
         LOG_W(TAG, "Observation: %s", error.c_str());
         return false;
@@ -147,13 +147,13 @@ bool fetchForecast(const std::string& forecastUrl, Forecast& outForecast, const 
     }
 
     std::string error;
-    std::string body;
+    tt::network::HttpBody body;
     if (!httpGet(forecastUrl, body, error)) {
         LOG_W(TAG, "Forecast failed: %s", error.c_str());
         return false;
     }
 
-    cJSON* forecast = parseJson(body, error);
+    cJSON* forecast = parseJson(body.c_str(), error);
     if (forecast == nullptr) {
         LOG_W(TAG, "Forecast: %s", error.c_str());
         return false;
@@ -224,12 +224,12 @@ bool geocodePostalCode(const std::string& postalCode, Coordinates& outCoordinate
         postalCode
     );
 
-    std::string body;
+    tt::network::HttpBody body;
     if (!httpGet(url, body, outError)) {
         return false;
     }
 
-    cJSON* json = parseJson(body, outError);
+    cJSON* json = parseJson(body.c_str(), outError);
     if (json == nullptr) {
         return false;
     }
@@ -265,13 +265,13 @@ bool fetchReport(const Coordinates& coordinates, WeatherReport& outReport, const
         coordinates.longitude
     );
 
-    std::string body;
+    tt::network::HttpBody body;
     if (!httpGet(pointsUrl, body, outError)) {
         LOG_W(TAG, "Points lookup failed: %s", outError.c_str());
         return false;
     }
 
-    cJSON* points = parseJson(body, outError);
+    cJSON* points = parseJson(body.c_str(), outError);
     if (points == nullptr) {
         return false;
     }

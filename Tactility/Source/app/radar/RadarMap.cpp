@@ -179,10 +179,10 @@ struct DecodedImage {
     DecodedImage& operator=(const DecodedImage&) = delete;
 };
 
-bool decodePng(const std::string& data, DecodedImage& outImage, std::string& outError) {
+bool decodePng(const uint8_t* data, size_t size, DecodedImage& outImage, std::string& outError) {
     outImage.source.header.magic = LV_IMAGE_HEADER_MAGIC;
-    outImage.source.data = reinterpret_cast<const uint8_t*>(data.data());
-    outImage.source.data_size = static_cast<uint32_t>(data.size());
+    outImage.source.data = data;
+    outImage.source.data_size = static_cast<uint32_t>(size);
 
     // no_cache: these images are decoded once and consumed, and they are larger than the cache this
     // build configures (LV_CACHE_DEF_SIZE is 256 KB; a decoded 480x231 frame is 443 KB), so asking
@@ -196,7 +196,7 @@ bool decodePng(const std::string& data, DecodedImage& outImage, std::string& out
         outError = std::format(
             "image did not decode (header lookup {}, {} bytes)",
             static_cast<int>(info),
-            static_cast<unsigned>(data.size())
+            static_cast<unsigned>(size)
         );
         return false;
     }
@@ -290,6 +290,10 @@ struct FrameWork {
 
 /** Fetches, decodes and blends frames until there are none left to claim. */
 int32_t runFrameWork(FrameWork& work) {
+    // One body for the whole series, not one per frame: the client empties it in place before each
+    // use, so its PSRAM buffer is allocated once and reused for every frame.
+    tt::network::HttpBody frameData;
+
     while (true) {
         // Checked between frames rather than during one, so the wait is bounded by the budget plus a
         // single request's timeout rather than by the number of frames left.
@@ -312,7 +316,6 @@ int32_t runFrameWork(FrameWork& work) {
             (RadarFrames::FRAME_COUNT - 1 - index) * FRAME_INTERVAL_SECONDS;
         const std::string time = formatTime(work.now - ageSeconds);
 
-        std::string frameData;
         std::string frameError;
         if (!work.session->get(
                 radarUrl(*work.view, time),
@@ -331,7 +334,7 @@ int32_t runFrameWork(FrameWork& work) {
             // LVGL is not thread safe, so the decode happens under the graphics lock. The blending
             // below is arithmetic on two buffers and needs nothing.
             lvgl_lock();
-            decoded = decodePng(frameData, overlay, frameError);
+            decoded = decodePng(frameData.data(), frameData.size(), overlay, frameError);
             lvgl_unlock();
         }
         if (!decoded) {
@@ -371,7 +374,9 @@ void RadarFrames::clear() {
 bool RadarFrames::fetch(const MapView& view, const std::string& station, std::string& outError) {
     clear();
 
-    std::string basemapData;
+    // The base map is the largest single image in the system - 87 KB as png8 - and it is fetched
+    // once per series, so its body is the one that has to come out of PSRAM rather than internal RAM.
+    tt::network::HttpBody basemapData;
     if (!tt::network::httpGet(basemapUrl(view), basemapData, outError, FETCH_TIMEOUT_MS, MAX_BASEMAP_BYTES)) {
         LOG_W(TAG, "Base map failed: %s", outError.c_str());
         return false;
@@ -379,7 +384,7 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
     LOG_I(TAG, "Base map: %u bytes", static_cast<unsigned>(basemapData.size()));
 
     DecodedImage basemap;
-    if (!decodePng(basemapData, basemap, outError)) {
+    if (!decodePng(basemapData.data(), basemapData.size(), basemap, outError)) {
         LOG_W(TAG, "Base map did not decode: %s", outError.c_str());
         return false;
     }

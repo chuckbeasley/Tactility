@@ -143,7 +143,7 @@ struct Context {
     // screen is open. It used to be written to /data and read back by LVGL instead, which cost 67
     // seconds for a megabyte on this board - the data goes through the wear-levelling FAT, and that
     // write was the whole of the delay between the download finishing and the map appearing.
-    std::string imageData;
+    tt::network::HttpBody imageData;
     lv_image_dsc_t imageDescriptor {};
     int32_t imageWidth = 0;
     int32_t imageHeight = 0;
@@ -202,7 +202,7 @@ void setStatus(Context* ctx, const std::string& text) {
  * when the loop cannot be fetched - the loop carries the history, so it is the one worth having.
  * @return true when an image arrived
  */
-bool fetchImage(const std::string& station, std::string& outData, std::string& outError) {
+bool fetchImage(const std::string& station, tt::network::HttpBody& outData, std::string& outError) {
     // The loop's size follows the weather: 47 KB for KFFC in calm conditions, 1,008,766 bytes for
     // KMPX with a system overhead - which is over the shared client's 512 KB default and is how this
     // screen ended up showing a single still frame while asking for the loop. Hence a cap of its own,
@@ -241,7 +241,7 @@ bool fetchImage(const std::string& station, std::string& outData, std::string& o
 bool fetchStationPosition(const std::string& station, double& outLatitude, double& outLongitude) {
     const std::string url = std::format("{}/{}", STATION_URL_BASE, station);
 
-    std::string body;
+    tt::network::HttpBody body;
     std::string error;
     if (!tt::network::httpGet(url, body, error)) {
         LOG_W(TAG, "Radar station lookup failed: %s", error.c_str());
@@ -575,14 +575,15 @@ void onZoomOutPressed(lv_event_t* event) {
 }
 
 /** Scales the image to fit the space it has, in whole 1/256ths as LVGL expects. */
-void showImage(Context* ctx, std::string data) {
+void showImage(Context* ctx, tt::network::HttpBody data) {
     if (data.size() < GIF_HEADER_SIZE) {
         setStatus(ctx, "The radar image was truncated");
         return;
     }
 
-    const auto width = static_cast<int32_t>(static_cast<uint8_t>(data[GIF_WIDTH_OFFSET]) | (static_cast<uint8_t>(data[GIF_WIDTH_OFFSET + 1]) << 8));
-    const auto height = static_cast<int32_t>(static_cast<uint8_t>(data[GIF_HEIGHT_OFFSET]) | (static_cast<uint8_t>(data[GIF_HEIGHT_OFFSET + 1]) << 8));
+    const auto* bytes = data.data();
+    const auto width = static_cast<int32_t>(bytes[GIF_WIDTH_OFFSET] | (bytes[GIF_WIDTH_OFFSET + 1] << 8));
+    const auto height = static_cast<int32_t>(bytes[GIF_HEIGHT_OFFSET] | (bytes[GIF_HEIGHT_OFFSET + 1] << 8));
     if (width <= 0 || height <= 0) {
         setStatus(ctx, "The radar image has no size");
         return;
@@ -636,7 +637,7 @@ void showImage(Context* ctx, std::string data) {
         ctx->imageDescriptor.header.w = width;
         ctx->imageDescriptor.header.h = height;
         ctx->imageDescriptor.data_size = ctx->imageData.size();
-        ctx->imageDescriptor.data = reinterpret_cast<const uint8_t*>(ctx->imageData.data());
+        ctx->imageDescriptor.data = ctx->imageData.data();
 
         ctx->imageWidth = width;
         ctx->imageHeight = height;
@@ -724,7 +725,7 @@ void loadRadar(Context* ctx) {
     // Its coordinates are only needed to centre that fixed grid on the location.
     ctx->hasStationPosition = fetchStationPosition(ctx->station, ctx->stationLatitude, ctx->stationLongitude);
 
-    std::string data;
+    tt::network::HttpBody data;
     std::string error;
     if (!fetchImage(ctx->station, data, error)) {
         setStatus(ctx, std::format("Could not load the radar: {}", error));
