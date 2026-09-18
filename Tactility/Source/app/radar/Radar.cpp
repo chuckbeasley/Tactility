@@ -268,9 +268,21 @@ void updateCaption(Context* ctx) {
 
     const std::string where = ctx->place.empty() ? ctx->station : std::format("{} - {}", ctx->place, ctx->station);
     if (ctx->usingServerMap) {
-        // The map zoom, because that is what the buttons change on this path and it is the number
-        // that was sent to the server.
-        lv_label_set_text(ctx->statusLabel, std::format("{}   zoom {}", where, static_cast<int>(ctx->mapZoom)).c_str());
+        // The map zoom, because that is what the buttons change on this path, and the frame's own
+        // time: these frames have no timestamp in the pixels, so in calm weather - when every frame
+        // is the same picture - this is the only thing on screen that moves, and it is how the user
+        // can tell the series is advancing rather than stuck.
+        std::string observed = "--:--";
+        if (ctx->frameIndex < ctx->radarFrames.frames.size()) {
+            const auto epoch = static_cast<time_t>(ctx->radarFrames.frames[ctx->frameIndex].epochSeconds);
+            std::tm local {};
+            localtime_r(&epoch, &local);
+            observed = std::format("{:02}:{:02}", local.tm_hour, local.tm_min);
+        }
+        lv_label_set_text(
+            ctx->statusLabel,
+            std::format("{}   zoom {}   {}", where, static_cast<int>(ctx->mapZoom), observed).c_str()
+        );
     } else {
         const std::string zoom = (ZOOM_PERCENTS[ctx->zoomStep] == 0)
             ? std::string("full")
@@ -389,6 +401,9 @@ void onFrameTimer(lv_timer_t* timer) {
     }
     ctx->frameIndex = (ctx->frameIndex + 1) % ctx->frameDescriptors.size();
     lv_image_set_src(ctx->image, &ctx->frameDescriptors[ctx->frameIndex]);
+    // The caption carries the frame's observation time, which is the visible sign that the series is
+    // running when the frames themselves are identical.
+    updateCaption(ctx);
 }
 
 /**

@@ -43,6 +43,15 @@ struct MapFrame {
     const uint8_t* pixels = nullptr;
     int32_t width = 0;
     int32_t height = 0;
+    /**
+     * The observation time this frame was asked for, as a Unix timestamp.
+     *
+     * Carried because the frames have no timestamp of their own: the published GIF had the
+     * observation time drawn into its pixels, and these are rendered per request instead, so in calm
+     * weather - when every frame is the same picture - the time is the only thing on screen that
+     * changes, and it is what tells the user the series is advancing at all.
+     */
+    long long epochSeconds = 0;
 };
 
 /**

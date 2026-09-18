@@ -281,6 +281,7 @@ struct FrameWork {
     std::atomic<int32_t>* nextIndex = nullptr;
     std::atomic<int32_t>* producedCount = nullptr;
     std::atomic<bool>* succeeded = nullptr;
+    long long* epochs = nullptr;
     /** Tick after which no new frame is started; frames already in flight are still waited for. */
     TickType_t deadline = 0;
 };
@@ -341,6 +342,7 @@ int32_t runFrameWork(FrameWork& work) {
         }
 
         flatten(*work.basemap, overlay, work.pixels->data() + (static_cast<size_t>(index) * work.framePixels));
+        work.epochs[index] = work.now - ageSeconds;
         work.succeeded[index].store(true);
         work.producedCount->fetch_add(1);
         LOG_I(
@@ -396,6 +398,7 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
     std::atomic<int32_t> nextIndex { 0 };
     std::atomic<int32_t> producedCount { 0 };
     std::atomic<bool> succeeded[FRAME_COUNT] {};
+    long long epochs[FRAME_COUNT] {};
 
 
     FrameWork work {
@@ -407,6 +410,7 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
         .nextIndex = &nextIndex,
         .producedCount = &producedCount,
         .succeeded = succeeded,
+        .epochs = epochs,
         .deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SERIES_BUDGET_MS)
     };
 
@@ -458,7 +462,8 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
         frames.push_back(MapFrame {
             .pixels = pixels.data() + (static_cast<size_t>(slot) * framePixels),
             .width = view.width,
-            .height = view.height
+            .height = view.height,
+            .epochSeconds = epochs[slot]
         });
     }
 
