@@ -95,6 +95,14 @@ struct BleCtx {
     char device_name[BLE_DEVICE_NAME_MAX + 1];
 
     // Scan data (guarded by scan_mutex)
+    //
+    // 64 entries of 356 bytes: ~23 KB, and deliberately not trimmed — a complete list of what a
+    // scan heard is the point of the BLE toolbox. It costs no internal RAM. BleCtx is allocated
+    // with `new`, and ESP-IDF routes every allocation larger than CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL
+    // (256 here) to PSRAM first (heap_caps_malloc_default(), components/heap/heap_caps.c), so this
+    // array has always lived in PSRAM. Measured on the C5: opening the BLE Toolbox moves 38.0 KB of
+    // internal RAM and 32.1 KB of PSRAM, and moving these two arrays to an explicit PSRAM
+    // allocation by hand changed the internal figure by 0.6 KB — run-to-run noise. Don't redo it.
     SemaphoreHandle_t scan_mutex;
     BtPeerRecord      scan_results[64];
     ble_addr_t        scan_addrs[64];
