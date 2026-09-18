@@ -130,6 +130,10 @@ struct Context {
     lv_obj_t* gifImage = nullptr;
     lv_obj_t* zoomInButton = nullptr;
     lv_obj_t* zoomOutButton = nullptr;
+    lv_obj_t* playPauseButton = nullptr;
+
+    /** Playback state, which the button toggles. A paused screen keeps its frame and its clock. */
+    bool paused = false;
 
     // What the zoom buttons need to redo their work without fetching anything again: the size of the
     // frame that arrived, the scale at which all of it fits, which entry of ZOOM_PERCENTS is showing,
@@ -172,6 +176,7 @@ struct Context {
         gifImage = nullptr;
         zoomInButton = nullptr;
         zoomOutButton = nullptr;
+        playPauseButton = nullptr;
     }
 };
 
@@ -444,10 +449,56 @@ void startPlayback(Context* ctx) {
     if (ctx->frameTimer == nullptr) {
         ctx->frameTimer = lv_timer_create(onFrameTimer, FRAME_DURATION_MS, ctx);
     }
+    // A pause set before the frames arrived, or before a zoom replaced them, has to survive their
+    // arrival, or the screen starts moving again on its own.
+    applyPaused(ctx);
 
     updateCaption(ctx);
     updateZoomButtons(ctx);
     LOG_I(TAG, "Playing %u frames", static_cast<unsigned>(ctx->frameDescriptors.size()));
+}
+
+/**
+ * Shows what pressing the play/pause button would do: a pause sign while the frames are running, a
+ * play sign once they are not.
+ *
+ * The label is set through the button's child because the toolbar builds a text button as a button
+ * with a label in it and offers no way to change the text afterwards.
+ */
+void updatePlayPauseButton(Context* ctx) {
+    if (ctx->playPauseButton == nullptr) {
+        return;
+    }
+    lv_obj_t* label = lv_obj_get_child(ctx->playPauseButton, 0);
+    if (label != nullptr) {
+        lv_label_set_text(label, ctx->paused ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE);
+    }
+}
+
+/** Pauses or resumes whichever animation is on screen: the frame timer, or the GIF's own timer. */
+void applyPaused(Context* ctx) {
+    if (ctx->frameTimer != nullptr) {
+        if (ctx->paused) {
+            lv_timer_pause(ctx->frameTimer);
+        } else {
+            lv_timer_resume(ctx->frameTimer);
+        }
+    }
+    if (ctx->gifImage != nullptr) {
+        if (ctx->paused) {
+            lv_gif_pause(ctx->gifImage);
+        } else {
+            lv_gif_resume(ctx->gifImage);
+        }
+    }
+    updatePlayPauseButton(ctx);
+}
+
+void onPlayPausePressed(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    ctx->paused = !ctx->paused;
+    applyPaused(ctx);
+    LOG_I(TAG, "%s", ctx->paused ? "Paused" : "Playing");
 }
 
 void onZoomInPressed(lv_event_t* event) {
@@ -568,6 +619,8 @@ void showImage(Context* ctx, std::string data) {
 
         lv_gif_set_src(ctx->gifImage, &ctx->imageDescriptor);
         applyZoom(ctx);
+        // The GIF animates on its own timer, so a pause has to be applied to it as well.
+        applyPaused(ctx);
     }
     lvgl_unlock();
 }
@@ -657,6 +710,10 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     // symbols a zoom control is expected to use.
     ctx->zoomOutButton = lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_MINUS, onZoomOutPressed, ctx);
     ctx->zoomInButton = lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_PLUS, onZoomInPressed, ctx);
+    // Pause and play come last so the zoom pair stays adjacent: the three actions and the close
+    // button are all the toolbar this window has room for.
+    ctx->playPauseButton = lvgl_toolbar_add_text_button_action(toolbar, LV_SYMBOL_PAUSE, onPlayPausePressed, ctx);
+    updatePlayPauseButton(ctx);
     lv_obj_set_style_margin_bottom(toolbar, margin, LV_STATE_DEFAULT);
 
     // One line for the place and the site, then the map window below it.
