@@ -281,6 +281,8 @@ struct FrameWork {
     std::atomic<int32_t>* nextIndex = nullptr;
     std::atomic<int32_t>* producedCount = nullptr;
     std::atomic<bool>* succeeded = nullptr;
+    /** One connection for this slot's frames, instead of a TLS handshake per frame. */
+    tt::network::HttpSession* session = nullptr;
     long long* epochs = nullptr;
     /** Tick after which no new frame is started; frames already in flight are still waited for. */
     TickType_t deadline = 0;
@@ -312,7 +314,7 @@ int32_t runFrameWork(FrameWork& work) {
 
         std::string frameData;
         std::string frameError;
-        if (!tt::network::httpGet(
+        if (!work.session->get(
                 radarUrl(*work.view, time),
                 frameData,
                 frameError,
@@ -401,6 +403,11 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
     long long epochs[FRAME_COUNT] {};
 
 
+    // One session per slot, so two connections rather than one per frame: each worker keeps its
+    // connection open and issues its frames over it, which is where the handshakes stop being paid.
+    tt::network::HttpSession callerSession;
+    tt::network::HttpSession workerSession;
+
     FrameWork work {
         .view = &view,
         .basemap = &basemap,
@@ -410,9 +417,13 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
         .nextIndex = &nextIndex,
         .producedCount = &producedCount,
         .succeeded = succeeded,
+        .session = &callerSession,
         .epochs = epochs,
         .deadline = xTaskGetTickCount() + pdMS_TO_TICKS(SERIES_BUDGET_MS)
     };
+
+    FrameWork workerWork = work;
+    workerWork.session = &workerSession;
 
     // One worker thread, and this task is the other worker: two requests in flight, one of which
     // costs no memory at all, which is what makes this affordable - a second task stack has to come
@@ -425,7 +436,7 @@ bool RadarFrames::fetch(const MapView& view, const std::string& station, std::st
         "radar-frame",
         FRAME_WORKER_STACK,
         frameWorkMain,
-        &work,
+        &workerWork,
         tskNO_AFFINITY
     );
     if (frameThread != nullptr) {

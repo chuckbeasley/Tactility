@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <string>
 
+/** The ESP-IDF HTTP client handle's pointee, named without pulling the ESP headers into this one. */
+struct esp_http_client;
+
 namespace tt::network {
 
 /**
@@ -37,6 +40,46 @@ bool httpGet(
     int32_t timeoutMs = 10000,
     size_t maxResponseBytes = 512 * 1024
 );
+
+/**
+ * A series of GETs over one connection.
+ *
+ * httpGet() opens its own connection, which means its own TLS handshake. That is the right cost for a
+ * one-off request and the wrong one for a series: the radar screen fetches six frames from the same
+ * host, and measured on this board each request cost about 3.8 seconds for sixteen kilobytes - almost
+ * all of it handshake and server render rather than transfer. A session keeps the connection and
+ * issues the requests over it, so a series pays for one handshake per session instead of one per
+ * request.
+ *
+ * A session is for one thread: two of them are two connections. It is not thread safe, by design -
+ * the point is to have several, not to share one.
+ *
+ * If a request fails the connection is dropped and the next one starts a new one, because a session
+ * that has just seen an error cannot know what state the socket is in.
+ */
+class HttpSession {
+public:
+    HttpSession() = default;
+    ~HttpSession();
+
+    HttpSession(const HttpSession&) = delete;
+    HttpSession& operator=(const HttpSession&) = delete;
+
+    /** Same contract as httpGet(), over this session's connection. */
+    bool get(
+        const std::string& url,
+        std::string& outBody,
+        std::string& outError,
+        int32_t timeoutMs = 10000,
+        size_t maxResponseBytes = 512 * 1024
+    );
+
+    /** Drops the connection; the next get() starts a new one. */
+    void close();
+
+private:
+    esp_http_client* client = nullptr;
+};
 
 /**
  * Percent-encode everything outside the unreserved set, for use in a query string.

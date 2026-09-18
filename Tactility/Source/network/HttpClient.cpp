@@ -48,6 +48,145 @@ std::string describeError(const std::string& body, int status) {
 
 }
 
+#ifdef ESP_PLATFORM
+
+/**
+ * Reads the body of an opened request, or the explanation out of a failed one.
+ *
+ * Shared by the one-off call and the session, because the reading is where the subtleties are: the
+ * return value of the read is -1 for an error and 0 for end of body, and a status that is not 200
+ * still has a body worth reading, since these APIs name the problem there.
+ */
+bool readBody(
+    esp_http_client_handle_t client,
+    std::string& outBody,
+    std::string& outError,
+    size_t maxResponseBytes
+) {
+    const int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        std::string errorBody;
+        char errorBuffer[256];
+        while (errorBody.size() < MAX_ERROR_BODY_BYTES) {
+            const int read = esp_http_client_read(client, errorBuffer, sizeof(errorBuffer));
+            if (read <= 0) {
+                break;
+            }
+            errorBody.append(errorBuffer, static_cast<size_t>(read));
+        }
+        outError = describeError(errorBody, status);
+        return false;
+    }
+
+    outBody.clear();
+    char buffer[1024];
+    while (true) {
+        const int read = esp_http_client_read(client, buffer, sizeof(buffer));
+        if (read < 0) {
+            outError = "Failed to read the response";
+            outBody.clear();
+            return false;
+        }
+        if (read == 0) {
+            return true;
+        }
+        if (outBody.size() + static_cast<size_t>(read) > maxResponseBytes) {
+            outError = std::format("The response is larger than {} bytes", static_cast<unsigned>(maxResponseBytes));
+            outBody.clear();
+            return false;
+        }
+        outBody.append(buffer, static_cast<size_t>(read));
+    }
+}
+
+void logFetched(const std::string& url, const std::string& body) {
+    LOG_I(
+        TAG,
+        "  %s: %u bytes (internal heap %u)",
+        url.c_str(),
+        static_cast<unsigned>(body.size()),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL))
+    );
+}
+
+#endif
+
+HttpSession::~HttpSession() {
+    close();
+}
+
+void HttpSession::close() {
+#ifdef ESP_PLATFORM
+    if (client != nullptr) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        client = nullptr;
+    }
+#endif
+}
+
+bool HttpSession::get(
+    const std::string& url,
+    std::string& outBody,
+    std::string& outError,
+    int32_t timeoutMs,
+    size_t maxResponseBytes
+) {
+#ifdef ESP_PLATFORM
+    if (client == nullptr) {
+        LOG_I(TAG, "GET %s (new connection)", url.c_str());
+
+        esp_http_client_config_t config = {};
+        config.url = url.c_str();
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+        config.timeout_ms = timeoutMs;
+        config.method = HTTP_METHOD_GET;
+        // What makes a session worth having: without this the connection is torn down when the
+        // request completes and the next one pays for the handshake again.
+        config.keep_alive_enable = true;
+
+        client = esp_http_client_init(&config);
+        if (client == nullptr) {
+            outError = "Failed to create HTTP client";
+            return false;
+        }
+        esp_http_client_set_header(client, "User-Agent", USER_AGENT);
+        esp_http_client_set_header(client, "Accept", "application/json, image/png");
+    } else {
+        LOG_I(TAG, "GET %s (same connection)", url.c_str());
+        if (esp_http_client_set_url(client, url.c_str()) != ESP_OK) {
+            outError = "Failed to set the URL";
+            close();
+            return false;
+        }
+    }
+
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        outError = "Failed to connect";
+        close();
+        return false;
+    }
+
+    esp_http_client_fetch_headers(client);
+
+    if (!readBody(client, outBody, outError, maxResponseBytes)) {
+        // The socket may be half-read, so it is not reused: the next request starts a new one.
+        close();
+        return false;
+    }
+
+    logFetched(url, outBody);
+    return true;
+#else
+    (void)url;
+    (void)outBody;
+    (void)timeoutMs;
+    (void)maxResponseBytes;
+    outError = "Networking is unavailable on this platform";
+    return false;
+#endif
+}
+
 bool httpGet(
     const std::string& url,
     std::string& outBody,
@@ -70,7 +209,6 @@ bool httpGet(
         return false;
     }
 
-    bool opened = false;
     bool ok = false;
 
     do {
@@ -81,53 +219,16 @@ bool httpGet(
             outError = "Failed to connect";
             break;
         }
-        opened = true;
 
         // Reads the status line and headers. The return value is the content length, or -1 when the
         // server uses chunked encoding; neither is needed, because the body is read until the client
         // reports it finished.
         esp_http_client_fetch_headers(client);
 
-        const int status = esp_http_client_get_status_code(client);
-        if (status != 200) {
-            std::string errorBody;
-            char errorBuffer[256];
-            while (errorBody.size() < MAX_ERROR_BODY_BYTES) {
-                const int read = esp_http_client_read(client, errorBuffer, sizeof(errorBuffer));
-                if (read <= 0) {
-                    break;
-                }
-                errorBody.append(errorBuffer, static_cast<size_t>(read));
-            }
-            outError = describeError(errorBody, status);
-            break;
-        }
-
-        outBody.clear();
-        char buffer[1024];
-        while (true) {
-            const int read = esp_http_client_read(client, buffer, sizeof(buffer));
-            if (read < 0) {
-                outError = "Failed to read the response";
-                outBody.clear();
-                break;
-            }
-            if (read == 0) {
-                ok = true;
-                break;
-            }
-            if (outBody.size() + static_cast<size_t>(read) > maxResponseBytes) {
-                outError = std::format("The response is larger than {} bytes", static_cast<unsigned>(maxResponseBytes));
-                outBody.clear();
-                break;
-            }
-            outBody.append(buffer, static_cast<size_t>(read));
-        }
+        ok = readBody(client, outBody, outError, maxResponseBytes);
     } while (false);
 
-    if (opened) {
-        esp_http_client_close(client);
-    }
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
 
     if (!ok && outError.empty()) {
@@ -135,12 +236,7 @@ bool httpGet(
     }
 
     if (ok) {
-        LOG_I(
-            TAG,
-            "  %u bytes (internal heap %u)",
-            static_cast<unsigned>(outBody.size()),
-            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL))
-        );
+        logFetched(url, outBody);
     }
     return ok;
 #else
