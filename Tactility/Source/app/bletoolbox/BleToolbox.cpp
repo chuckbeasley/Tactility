@@ -253,6 +253,15 @@ struct Context {
 
     std::unique_ptr<Timer> pollTimer;
     std::unique_ptr<Timer> spamTimer;
+    /**
+     * Whether this app's window exists right now.
+     *
+     * The window manager destroys a window on suspend as well as on close, and both timers below
+     * touch widgets: without this they walk objects that have been deleted, which faults inside
+     * LVGL's event send rather than being harmless. Development.cpp already guards its own timer
+     * this way, by asking the window manager for the window's state.
+     */
+    std::atomic<bool> windowAlive{false};
 
     // UI widgets.
     lv_obj_t* body = nullptr;
@@ -1099,6 +1108,13 @@ static void onPollTick(Context* ctx) {
 
 static void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
+
+    // Also the resume path, so the timers follow the window rather than the app instance.
+    ctx->windowAlive.store(true);
+    // Only the poll timer. The spam timer is opt-in from the toolbar, and starting it here would
+    // begin advertising merely because the screen came back; it stops with the window on suspend,
+    // which is the safe direction for a radio, and the user's toggle starts it again.
+    if (ctx->pollTimer != nullptr) ctx->pollTimer->start();
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
 
@@ -1116,6 +1132,14 @@ static void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_scroll_to_y(ctx->body, 0, LV_ANIM_OFF);
 
     showMainScreen(ctx);
+}
+
+/** Called when this window's widget is deleted, which happens on suspend as well as on close. */
+static void destroyWidgets(void* userData) {
+    auto* ctx = static_cast<Context*>(userData);
+    ctx->windowAlive.store(false);
+    if (ctx->pollTimer != nullptr) ctx->pollTimer->stop();
+    if (ctx->spamTimer != nullptr) ctx->spamTimer->stop();
 }
 
 int32_t appMain(int argc, char* argv[]) {
@@ -1150,14 +1174,15 @@ int32_t appMain(int argc, char* argv[]) {
 #endif
 
     ctx.pollTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(POLL_INTERVAL_MS), [&ctx] {
+        if (!ctx.windowAlive.load()) return;
         onPollTick(&ctx);
     });
     ctx.spamTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(SPAM_INTERVAL_MS), [&ctx] {
+        if (!ctx.windowAlive.load()) return;
         onSpamTick(&ctx);
     });
-    ctx.pollTimer->start();
 
-    WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
+    WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
 
     bool shouldClose = false;
     while (!shouldClose) {
