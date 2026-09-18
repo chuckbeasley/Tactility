@@ -247,6 +247,17 @@ struct Context {
 
     std::unique_ptr<Timer> memoryTimer;
     std::unique_ptr<Timer> tasksTimer;
+    /**
+     * Whether this app's window exists right now.
+     *
+     * The window manager destroys the window when the app is suspended, not only when it closes, so
+     * a timer that runs "for the app instance's whole lifetime" can outlive the widgets it updates.
+     * That is not a slow leak: lv_obj_mark_layout_as_dirty() on a deleted object asks it for its
+     * display, gets NULL, and faults inside LVGL's event send. The flag is checked after taking the
+     * graphics lock, because a callback already waiting on that lock runs after the destroyer has
+     * finished with the widgets.
+     */
+    std::atomic<bool> windowAlive { false };
 
     MemoryBarWidgets internalMemBar;
     MemoryBarWidgets externalMemBar;
@@ -310,6 +321,11 @@ void onBackPressed(lv_event_t* event) {
 
 void createWidgets(lv_obj_t* parent, void* userData) {
     auto* ctx = static_cast<Context*>(userData);
+
+    // Also the resume path, so the flags and the timers follow the window rather than the app.
+    ctx->windowAlive.store(true);
+    if (ctx->memoryTimer != nullptr) ctx->memoryTimer->start();
+    if (ctx->tasksTimer != nullptr) ctx->tasksTimer->start();
 
     lv_obj_set_flex_flow(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(parent, 0, LV_STATE_DEFAULT);
@@ -396,22 +412,33 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     updateTasks(ctx);
 }
 
+/**
+ * Called when this window's widget is deleted, which happens on suspend as well as on close. The
+ * timers must stop here: they hold a raw Context pointer and their callbacks touch widgets.
+ */
+void destroyWidgets(void* userData) {
+    auto* ctx = static_cast<Context*>(userData);
+    ctx->windowAlive.store(false);
+    if (ctx->memoryTimer != nullptr) ctx->memoryTimer->stop();
+    if (ctx->tasksTimer != nullptr) ctx->tasksTimer->stop();
+}
+
 int32_t appMain(int argc, char* argv[]) {
     uint32_t appInstanceId = app_scheduler_current_app_id();
     Context ctx {};
     ctx.appInstanceId = appInstanceId;
 
-    // Run for this app instance's whole lifetime (mirrors GpsSettings) - both timers keep the
-    // displayed values fresh regardless of whether the app is currently topmost.
+    // Started by createWidgets, which the window manager also calls on resume, so the timers follow
+    // the window rather than the app instance.
     ctx.memoryTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(10000), [&ctx] {
         lvgl_lock();
-        updateMemory(&ctx);
+        if (ctx.windowAlive.load()) updateMemory(&ctx);
         lvgl_unlock();
     });
 
     ctx.tasksTimer = std::make_unique<Timer>(Timer::Type::Periodic, millis_to_ticks(15000), [&ctx] {
         lvgl_lock();
-        updateTasks(&ctx);
+        if (ctx.windowAlive.load()) updateTasks(&ctx);
         lvgl_unlock();
     });
 
@@ -421,9 +448,7 @@ int32_t appMain(int argc, char* argv[]) {
     AppEventSubscription sub {};
     check(app_event_subscribe(&sub, &event_group) == ERROR_NONE);
 
-    WindowId window = window_manager_create(appInstanceId, createWidgets, &ctx);
-    ctx.memoryTimer->start();   // Memory: every 10s
-    ctx.tasksTimer->start();    // Tasks/CPU: every 15s
+    WindowId window = window_manager_create_ext(appInstanceId, createWidgets, destroyWidgets, &ctx);
 
     bool shouldClose = false;
     while (!shouldClose) {
