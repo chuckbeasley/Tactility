@@ -457,6 +457,10 @@ bool isUnreserved(char c) {
 }
 
 std::string percentEncode(const std::string& input) {
+    // Every escaped byte used to cost a std::string: std::format("%{:02X}", c) builds one, and this
+    // runs for each character of every URL that carries parameters.
+    constexpr char HEX[] = "0123456789ABCDEF";
+
     std::string output;
     output.reserve(input.size() * 2);
     for (const char raw : input) {
@@ -464,7 +468,9 @@ std::string percentEncode(const std::string& input) {
         if (isUnreserved(static_cast<char>(c))) {
             output += static_cast<char>(c);
         } else {
-            output += std::format("%{:02X}", c);
+            output += '%';
+            output += HEX[c >> 4];
+            output += HEX[c & 0x0F];
         }
     }
     return output;
