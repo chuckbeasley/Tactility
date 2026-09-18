@@ -531,8 +531,15 @@ bool isConnectionSecure() {
     return state.secureConnection;
 }
 
+// Both of these go into the Wi-Fi driver, whose API lock does not exist until the radio is on:
+// calling one earlier faults inside the closed driver library rather than returning an error, and
+// the fault is a null-pointer load at a fixed offset in current_task_is_wifi_task, reached from
+// esp_wifi_sta_get_ap_info. Measured on the ESP32-C5: a caller polling RSSI 1 second into boot - the
+// driver comes up around 29 seconds - put the board in a boot loop. `started` and the device being
+// present are not enough on their own, because the service is started before the driver is ready;
+// isRadioOn() is the same guard setPowerSaveEnabled() already relies on.
 int getRssi() {
-    if (!started || state.device == nullptr) return 1;
+    if (!started || state.device == nullptr || !isRadioOn()) return 1;
     int32_t rssi = 0;
     if (wifi_station_get_rssi(state.device, &rssi) == ERROR_NONE) {
         return rssi;
@@ -541,7 +548,7 @@ int getRssi() {
 }
 
 std::string getIp() {
-    if (!started || state.device == nullptr) return "";
+    if (!started || state.device == nullptr || !isRadioOn()) return "";
     char ipv4[16] = {};
     if (wifi_station_get_ipv4_address(state.device, ipv4) != ERROR_NONE) {
         return "";
