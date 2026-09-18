@@ -366,7 +366,9 @@ void render(Context* ctx) {
             LV_STATE_DEFAULT
         );
 
-        lv_label_set_text(ctx->satellitesValue, std::to_string(fix.satellites).c_str());
+        // Formatted straight into the label: std::to_string allocated a temporary and then LVGL
+        // copied it, which is two allocations per update on a screen that updates every second.
+        lv_label_set_text_fmt(ctx->satellitesValue, "%u", static_cast<unsigned>(fix.satellites));
         lv_label_set_text(ctx->hdopValue, hdopToText(fix).c_str());
         lv_label_set_text(ctx->latitudeValue, formatCoordinate(&fix.latitude).c_str());
         lv_label_set_text(ctx->longitudeValue, formatCoordinate(&fix.longitude).c_str());

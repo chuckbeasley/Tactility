@@ -115,21 +115,27 @@ std::unique_ptr<char[]> receiveByteArray(httpd_req_t* request, size_t length, si
 }
 
 std::string receiveTextUntil(httpd_req_t* request, const std::string& terminator) {
-    size_t read_index = 0;
-    std::stringstream result;
-    while (!result.str().ends_with(terminator)) {
-        char buffer;
-        size_t bytes_read = httpd_req_recv(request, &buffer, 1);
+    // One byte at a time on purpose: anything past the terminator belongs to the next part of the
+    // request, so this cannot read ahead in chunks.
+    //
+    // What was wrong was the bookkeeping, not the reads. result.str() built a copy of everything
+    // accumulated so far on every iteration just to test its tail, so a 500-byte header meant 500
+    // allocations and roughly 125 KB of copying. The test below reads the buffer it already has, and
+    // the receive result is signed so that -1 is not mistaken for a successful read of one byte.
+    std::string result;
+    while (true) {
+        char buffer = 0;
+        const int bytes_read = httpd_req_recv(request, &buffer, 1);
         if (bytes_read <= 0) {
             return "";
-        } else {
-            read_index += bytes_read;
         }
 
-        result << buffer;
+        result += buffer;
+        if (result.size() >= terminator.size() &&
+            result.compare(result.size() - terminator.size(), terminator.size(), terminator) == 0) {
+            return result;
+        }
     }
-
-    return result.str();
 }
 
 std::map<std::string, std::string> parseContentDisposition(const std::vector<std::string>& input) {

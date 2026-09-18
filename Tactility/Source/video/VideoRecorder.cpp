@@ -359,6 +359,11 @@ void captureTask(void* arg) {
     Recorder& rec = recorder();
     const uint32_t interval_ms = 1000 / (rec.fps ? rec.fps : 5);
 
+    // One frame buffer for the whole recording, cleared per frame. This used to be constructed and
+    // destroyed inside the loop below, which is a 480x320 RGB565 allocation and free - 307 KB - for
+    // every captured frame.
+    std::vector<uint8_t> frame;
+
     while (true) {
         // A mutex-guarded "are we still recording?" check.
         xSemaphoreTake(rec.mutex, portMAX_DELAY);
@@ -368,7 +373,7 @@ void captureTask(void* arg) {
         }
         xSemaphoreGive(rec.mutex);
 
-        std::vector<uint8_t> frame;
+        frame.clear(); // keeps the capacity, so only the first frame of a recording allocates
         if (lvgl_try_lock(pdMS_TO_TICKS(200))) {
             lv_draw_buf_t* draw_buf = lv_snapshot_take(lv_scr_act(), LV_COLOR_FORMAT_RGB565);
             if (draw_buf != nullptr) {

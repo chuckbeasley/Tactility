@@ -986,13 +986,31 @@ static std::string escapeJson(const std::string& s) {
 }
 
 static bool getQueryParam(httpd_req_t* req, const char* key, std::string& out) {
-    size_t len = httpd_req_get_url_query_len(req) + 1;
+    const size_t len = httpd_req_get_url_query_len(req) + 1;
     if (len <= 1) return false;
-    std::unique_ptr<char[]> buf(new char[len]);
-    if (httpd_req_get_url_query_str(req, buf.get(), len) != ESP_OK) return false;
-    // Allocate buffer large enough for the entire query string (worst case)
+
+    // Queries on this server are short - a path, or an id - so the common case fits in a stack buffer
+    // and only a longer one allocates. This used to allocate twice per call, once for the whole query
+    // string and once sized to the whole query string for a single value.
+    char stack_query[256];
+    std::unique_ptr<char[]> heap_query;
+    char* query = stack_query;
+    if (len > sizeof(stack_query)) {
+        heap_query = std::make_unique<char[]>(len);
+        query = heap_query.get();
+    }
+    if (httpd_req_get_url_query_str(req, query, len) != ESP_OK) return false;
+
+    char stack_value[256];
+    if (httpd_query_key_value(query, key, stack_value, sizeof(stack_value)) == ESP_OK) {
+        out = stack_value;
+        return true;
+    }
+
+    // Longer than the stack buffer: retry with the full length so a long value still works rather
+    // than being reported as absent.
     std::unique_ptr<char[]> value(new char[len]);
-    if (httpd_query_key_value(buf.get(), key, value.get(), len) == ESP_OK) {
+    if (httpd_query_key_value(query, key, value.get(), len) == ESP_OK) {
         out = value.get();
         return true;
     }
