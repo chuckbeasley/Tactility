@@ -241,6 +241,11 @@ struct BtEventSubscription {
         bool constructed;
 
         struct BtEventSubscription* next;
+        /** Set by a background watcher that maintains its own cache and must not count as demand for
+         * the radio's idle policy (see ble_idle_timer_cb() in esp32_ble.cpp). The only field here a
+         * caller is expected to write. Zero-initialised subscriptions count as demand, which is the
+         * safe default: an app that opens BLE holds a real subscription and must keep the radio up. */
+        bool background_only;
     } internal;
 };
 

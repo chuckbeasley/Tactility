@@ -1041,7 +1041,12 @@ static size_t count_subscriptions(BleCtx* ctx) {
     size_t count = 0;
     mutex_lock(&ctx->subscriptionsMutex);
     for (BtEventSubscription* sub = ctx->subscriptions; sub != nullptr; sub = sub->internal.next) {
-        ++count;
+        // Background watchers (the Bluetooth service's peer cache) hold a subscription for their own
+        // bookkeeping, not because anything wants the radio: counting them made demand permanently
+        // true and the idle policy unable to fire. Only real consumers count.
+        if (!sub->internal.background_only) {
+            ++count;
+        }
     }
     mutex_unlock(&ctx->subscriptionsMutex);
     return count;

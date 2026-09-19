@@ -286,6 +286,10 @@ bool startBtEventThread(Device* dev) {
     }
 
     task_event_group_construct(&btEventGroup);
+    // This subscription exists to keep the scan-result cache fresh, not because anything is using
+    // Bluetooth: marking it background-only keeps it out of the radio's idle-policy demand count,
+    // which would otherwise be permanently non-zero and the radio would never be released.
+    btEventSub.internal.background_only = true;
     if (bluetooth_event_subscribe(dev, &btEventSub, &btEventGroup) != ERROR_NONE) {
         task_event_group_destruct(&btEventGroup);
         return false;
