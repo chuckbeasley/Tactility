@@ -513,6 +513,18 @@ void WebServerService::onStop(ServiceContext& service) {
 
     setEnabled(false);
 
+    // Mirror teardown. mirrorEndLowLatency() puts the radio state back and closes what remote input
+    // left open; the low-latency timer is created lazily on the first frame request and would
+    // otherwise outlive the service, leaking a timer slot on every stop/start cycle. HttpServer::stop()
+    // has already released the httpd task and its 16 KB stack by this point.
+    if (mirrorLowLatencyActive) {
+        mirrorEndLowLatency();
+    }
+    if (mirrorLowLatencyTimer != nullptr) {
+        mirrorLowLatencyTimer->stop();
+        mirrorLowLatencyTimer.reset();
+    }
+
     // Remove statusbar icon
     if (statusbarIconId >= 0) {
         lvgl::statusbar_icon_remove(statusbarIconId);
