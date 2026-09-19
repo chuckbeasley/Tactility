@@ -9,7 +9,6 @@
 #include <tactility/device.h>
 #include <tactility/driver.h>
 
-#include <esp_bt.h>
 #include <host/ble_att.h>
 #include <host/ble_gap.h>
 #include <host/ble_hs.h>
@@ -839,21 +838,6 @@ static void dispatch_disable(BleCtx* ctx) {
 #endif
     nimble_port_deinit();
 
-#if !defined(CONFIG_ESP_HOSTED_ENABLED)
-    // Native controller (this C5): the hosted branch below tears its own controller down, and this
-    // path never did. BLE and Wi-Fi share one radio through the coexistence layer, so leaving the
-    // controller enabled while the NimBLE host structures it points at have just been freed leaves
-    // that arbitration holding a controller nobody owns any more. Observed as: the idle policy
-    // disables the radio, and Wi-Fi goes silently dead - no panic, no reboot, nothing logged - and
-    // stays dead. Paired disable/deinit is the sequence IDF's own NimBLE teardown uses.
-    if (esp_bt_controller_disable() != ESP_OK) {
-        LOG_W(TAG, "esp_bt_controller_disable failed");
-    }
-    if (esp_bt_controller_deinit() != ESP_OK) {
-        LOG_W(TAG, "esp_bt_controller_deinit failed");
-    }
-#endif
-
 #if defined(CONFIG_ESP_HOSTED_ENABLED)
     // Symmetric with the enable-side esp_hosted_bt_controller_init/enable() calls.
     if (esp_hosted_bt_controller_disable() != ESP_OK) {
@@ -1068,20 +1052,6 @@ static size_t count_subscriptions(BleCtx* ctx) {
     return count;
 }
 
-// Runs the idle disable on its own short-lived task. dispatch_disable() can block for an unbounded
-// time - nimble_port_stop() waits for the NimBLE host task to exit its run loop, and this driver has
-// a giveup mechanism precisely because that wait can fail - and the timer callback it used to run on
-// is the shared esp_timer task, where a block takes every other subsystem's timers down with it.
-// Observed once: the idle line printed, then the console, the '?' memory report (which runs on that
-// same timer task) and the network all went quiet together, with no panic and no reboot.
-static void ble_idle_disable_task(void* arg) {
-    BleCtx* ctx = (BleCtx*)arg;
-    xSemaphoreTake(ctx->radio_mutex, portMAX_DELAY);
-    dispatch_disable(ctx);
-    xSemaphoreGive(ctx->radio_mutex);
-    vTaskDelete(nullptr);
-}
-
 static void ble_idle_timer_cb(void* arg) {
     BleCtx* ctx = (BleCtx*)arg;
     if (ctx->radio_state.load() != BT_RADIO_STATE_ON) {
@@ -1104,12 +1074,15 @@ static void ble_idle_timer_cb(void* arg) {
     }
     s_idle_checks = 0;
 
-    LOG_I(TAG, "BLE idle for %u minutes with no subscribers and no connections - disabling the radio to release its memory",
+    // Log only - the radio is deliberately left up. The disable was tried three times and never
+    // completed once: esp_bt_controller_disable()/deinit() come back ESP_ERR_INVALID_STATE because
+    // nimble_port_deinit() has already torn the controller down, the radio's memory is never
+    // released (largest stays at the radio-up figure), the serial memory report stops answering
+    // every time, and twice the network died with it - no panic, no reboot, nothing logged. Demand
+    // detection and this log line are verified and worth keeping; until the teardown is understood,
+    // acting on them costs more than the ~40 KB it returns.
+    LOG_I(TAG, "BLE idle for %u minutes with no subscribers and no connections - leaving the radio up (idle disable disabled, see this file)",
         (unsigned)((BLE_IDLE_CHECK_INTERVAL_S * BLE_IDLE_CHECKS_BEFORE_DISABLE) / 60));
-
-    if (xTaskCreate(ble_idle_disable_task, "ble_idle_off", 3072, ctx, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
-        LOG_W(TAG, "BLE idle: could not create the disable task, leaving the radio up");
-    }
 }
 
 static error_t api_event_subscribe(struct Device* device, BtEventSubscription* sub, TaskEventGroup* event_group) {
