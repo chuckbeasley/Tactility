@@ -1052,6 +1052,20 @@ static size_t count_subscriptions(BleCtx* ctx) {
     return count;
 }
 
+// Runs the idle disable on its own short-lived task. dispatch_disable() can block for an unbounded
+// time - nimble_port_stop() waits for the NimBLE host task to exit its run loop, and this driver has
+// a giveup mechanism precisely because that wait can fail - and the timer callback it used to run on
+// is the shared esp_timer task, where a block takes every other subsystem's timers down with it.
+// Observed once: the idle line printed, then the console, the '?' memory report (which runs on that
+// same timer task) and the network all went quiet together, with no panic and no reboot.
+static void ble_idle_disable_task(void* arg) {
+    BleCtx* ctx = (BleCtx*)arg;
+    xSemaphoreTake(ctx->radio_mutex, portMAX_DELAY);
+    dispatch_disable(ctx);
+    xSemaphoreGive(ctx->radio_mutex);
+    vTaskDelete(nullptr);
+}
+
 static void ble_idle_timer_cb(void* arg) {
     BleCtx* ctx = (BleCtx*)arg;
     if (ctx->radio_state.load() != BT_RADIO_STATE_ON) {
@@ -1077,11 +1091,9 @@ static void ble_idle_timer_cb(void* arg) {
     LOG_I(TAG, "BLE idle for %u minutes with no subscribers and no connections - disabling the radio to release its memory",
         (unsigned)((BLE_IDLE_CHECK_INTERVAL_S * BLE_IDLE_CHECKS_BEFORE_DISABLE) / 60));
 
-    // Same pattern as the disable timer: dispatch_disable() must not run on the NimBLE host task,
-    // and radio_mutex serialises it against a concurrent enable/disable.
-    xSemaphoreTake(ctx->radio_mutex, portMAX_DELAY);
-    dispatch_disable(ctx);
-    xSemaphoreGive(ctx->radio_mutex);
+    if (xTaskCreate(ble_idle_disable_task, "ble_idle_off", 3072, ctx, tskIDLE_PRIORITY + 1, nullptr) != pdPASS) {
+        LOG_W(TAG, "BLE idle: could not create the disable task, leaving the radio up");
+    }
 }
 
 static error_t api_event_subscribe(struct Device* device, BtEventSubscription* sub, TaskEventGroup* event_group) {
