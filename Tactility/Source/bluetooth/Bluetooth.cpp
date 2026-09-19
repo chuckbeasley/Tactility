@@ -264,7 +264,7 @@ static void bt_event_bridge(BtEvent event) {
 // Runs bt_event_bridge() on its own stack instead of whichever thread published the event, by
 // blocking in task_event_group_wait_any() rather than being called back directly.
 
-constexpr configSTACK_DEPTH_TYPE BT_EVENT_THREAD_STACK_SIZE = 4096;
+constexpr configSTACK_DEPTH_TYPE BT_EVENT_THREAD_STACK_SIZE = 2048;
 
 Device* btEventDevice = nullptr;
 
