@@ -9,6 +9,99 @@
 #include <esp_wifi.h>
 #include <esp_wifi_default.h>
 
+// ---- WiFi health monitor ----
+// The failure this exists for leaves the station associated with a healthy RSSI while no data moves
+// in either direction, for minutes at a time, with nothing logged and no panic - association state,
+// RSSI and the IP configuration all stay normal, so only an end-to-end probe can see it. It was
+// observed four times in one day at 10, 29, 35 and 40 minutes of uptime, and it heals itself, so the
+// probe's job is twofold: shorten the blackout by forcing a reconnect, and record the lwIP counters
+// at the moment the fault is detected, which is the evidence the investigation is missing.
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <unistd.h>
+
+#include <esp_timer.h>
+#include <lwip/sockets.h>
+#include <lwip/stats.h>
+#include <tactility/log.h>
+
+constexpr auto* WIFI_HEALTH_TAG = "wifi_health";
+
+static esp_netif_t* s_healthNetif = nullptr;
+static int s_healthFailures = 0;
+static esp_timer_handle_t s_healthTimer = nullptr;
+
+static constexpr int HEALTH_PROBE_INTERVAL_S = 20;
+static constexpr int HEALTH_PROBE_TIMEOUT_S = 3;
+static constexpr int HEALTH_FAILURES_BEFORE_RECONNECT = 3;
+
+static void wifiHealthTick(void*) {
+    if (s_healthNetif == nullptr) {
+        return;
+    }
+
+    esp_netif_ip_info_t info = {};
+    if (esp_netif_get_ip_info(s_healthNetif, &info) != ESP_OK || info.gw.addr == 0) {
+        // No address to probe yet: not a failure, just not connected.
+        s_healthFailures = 0;
+        return;
+    }
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return;
+    }
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    addr.sin_addr.s_addr = info.gw.addr;
+
+    bool reachable = connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0;
+    if (!reachable && errno == EINPROGRESS) {
+        fd_set write_set;
+        FD_ZERO(&write_set);
+        FD_SET(sock, &write_set);
+        struct timeval timeout = {};
+        timeout.tv_sec = HEALTH_PROBE_TIMEOUT_S;
+        if (select(sock + 1, nullptr, &write_set, nullptr, &timeout) > 0) {
+            int socket_error = 0;
+            socklen_t length = sizeof(socket_error);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &socket_error, &length);
+            reachable = socket_error == 0;
+        }
+    }
+    close(sock);
+
+    if (reachable) {
+        s_healthFailures = 0;
+        return;
+    }
+
+    s_healthFailures++;
+    if (s_healthFailures < HEALTH_FAILURES_BEFORE_RECONNECT) {
+        return;
+    }
+
+    wifi_ap_record_t ap = {};
+    const bool associated = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+#if LWIP_STATS && IP_STATS && TCP_STATS
+    LOG_W(WIFI_HEALTH_TAG, "gateway unreachable for %d probes (associated=%d rssi=%d ip_recv=%u tcp_recv=%u) - reconnecting",
+        s_healthFailures, (int)associated, (int)ap.rssi,
+        (unsigned)lwip_stats.ip.recv, (unsigned)lwip_stats.tcp.recv);
+#else
+    LOG_W(WIFI_HEALTH_TAG, "gateway unreachable for %d probes (associated=%d rssi=%d) - reconnecting",
+        s_healthFailures, (int)associated, (int)ap.rssi);
+#endif
+    s_healthFailures = 0;
+    esp_wifi_disconnect();
+    esp_wifi_connect();
+}
+
 #include <tactility/concurrent/mutex.h>
 #include <tactility/device.h>
 #include <tactility/driver.h>
@@ -280,6 +373,25 @@ error_t bring_up_wifi(Esp32WifiCtx* ctx) {
         esp_netif_destroy(ctx->netif);
         ctx->netif = nullptr;
         return esp_err_to_error(err);
+    }
+
+    // Start the health monitor (see wifiHealthTick). Created once; the netif is re-pointed on every
+    // start so a stop/start cycle cannot leave the probe reading a destroyed netif.
+    s_healthNetif = ctx->netif;
+    s_healthFailures = 0;
+    if (s_healthTimer == nullptr) {
+        const esp_timer_create_args_t health_args = {
+            .callback = wifiHealthTick,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "wifi_health",
+        };
+        if (esp_timer_create(&health_args, &s_healthTimer) == ESP_OK) {
+            esp_timer_start_periodic(s_healthTimer, (uint64_t)HEALTH_PROBE_INTERVAL_S * 1000 * 1000);
+        } else {
+            LOG_W(WIFI_HEALTH_TAG, "WiFi health monitor timer could not be created");
+            s_healthTimer = nullptr;
+        }
     }
 
     mutex_lock(&ctx->mutex);
