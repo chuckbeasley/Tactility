@@ -9,6 +9,7 @@
 #include <tactility/device.h>
 #include <tactility/driver.h>
 
+#include <esp_bt.h>
 #include <host/ble_att.h>
 #include <host/ble_gap.h>
 #include <host/ble_hs.h>
@@ -837,6 +838,21 @@ static void dispatch_disable(BleCtx* ctx) {
     }
 #endif
     nimble_port_deinit();
+
+#if !defined(CONFIG_ESP_HOSTED_ENABLED)
+    // Native controller (this C5): the hosted branch below tears its own controller down, and this
+    // path never did. BLE and Wi-Fi share one radio through the coexistence layer, so leaving the
+    // controller enabled while the NimBLE host structures it points at have just been freed leaves
+    // that arbitration holding a controller nobody owns any more. Observed as: the idle policy
+    // disables the radio, and Wi-Fi goes silently dead - no panic, no reboot, nothing logged - and
+    // stays dead. Paired disable/deinit is the sequence IDF's own NimBLE teardown uses.
+    if (esp_bt_controller_disable() != ESP_OK) {
+        LOG_W(TAG, "esp_bt_controller_disable failed");
+    }
+    if (esp_bt_controller_deinit() != ESP_OK) {
+        LOG_W(TAG, "esp_bt_controller_deinit failed");
+    }
+#endif
 
 #if defined(CONFIG_ESP_HOSTED_ENABLED)
     // Symmetric with the enable-side esp_hosted_bt_controller_init/enable() calls.
