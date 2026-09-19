@@ -295,10 +295,12 @@ void ble_resolve_next_unnamed_peer(struct Device* device, size_t start_idx) {
     BleCtx* ctx = ble_get_ctx(device);
     s_scan_ctx = ctx;
 
-    // Fresh chain (called with 0 at scan completion): reset the cap counter. Re-entrant calls
-    // (on disconnect / connect-fail) pass the next index, which is always > 0.
+    // Fresh chain (called with 0 at scan completion): reset the cap counter and mark the chain
+    // active, so the idle policy and any teardown attempt know the host task is about to be busy
+    // with GAP connects. Re-entrant calls (on disconnect / connect-fail) pass the next index.
     if (start_idx == 0) {
         s_name_resolve_count = 0;
+        ctx->name_resolving.store(true);
     }
 
     // Skip if a profile server or HID host connection attempt is active —
@@ -306,6 +308,7 @@ void ble_resolve_next_unnamed_peer(struct Device* device, size_t start_idx) {
     if (ble_midi_get_active(device) || ble_spp_get_active(device) ||
         ble_hid_get_active(device)  || ble_hid_get_host_active(device)) {
         LOG_I(TAG, "Name resolution: skipping (server or HID host active)");
+        ctx->name_resolving.store(false);
         ble_set_scan_active(device, false);
         struct BtEvent e = {};
         e.type = BT_EVENT_SCAN_FINISHED;

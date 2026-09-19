@@ -799,6 +799,16 @@ static void dispatch_disable(BleCtx* ctx) {
         return;
     }
 
+    // Quiescence before teardown. The name-resolution chain runs on the NimBLE host task and holds
+    // it across one GAP connect per unnamed peer, so requesting a stop while it is in flight leaves
+    // nimble_port_stop()'s sentinel queued behind a connect that has not completed: the host task
+    // never exits, and before the fail-safe below existed, deinit ran under it anyway. Refusing here
+    // costs a radio that stays up for a few more seconds; proceeding costs the teardown itself.
+    if (ctx->name_resolving.load()) {
+        LOG_W(TAG, "Name resolution in flight; refusing to tear down (host task is inside a GAP connect)");
+        return;
+    }
+
     ctx->radio_state.store(BT_RADIO_STATE_OFF_PENDING);
     {
         struct BtEvent e = {};
@@ -1085,6 +1095,7 @@ static void ble_idle_timer_cb(void* arg) {
 
     const bool demand = count_subscriptions(ctx) > 0 ||
                         ctx->scan_active.load() ||
+                        ctx->name_resolving.load() ||
                         ctx->hid_host_active.load() ||
                         ble_spp_get_active(ctx->device) ||
                         ble_midi_get_active(ctx->device);

@@ -47,6 +47,13 @@ struct BleCtx {
     // Set when the active scan should skip post-scan GATT name resolution (e.g. a passive
     // observer/sniffer must stay non-intrusive and must not initiate central connections).
     std::atomic<bool>         scan_resolve_names;
+    // True while the post-scan name-resolution chain is walking peers with one GAP connect at a
+    // time. That chain runs on the NimBLE host task and can hold it for tens of seconds (up to 60
+    // peers, 1500 ms each), so a teardown requested during it leaves nimble_port_stop()'s sentinel
+    // queued behind a GAP connect that has not completed - which is what "the host task did not
+    // signal completion" meant. It is deliberately its own signal: the chain runs after the scan
+    // reports complete, so scan_active does not cover it.
+    std::atomic<bool>         name_resolving;
     // Set by Tactility HID host to prevent simultaneous central connection during name resolution
     std::atomic<bool>         hid_host_active;
 
