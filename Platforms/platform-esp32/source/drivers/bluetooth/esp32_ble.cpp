@@ -1024,6 +1024,61 @@ static error_t api_disconnect(struct Device* device, const BtAddr addr, enum BtP
     return ERROR_NOT_SUPPORTED;
 }
 
+// ---- BLE idle policy ----
+// The radio's stacks and NimBLE's buffers are tens of KB of internal RAM that stay allocated for the
+// rest of the boot once any app has started the radio, because nothing stops it on app exit. This
+// releases them: with no app holding an event subscription, nothing scanning, and no profile or HID
+// host connection live, the radio is disabled after a grace period. Demand is what keeps it up, not
+// connection state - a connected keyboard is demand, and so is any open BLE app - so a sleeping
+// peripheral reconnecting on its own is not something this policy preserves.
+static constexpr int BLE_IDLE_CHECK_INTERVAL_S = 30;
+static constexpr int BLE_IDLE_CHECKS_BEFORE_DISABLE = 4; // ~2 minutes
+
+static esp_timer_handle_t s_idle_timer = nullptr;
+static int s_idle_checks = 0;
+
+static size_t count_subscriptions(BleCtx* ctx) {
+    size_t count = 0;
+    mutex_lock(&ctx->subscriptionsMutex);
+    for (BtEventSubscription* sub = ctx->subscriptions; sub != nullptr; sub = sub->internal.next) {
+        ++count;
+    }
+    mutex_unlock(&ctx->subscriptionsMutex);
+    return count;
+}
+
+static void ble_idle_timer_cb(void* arg) {
+    BleCtx* ctx = (BleCtx*)arg;
+    if (ctx->radio_state.load() != BT_RADIO_STATE_ON) {
+        s_idle_checks = 0;
+        return;
+    }
+
+    const bool demand = count_subscriptions(ctx) > 0 ||
+                        ctx->scan_active.load() ||
+                        ctx->hid_host_active.load() ||
+                        ble_spp_get_active(ctx->device) ||
+                        ble_midi_get_active(ctx->device);
+    if (demand) {
+        s_idle_checks = 0;
+        return;
+    }
+
+    if (++s_idle_checks < BLE_IDLE_CHECKS_BEFORE_DISABLE) {
+        return;
+    }
+    s_idle_checks = 0;
+
+    LOG_I(TAG, "BLE idle for %u minutes with no subscribers and no connections - disabling the radio to release its memory",
+        (unsigned)((BLE_IDLE_CHECK_INTERVAL_S * BLE_IDLE_CHECKS_BEFORE_DISABLE) / 60));
+
+    // Same pattern as the disable timer: dispatch_disable() must not run on the NimBLE host task,
+    // and radio_mutex serialises it against a concurrent enable/disable.
+    xSemaphoreTake(ctx->radio_mutex, portMAX_DELAY);
+    dispatch_disable(ctx);
+    xSemaphoreGive(ctx->radio_mutex);
+}
+
 static error_t api_event_subscribe(struct Device* device, BtEventSubscription* sub, TaskEventGroup* event_group) {
     BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
     if (!ctx || !sub || !event_group) return ERROR_INVALID_ARGUMENT;
@@ -1284,6 +1339,22 @@ static error_t esp32_ble_start_device(struct Device* device) {
     device_set_driver_data(device, ctx);
     s_ctx = ctx;
 
+    // Idle policy: created once, started once. It no-ops unless the radio is on.
+    if (s_idle_timer == nullptr) {
+        const esp_timer_create_args_t idle_args = {
+            .callback = ble_idle_timer_cb,
+            .arg = ctx,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "ble_idle",
+        };
+        if (esp_timer_create(&idle_args, &s_idle_timer) == ESP_OK) {
+            esp_timer_start_periodic(s_idle_timer, (uint64_t)BLE_IDLE_CHECK_INTERVAL_S * 1000 * 1000);
+        } else {
+            s_idle_timer = nullptr;
+            LOG_W(TAG, "BLE idle policy timer could not be created");
+        }
+    }
+
     // Create child devices for the serial, MIDI and HID device profiles.
     // device_start() on each child will invoke start_device (for serial/midi)
     // which initialises their driver data (BleSppCtx / BleMidiCtx).
@@ -1349,6 +1420,13 @@ static error_t esp32_ble_stop_device(struct Device* device) {
     ctx->subscriptions = nullptr;
     mutex_unlock(&ctx->subscriptionsMutex);
     mutex_destruct(&ctx->subscriptionsMutex);
+
+    if (s_idle_timer != nullptr) {
+        esp_timer_stop(s_idle_timer);
+        esp_timer_delete(s_idle_timer);
+        s_idle_timer = nullptr;
+    }
+    s_idle_checks = 0;
 
     s_ctx = nullptr;
     device_set_driver_data(device, nullptr);
