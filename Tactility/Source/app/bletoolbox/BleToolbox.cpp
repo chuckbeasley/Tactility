@@ -1257,10 +1257,13 @@ extern const ::AppManifest manifest = {
     .flags = 0,
     // The scan/AirTag peer-list rebuild does heavy LVGL work (creating/cleaning many widgets,
     // forcing layout, object-tree redraw recursion) on this app's own task, and the BLE Observer
-    // builds a large log string. The default 8 KB stack overflows under that redraw recursion, so
-    // give the app more headroom (as BtManage does); the LVGL lock must also be held around those
-    // widget mutations. A ~24 KB internal stack is well under APP_STACK_SIZE_MAX (64 KB).
-    .stack = { .depth = 6144 }, // 24 KB
+    // builds a large log string. It needs real headroom: one instance was measured with only 1,160
+    // bytes free of its 6,144-byte stack, i.e. 4,984 bytes used at peak. The stack depth here is in
+    // BYTES, not words - StackType_t is one byte on IDF's RISC-V port - so the 6144 this used to say
+    // bought 6 KB, not the 24 KB its comment claimed, and it was below the 8 KB default it was meant
+    // to exceed. 12,288 is 2.5x the measured peak, still well under APP_STACK_SIZE_MAX (64 KB), and
+    // is only held while this app is open.
+    .stack = { .depth = 12288 },
 };
 
 } // namespace tt::app::bletoolbox
