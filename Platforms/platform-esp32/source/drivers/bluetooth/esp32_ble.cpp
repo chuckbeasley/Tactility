@@ -822,11 +822,35 @@ static void dispatch_disable(BleCtx* ctx) {
     // freeing anything NimBLE still references (ble_hs_timer et al in nimble_port_deinit()),
     // otherwise ble_hs_timer_sched() on the host task can dereference a freed callout —
     // see host_task() for the crash this fixes.
-    if (ctx->host_task_done_sem != nullptr) {
-        if (xSemaphoreTake(ctx->host_task_done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    // Fail-safe: never deinit under a live host task. nimble_port_deinit() frees the controller and
+    // the structures NimBLE's host task walks, and a host task that has not exited goes on using
+    // them - silently, because none of that path logs. Measured three times: the teardown looked
+    // complete (the controller calls after deinit returned ESP_ERR_INVALID_STATE, proving deinit had
+    // run), yet the radio's memory never came back because the host task never exited, and the
+    // serial memory report stopped answering; twice the network died with it. A host task that does
+    // not confirm exit now aborts the teardown and leaves the radio up, which costs ~40 KB rather
+    // than the console and sometimes the network.
+    bool host_task_exited = (ctx->host_task_done_sem == nullptr);
+    if (!host_task_exited) {
+        // An in-flight GAP operation (scan cancel, name-resolution connect, advertising restart) can
+        // hold the host task past its own 1500 ms timeouts, so the second window is longer.
+        host_task_exited = xSemaphoreTake(ctx->host_task_done_sem, pdMS_TO_TICKS(2000)) == pdTRUE;
+        if (!host_task_exited) {
             LOG_W(TAG, "host task did not signal completion in time");
+            host_task_exited = xSemaphoreTake(ctx->host_task_done_sem, pdMS_TO_TICKS(5000)) == pdTRUE;
         }
     }
+
+    if (!host_task_exited) {
+        LOG_E(TAG, "host task still alive after nimble_port_stop(); abandoning teardown, radio left up");
+        ctx->radio_state.store(BT_RADIO_STATE_ON);
+        struct BtEvent resume = {};
+        resume.type = BT_EVENT_RADIO_STATE_CHANGED;
+        resume.radio_state = BT_RADIO_STATE_ON;
+        ble_publish_event(ctx->device, resume);
+        return;
+    }
+
 #if defined(CONFIG_ESP_HOSTED_ENABLED)
     // Close the gate NOW — after nimble_port_stop() returns the NimBLE host task has
     // exited and nimble_port_deinit() is about to zero npl_funcs. Any HCI packet
