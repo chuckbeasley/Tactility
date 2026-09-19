@@ -34,7 +34,7 @@ static esp_netif_t* s_healthNetif = nullptr;
 static int s_healthFailures = 0;
 static esp_timer_handle_t s_healthTimer = nullptr;
 
-static constexpr int HEALTH_PROBE_INTERVAL_S = 20;
+static constexpr int HEALTH_PROBE_INTERVAL_S = 5;
 static constexpr int HEALTH_PROBE_TIMEOUT_S = 3;
 static constexpr int HEALTH_FAILURES_BEFORE_RECONNECT = 3;
 
