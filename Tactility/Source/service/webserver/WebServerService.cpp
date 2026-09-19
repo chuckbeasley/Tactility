@@ -1297,6 +1297,23 @@ esp_err_t WebServerService::handleAdminPost(httpd_req_t* request) {
 esp_err_t WebServerService::handleApiGet(httpd_req_t* request) {
     const char* uri = request->uri;
 
+    // Slow-request diagnostic. Phase two of this board's intermittent network fault is HTTP
+    // connections being accepted and never answered while ICMP and the gateway stay healthy, which
+    // makes the webserver the first place it becomes visible - caught live once, on this dispatcher,
+    // roughly a minute before the network itself died. A request held past the threshold logs its
+    // URI and duration, so a recurrence names the endpoint that was in flight. It logs nothing in
+    // normal operation. See the WiFi health monitor in esp32_wifi.cpp for the other half of the pair.
+    struct SlowRequestLog {
+        int64_t started_us;
+        const char* uri;
+        ~SlowRequestLog() {
+            const int64_t ms = (esp_timer_get_time() - started_us) / 1000;
+            if (ms > 3000) {
+                LOG_W(TAG, "slow request: %s took %lld ms", uri, (long long)ms);
+            }
+        }
+    } slow_request_log = { esp_timer_get_time(), uri };
+
     // Public endpoint: sysinfo (basic device info for monitoring)
     if (strncmp(uri, "/api/sysinfo", 12) == 0) {
         return handleApiSysinfo(request);

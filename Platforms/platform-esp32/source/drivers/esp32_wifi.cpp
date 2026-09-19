@@ -38,6 +38,27 @@ static constexpr int HEALTH_PROBE_INTERVAL_S = 5;
 static constexpr int HEALTH_PROBE_TIMEOUT_S = 3;
 static constexpr int HEALTH_FAILURES_BEFORE_RECONNECT = 3;
 
+#include <esp_rom_sys.h>
+#include <freertos/task.h>
+
+static TaskStatus_t s_healthTaskTable[24];
+
+// Printed only when the monitor fires, never continuously. The serial wedge probe wrote ten lines a
+// second and every fault observed during this investigation happened on firmware without it, so this
+// instrument stays silent until there is something to say. State: 0 running, 1 ready, 2 blocked,
+// 3 suspended.
+static void dumpHealthTaskTable() {
+    const UBaseType_t count = uxTaskGetSystemState(s_healthTaskTable, 24, nullptr);
+    esp_rom_printf("[wifi_health] %u tasks:\n", (unsigned)count);
+    for (UBaseType_t i = 0; i < count; ++i) {
+        esp_rom_printf("[wifi_health]   %-16s state=%u prio=%u stack_free=%u\n",
+            s_healthTaskTable[i].pcTaskName,
+            (unsigned)s_healthTaskTable[i].eCurrentState,
+            (unsigned)s_healthTaskTable[i].uxCurrentPriority,
+            (unsigned)s_healthTaskTable[i].usStackHighWaterMark);
+    }
+}
+
 static void wifiHealthTick(void*) {
     if (s_healthNetif == nullptr) {
         return;
@@ -97,6 +118,7 @@ static void wifiHealthTick(void*) {
     LOG_W(WIFI_HEALTH_TAG, "gateway unreachable for %d probes (associated=%d rssi=%d) - reconnecting",
         s_healthFailures, (int)associated, (int)ap.rssi);
 #endif
+    dumpHealthTaskTable();
     s_healthFailures = 0;
     esp_wifi_disconnect();
     esp_wifi_connect();
