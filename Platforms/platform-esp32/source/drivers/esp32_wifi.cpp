@@ -39,6 +39,7 @@ static constexpr int HEALTH_PROBE_TIMEOUT_S = 3;
 static constexpr int HEALTH_FAILURES_BEFORE_RECONNECT = 3;
 
 #include <esp_rom_sys.h>
+#include <esp_rom_uart.h>
 #include <freertos/task.h>
 
 static TaskStatus_t s_healthTaskTable[24];
@@ -62,6 +63,21 @@ static void dumpHealthTaskTable() {
 static void wifiHealthTick(void*) {
     if (s_healthNetif == nullptr) {
         return;
+    }
+
+    // Serial memory report: send '?' on the console and the heap figures come back. Polled from this
+    // tick rather than from a task of its own so it costs no stack, and deliberately silent otherwise
+    // - continuous console output has been observed to suppress the intermittent fault this board is
+    // being investigated for, and the only other way to read memory (/api/sysinfo) is served by a
+    // service that may be stopped, wedged, or the very thing being measured.
+    uint8_t console_key = 0;
+    if (esp_rom_uart_rx_one_char(&console_key) == 0 && console_key == '?') {
+        esp_rom_printf("[mem] internal free=%u largest=%u min=%u | psram free=%u largest=%u\n",
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
     }
 
     esp_netif_ip_info_t info = {};
