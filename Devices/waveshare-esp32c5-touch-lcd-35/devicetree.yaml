@@ -1,0 +1,5 @@
+dependencies:
+  - Platforms/platform-esp32
+  # The display is on the board's SPI2 bus and the panel is up (see the .dts and source/module.cpp).
+  - Drivers/st7796-module
+dts: waveshare,esp32c5.dts

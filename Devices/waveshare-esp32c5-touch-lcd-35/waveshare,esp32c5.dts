@@ -1,0 +1,123 @@
+/dts-v1/;
+
+#include <tactility/bindings/root.h>
+#include <tactility/bindings/esp32_ble.h>
+#include <tactility/bindings/esp32_wifi_pinned.h>
+#include <tactility/bindings/esp32_gpio.h>
+#include <tactility/bindings/esp32_i2c.h>
+#include <tactility/bindings/esp32_spi.h>
+#include <bindings/st7796.h>
+
+/*
+ * Waveshare ESP32-C5-Touch-LCD-3.5 (ESP32-C5-WROOM-1U, 32 MB flash, 8 MB PSRAM).
+ *
+ * Waveshare publishes no schematic and no example for this SKU - its own documentation says, of both
+ * the examples and the hardware resources, "Related resources are still being prepared" - so every
+ * number below was recovered from the firmware Waveshare ships on the board, then confirmed on
+ * hardware. Nothing here is copied from a datasheet or from another board:
+ *
+ *   I2C        SDA = GPIO27, SCL = GPIO26, 100 kHz. This is the BOARD bus: the QMI8658 (0x6B), the
+ *              PCF85063A, the SHTC3, the AXP2101 PMIC (0x34) and the CH32V003 IO-expander (0x24) are
+ *              all on it. It is NOT the 4/5 pair: 4/5 is the camera's SCCB, which the vendor's own
+ *              example passes to a separate bus and which fails to probe (no camera is fitted).
+ *              Hardware confirmation: a scan finds the expander on 27/26 and nothing at all on 4/5.
+ *
+ *   SPI        SCLK = GPIO6, MOSI = GPIO7, MISO = GPIO2, on SPI2. Confirmed independently of the
+ *              display path: the TF card runs on this same bus (SDSPI, host SPI2) and answers CMD0
+ *              with R1=0x01 at its own CS=9, so the three bus pins are proven by a device that talks
+ *              back. There is exactly one SPI bus in the vendor firmware, so the card and the panel
+ *              share these pins by construction.
+ *
+ *   Display    ST7796, CS = GPIO8, DC = GPIO5, no reset GPIO (the driver's reset is the software
+ *              SWRESET over SPI), 320x480 portrait. BGR element order, as the vendor configures it.
+ *
+ *   Backlight  PWM channel of the CH32V003 expander at 0x24 (register 5 = duty). It is held on by
+ *              the expander itself, so the panel is lit without help from here; there is no
+ *              devicetree binding for it yet, which is why display@0 has no 'backlight' property.
+ *
+ *   Touch      FT6336 at I2C address 0x38 on the same bus, INT = GPIO3, no reset pin. No binding in
+ *              this tree yet, so it is not declared below.
+ *
+ * IMPORTANT: the panel does not respond to SPI until two things have happened, and they are done by
+ * this device's module start hook (see source/module.cpp) because they must run before the display
+ * driver starts:
+ *   1. the AXP2101's rail enables (register 0x90 = 0xFF, register 0x91 bit 0), which is the first
+ *      thing the vendor's app_main does, and
+ *   2. a reset pulse on pins 0/1 of the CH32V003 expander, which is what the vendor does immediately
+ *      before it creates the panel.
+ * With both, fills land. Without them the panel ignores every command - which looks exactly like
+ * wrong pins and is why this took a sweep of every CS/DC combination to rule that out.
+ */
+
+/ {
+	compatible = "root";
+	model = "Waveshare ESP32-C5-Touch-LCD-3.5";
+
+	wifi0 {
+		compatible = "espressif,esp32-wifi-pinned";
+		status = "disabled";
+	};
+
+	ble0 {
+		compatible = "espressif,esp32-ble";
+		status = "disabled";
+	};
+
+	gpio0 {
+		compatible = "espressif,esp32-gpio";
+		gpio-count = <29>;
+	};
+
+	/*
+	 * Pin budget on this SoC, true for every board using it: GPIO 15-18 and 20-22 are the MSPI group
+	 * (spi_pins.h: CS1 15, CS0 16, MISO 17, WP 18, HD 20, CLK 21, MOSI 22) and are IOMUX-only, so
+	 * esp32_gpio_is_mspi_pin() rejects them outright. GPIO 11/12 are UART0. This board puts its
+	 * console on USB-Serial-JTAG rather than a bridge, so GPIO 13/14 (the native USB pads) are taken
+	 * too. GPIO 19 is NOT an MSPI pin and is usable. In use here: 2, 5, 6, 7, 8 (display),
+	 * 26, 27 (I2C), 3 (touch interrupt), 9 (SD chip select), 13/14 (USB console).
+	 */
+
+	i2c0 {
+		compatible = "espressif,esp32-i2c";
+		port = <I2C_NUM_0>;
+		pin-sda = <&gpio0 27 GPIO_FLAG_NONE>;
+		pin-scl = <&gpio0 26 GPIO_FLAG_NONE>;
+		clock-frequency = <100000>;
+	};
+
+	spi0 {
+		compatible = "espressif,esp32-spi";
+		host = <SPI2_HOST>;
+		cs-gpios = <&gpio0 8 GPIO_FLAG_NONE>;
+		pin-mosi = <&gpio0 7 GPIO_FLAG_NONE>;
+		pin-sclk = <&gpio0 6 GPIO_FLAG_NONE>;
+		pin-miso = <&gpio0 2 GPIO_FLAG_NONE>;
+
+		display@0 {
+			compatible = "sitronix,st7796";
+			// 320x480 portrait. This is the panel's native orientation, unlike the C5 board this
+			// profile was derived from, whose panel is 480x320 with swap-xy. Rotation is a user
+			// setting in the display app rather than something baked in here.
+			horizontal-resolution = <320>;
+			vertical-resolution = <480>;
+			pixel-clock-hz = <40000000>;
+			// The vendor configures rgb_ele_order = BGR; without this the panel reads R and B
+			// swapped and every colour comes out shifted.
+			bgr-order;
+			// INVON. The vendor's own esp_lcd_st7796 sends it only when its caller asks
+			// (panel_st7796_invert_color -> LCD_CMD_INVON); it is not part of that driver's init
+			// sequence, and esp_lcd_panel_dev_config_t only carries rgb_ele_order and bpp. The panel
+			// nonetheless needs it: a bring-up test that filled the panel with 0x001F and had sent
+			// 0x21 first showed solid BLUE, and the same fill without inversion would show yellow.
+			invert-color;
+			// MX. The vendor's MADCTL byte is 0x48 = MX (0x40) | BGR (0x08), and esp_lcd_st7796 only
+			// ever sets the BGR bit itself (madctl_val starts at 0 and gains LCD_CMD_BGR_BIT); the MX
+			// bit comes from the caller. Without it the panel scans X in the opposite direction and
+			// every glyph is mirrored - text renders reversed while the colours stay correct.
+			mirror-x;
+			pin-dc = <&gpio0 5 GPIO_FLAG_NONE>;
+			// No pin-reset: reset_gpio_num is -1 in the vendor firmware and the driver's reset is
+			// the software SWRESET. The panel's real reset is the expander pulse above.
+		};
+	};
+};
