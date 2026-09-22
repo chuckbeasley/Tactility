@@ -272,13 +272,18 @@ static error_t start(Device* device) {
     // is the value the part ends up with.
     //
     // Measured on this board: 128 -> zero detections in 16 s of firm tapping on battery, 48 -> seven,
-    // 32 -> more again, with nothing happening without a finger, and USB normal at all three. What the
-    // part's *own* default is remains unknown, because until this session nothing ever power-cycled it:
-    // the rail that feeds it is ALDO2 (found by toggling each LDO and watching the part NACK), and that
-    // rail has been up continuously. The vendor's firmware writes nothing and therefore runs at that
-    // default. Reproducing that exactly needs the managed component vendored into the tree so its three
-    // writes can be deleted - it is not tracked, so it cannot be patched in place - and until then this
-    // is the configuration the board has actually been verified with.
+    // 32 -> more again, with nothing happening without a finger, and USB normal at all three.
+    //
+    // 128 is not our invention and not a value we can blame on the stock driver: it is the part's own
+    // power-on default. That was measured rather than assumed - toggling the LDOs showed ALDO2 is the
+    // rail that feeds this controller, cutting it power-cycled the part for the first time in this
+    // board's session here, and the next boot printed "FT6x36: Thresh: 128" from a read taken before
+    // anything wrote to it.
+    //
+    // The consequence is worth stating plainly, because it is the reason this value is 32 and not 128:
+    // the vendor's firmware writes nothing to this controller, so it runs at 128 on USB and on battery
+    // alike - which is exactly the configuration measured to produce no touch at all on battery. Copying
+    // the vendor byte for byte would reproduce the fault, not fix it. This deviation is load-bearing.
     const uint8_t touch_threshold = 32;
     const uint8_t stock_point_rate = 0x0E;
     const uint8_t stock_interrupt_mode = 0x01;
