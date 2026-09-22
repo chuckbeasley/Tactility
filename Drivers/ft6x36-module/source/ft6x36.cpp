@@ -17,6 +17,7 @@
 #include <esp_err.h>
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
+#include <esp_timer.h>
 #include <esp_lcd_io_i2c.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_touch.h>
@@ -34,6 +35,11 @@
 // pulse_reset). The vendor's own driver for this part waits the same 300 ms after its reset pulse.
 constexpr int POWER_UP_SETTLE_MS = 300;
 
+// How often the driver's own task samples the controller. The controller scans at 14 Hz (71 ms) and the
+// input path asks for data every ~35 ms (measured on this board), so polling faster than either is what
+// keeps a short tap from falling between two samples. One 17-byte read costs about 2 ms at 100 kHz.
+constexpr int POLL_INTERVAL_MS = 10;
+
 // The controller's touch block: register 0x00 upwards, one transaction, containing the point count at
 // offset 0x02 and up to two sets of coordinates at 0x03..0x08. The same block the component's read
 // fetches as its second half.
@@ -48,6 +54,20 @@ struct Ft6x36Internal {
     esp_lcd_touch_handle_t touch_handle;
     // Non-null when pin_reset is configured. Owned/pulsed by this driver instead of esp_lcd_touch
     GpioDescriptor* reset_descriptor;
+
+    // The controller is polled by this driver's own task rather than only when the input path asks,
+    // because those two rates are far apart and the gap loses taps: measured on this board, LVGL's
+    // timer calls read_data every ~35 ms while the controller itself scans every ~71 ms (14 Hz), so a
+    // ~100 ms tap is one or two scans wide and two or three samples wide, and missing either loses it.
+    // The task samples the controller at POLL_INTERVAL_MS and latches what it sees, so a tap that
+    // happened between two input-path reads is still delivered exactly once.
+    TaskHandle_t poll_task;
+    portMUX_TYPE poll_lock;
+    bool poll_task_stop;
+    bool finger_down;
+    bool latch_pending;
+    uint16_t latched_x;
+    uint16_t latched_y;
 };
 
 // Only valid for pin_interrupt: esp_lcd_touch only ever reads this pin's level / attaches an ISR
@@ -86,6 +106,47 @@ static error_t pulse_reset(GpioDescriptor* descriptor) {
     }
     vTaskDelay(pdMS_TO_TICKS(300));
     return ERROR_NONE;
+}
+
+// Reads the controller's touch block and latches what it says. Runs from the driver's polling task,
+// several times per input-path read, so that a tap cannot fall between two samples.
+static void ft6x36_poll_once(Ft6x36Internal* internal) {
+    uint8_t block[TOUCH_BLOCK_SIZE] = {};
+    if (esp_lcd_panel_io_rx_param(internal->io_handle, TOUCH_BLOCK_REGISTER, block, sizeof(block)) != ESP_OK) {
+        return; // a failed read leaves the previous state alone rather than inventing a release
+    }
+
+    // 0x0F is not a count this controller can report, so an all-ones block (a bus that answered
+    // nothing meaningful) lands here as "no touch" rather than as fifteen of them.
+    const uint8_t raw_count = block[TOUCH_BLOCK_COUNT_OFFSET] & 0x0F;
+    const uint8_t point_count = raw_count <= CONFIG_ESP_LCD_TOUCH_MAX_POINTS ? raw_count : 0;
+
+    const uint16_t x = (uint16_t)(((block[TOUCH_BLOCK_FIRST_POINT_OFFSET] & 0x0F) << 8) |
+                                  block[TOUCH_BLOCK_FIRST_POINT_OFFSET + 1]);
+    const uint16_t y = (uint16_t)(((block[TOUCH_BLOCK_FIRST_POINT_OFFSET + 2] & 0x0F) << 8) |
+                                  block[TOUCH_BLOCK_FIRST_POINT_OFFSET + 3]);
+
+    portENTER_CRITICAL(&internal->poll_lock);
+    if (point_count > 0) {
+        internal->finger_down = true;
+        internal->latch_pending = true;
+        internal->latched_x = x;
+        internal->latched_y = y;
+    } else {
+        internal->finger_down = false;
+    }
+    portEXIT_CRITICAL(&internal->poll_lock);
+}
+
+static void ft6x36_poll_task(void* argument) {
+    auto* internal = static_cast<Ft6x36Internal*>(argument);
+
+    while (!internal->poll_task_stop) {
+        ft6x36_poll_once(internal);
+        vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
+    }
+
+    vTaskDelete(nullptr);
 }
 
 // region Driver lifecycle
@@ -222,14 +283,47 @@ static error_t start(Device* device) {
         esp_lcd_panel_io_tx_param(internal->io_handle, 0xA4, &stock_interrupt_mode, 1);
     if (threshold_result != ESP_OK || rate_result != ESP_OK || mode_result != ESP_OK) {
         LOG_W(TAG, "could not restore the controller's stock registers; leaving it as it is");
+    } else {
+        // Read back so the boot log states what the controller is actually configured with, rather than
+        // what it was asked for. Diagnostic, and cheap: three register reads once per boot.
+        uint8_t check_threshold = 0;
+        uint8_t check_rate = 0;
+        uint8_t check_mode = 0;
+        esp_lcd_panel_io_rx_param(internal->io_handle, 0x80, &check_threshold, 1);
+        esp_lcd_panel_io_rx_param(internal->io_handle, 0x88, &check_rate, 1);
+        esp_lcd_panel_io_rx_param(internal->io_handle, 0xA4, &check_mode, 1);
+        LOG_I(TAG, "registers: threshold=%u rate=%u interrupt_mode=%u", check_threshold, check_rate, check_mode);
     }
 
+    internal->poll_task = nullptr;
+    internal->poll_task_stop = false;
+    internal->finger_down = false;
+    internal->latch_pending = false;
+    internal->latched_x = 0;
+    internal->latched_y = 0;
+    internal->poll_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+
     device_set_driver_data(device, internal);
+
+    // Below the input path and the apps: this observes the controller and must never be the reason a
+    // touch is late. Small stack: one log line and one bus transaction per interval.
+    if (xTaskCreate(ft6x36_poll_task, "ft6x36-poll", 3072, internal, 3, &internal->poll_task) != pdPASS) {
+        LOG_W(TAG, "could not start the polling task; taps fall back to the input path's own rate");
+        internal->poll_task = nullptr;
+    }
+
     return ERROR_NONE;
 }
 
 static error_t stop(Device* device) {
     auto* internal = static_cast<Ft6x36Internal*>(device_get_driver_data(device));
+
+    // Stop the polling task first: it is the only other user of the panel IO handle deleted below.
+    if (internal->poll_task != nullptr) {
+        internal->poll_task_stop = true;
+        vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS * 3));
+        internal->poll_task = nullptr;
+    }
 
     // esp_lcd_touch_del() only releases the touch-side resources; the panel IO handle is owned
     // separately and needs its own deletion.
@@ -277,39 +371,37 @@ static error_t ft6x36_read_data(Device* device, TickType_t timeout) {
     (void)timeout; // esp_lcd_touch_read_data() has no timeout parameter
     auto* internal = static_cast<Ft6x36Internal*>(device_get_driver_data(device));
 
-    // One transaction, one coherent snapshot: the count byte and the coordinates come out of the same
-    // block read, so they cannot disagree with each other, and no other reader has to touch the
-    // controller first.
-    //
-    // The stock component reads the other way round - the count register first, returning immediately
-    // if it reads zero, and only then the block - which on battery power disagreed with itself in 14 of
-    // 98 samples (never once on USB, in 63) and silently threw the touch away every time it did. The
-    // next attempt let the component read first and fetched the block only when it reported nothing:
-    // that fixed battery but cost missed taps on USB, because on this part a read consumes the
-    // detection it just reported, so a second reader steals the first one's touch. A single read by a
-    // single reader has neither problem.
-    uint8_t block[TOUCH_BLOCK_SIZE] = {};
-    if (esp_lcd_panel_io_rx_param(internal->io_handle, TOUCH_BLOCK_REGISTER, block, sizeof(block)) != ESP_OK) {
-        // A failed read must not leave the previous touch standing as if it were current.
-        auto* failed = internal->touch_handle;
-        portENTER_CRITICAL(&failed->data.lock);
-        failed->data.points = 0;
-        portEXIT_CRITICAL(&failed->data.lock);
-        return ERROR_RESOURCE;
+    // The controller itself is read by ft6x36_poll_task(), several times per call here, because this
+    // call happens once per LVGL timer tick (~35 ms measured on this board) while the controller scans
+    // every ~71 ms (14 Hz): a ~100 ms tap is one or two scans wide, and anything that fell between two
+    // of these calls used to be lost outright. What is left here is to publish the polled state, with
+    // one addition - a touch the polling task saw but this path has not been told about yet is
+    // reported as a press now, and the next call reports the release, so it arrives as a press/release
+    // pair instead of never arriving at all.
+    bool finger_down = false;
+    bool unread_tap = false;
+    uint16_t x = 0;
+    uint16_t y = 0;
+
+    portENTER_CRITICAL(&internal->poll_lock);
+    finger_down = internal->finger_down;
+    x = internal->latched_x;
+    y = internal->latched_y;
+    if (finger_down) {
+        internal->latch_pending = false; // this press is being delivered now
+    } else if (internal->latch_pending) {
+        internal->latch_pending = false;
+        unread_tap = true;
     }
+    portEXIT_CRITICAL(&internal->poll_lock);
 
-    // 0x0F is not a count this controller can report, so a block of all-ones (a bus that answered
-    // nothing meaningful) lands here as "no touch" rather than as fifteen of them.
-    const uint8_t raw_count = block[TOUCH_BLOCK_COUNT_OFFSET] & 0x0F;
-    const uint8_t point_count = raw_count <= CONFIG_ESP_LCD_TOUCH_MAX_POINTS ? raw_count : 0;
-
+    const bool pressed = finger_down || unread_tap;
     auto* touch = internal->touch_handle;
     portENTER_CRITICAL(&touch->data.lock);
-    touch->data.points = point_count;
-    for (uint8_t i = 0; i < point_count; ++i) {
-        const size_t offset = TOUCH_BLOCK_FIRST_POINT_OFFSET + (i * TOUCH_POINT_STRIDE);
-        touch->data.coords[i].x = (uint16_t)(((block[offset] & 0x0F) << 8) | block[offset + 1]);
-        touch->data.coords[i].y = (uint16_t)(((block[offset + 2] & 0x0F) << 8) | block[offset + 3]);
+    touch->data.points = pressed ? 1 : 0;
+    if (pressed) {
+        touch->data.coords[0].x = x;
+        touch->data.coords[0].y = y;
     }
     portEXIT_CRITICAL(&touch->data.lock);
 

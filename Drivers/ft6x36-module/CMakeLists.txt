@@ -7,5 +7,5 @@ file(GLOB_RECURSE SOURCE_FILES "source/*.c*")
 tactility_add_module(ft6x36-module
     SRCS ${SOURCE_FILES}
     INCLUDE_DIRS include/
-    REQUIRES TactilityKernel platform-esp32 esp_lcd_touch_ft6336u esp_lcd driver
+    REQUIRES TactilityKernel platform-esp32 esp_lcd_touch_ft6336u esp_lcd driver esp_timer
 )
