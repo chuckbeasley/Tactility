@@ -395,7 +395,7 @@ constexpr uint8_t TOUCH_POINT_RATE_STOCK = 0x0E;
 // 0x80 after a reset pulse, before anything writes it, would show what the part's own default actually
 // is, and if it is low then not writing 0x80 at all is a better fix than any value here.
 constexpr uint8_t TOUCH_THRESHOLD_BATTERY = 32;
-constexpr uint8_t TOUCH_POINT_RATE_BATTERY = 0x0A;
+constexpr uint8_t TOUCH_POINT_RATE_BATTERY = 0x0E;
 
 // The controller still answers I2C on battery, so it is not unpowered - but it stops sensing reliably.
 // Re-applying the configuration it had at boot is the one thing worth doing here, and it is idempotent.

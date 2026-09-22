@@ -268,15 +268,22 @@ static error_t start(Device* device) {
     // because the revert had nothing to undo them with. The component's own init writes 0x00, 0x80 and
     // 0x88 but never 0xA4, so the interrupt mode in particular was left at whatever it had been.
     //
-    // The values here are the ones measured on a freshly powered controller: 0x80 = 128 (threshold),
-    // 0x88 = 0x0E (14 Hz, the component's own value) and 0xA4 = 1 (trigger mode). Power mode (0xA5) is
-    // deliberately left alone: the controller manages that itself, and it was 0x01 (monitor) when idle
-    // on a fresh part, which is normal.
-    const uint8_t stock_threshold = 128;
+    // The values here are the ones measured on a freshly powered controller, except for the threshold.
+    // 0x88 = 0x0E (14 ms, the component's own value) and 0xA4 = 1 (trigger mode) are its defaults as
+    // observed; the threshold is deliberately NOT the 128 the stack would otherwise impose.
+    //
+    // 128 is what starves this panel on battery power: with it, 16 seconds of firm tapping produced
+    // zero detections on battery, while 48 produced seven and 32 more again with no phantom touches
+    // (all measured on the board). The vendor's own firmware explains why 128 is the odd value here:
+    // it never writes a single register to this controller - its driver only reads 0x02 and 0x03 - so
+    // the part runs at its power-on default threshold on that board, on USB and on battery alike, and
+    // its touch does not care which power source it is on (wrk/vendor_touch_vbus_report.md). Matching
+    // that behaviour is this: one threshold that suits the panel, applied the same way on both.
+    const uint8_t touch_threshold = 32;
     const uint8_t stock_point_rate = 0x0E;
     const uint8_t stock_interrupt_mode = 0x01;
     const esp_err_t threshold_result =
-        esp_lcd_panel_io_tx_param(internal->io_handle, 0x80, &stock_threshold, 1);
+        esp_lcd_panel_io_tx_param(internal->io_handle, 0x80, &touch_threshold, 1);
     const esp_err_t rate_result =
         esp_lcd_panel_io_tx_param(internal->io_handle, 0x88, &stock_point_rate, 1);
     const esp_err_t mode_result =
