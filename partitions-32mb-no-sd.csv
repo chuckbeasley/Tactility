@@ -4,4 +4,9 @@ nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 factory,  app,  factory, 0x10000,  4M,
 system,   data, fat,            ,  128k,
-data,     data, fat,            ,  28480k,
+# A panic is written here and decoded with `idf.py coredump-info`, which is the only way to diagnose a
+# crash nobody was watching. It costs 128 KB out of data below, and it matches what
+# partitions-16mb-no-sd.csv already does. NOTE: this table is shared with tulip-4r11, so its data
+# partition shrinks by the same 128 KB and its data image has to be reflashed to match.
+coredump, data, coredump,       ,  128k,
+data,     data, fat,            ,  28352k,

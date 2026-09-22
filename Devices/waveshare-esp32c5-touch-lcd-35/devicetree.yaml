@@ -1,7 +1,9 @@
 dependencies:
   - Platforms/platform-esp32
-  # The display is on the board's SPI2 bus and the panel is up (see the .dts and source/module.cpp).
+  # The display is on the board's SPI2 bus (see the .dts and source/module.cpp).
   - Drivers/st7796-module
   # The FT6336 touch controller is an FT6x36-family part at 0x38 on the board I2C bus.
   - Drivers/ft6x36-module
+  # The AXP2101 PMIC powers the panel and its backlight, and provides the backlight device itself.
+  - Drivers/axp2101-module
 dts: waveshare,esp32c5.dts

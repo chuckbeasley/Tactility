@@ -8,6 +8,8 @@
 #include <tactility/bindings/esp32_spi.h>
 #include <bindings/st7796.h>
 #include <bindings/ft6x36.h>
+#include <bindings/axp2101.h>
+#include <bindings/axp2101_backlight.h>
 
 /*
  * Waveshare ESP32-C5-Touch-LCD-3.5 (ESP32-C5-WROOM-1U, 32 MB flash, 8 MB PSRAM).
@@ -87,6 +89,50 @@
 		pin-scl = <&gpio0 26 GPIO_FLAG_NONE>;
 		clock-frequency = <100000>;
 
+		// The AXP2101 PMIC. Its rails are what the panel and its backlight sit on, and the vendor's
+		// own boot log gives the voltages it settles on: ALDO1/2/3 3300, ALDO4 1800, BLDO1 1500,
+		// BLDO2 2800, DLDO1/2 3300. Declaring them here rather than poking I2C registers by hand
+		// means the rails come up with the rest of the device tree, before anything that depends on
+		// them - and only the rails this board actually uses, rather than every rail the chip has.
+		pmic0 {
+			compatible = "x-powers,axp2101";
+			reg = <0x34>;
+
+			aldo1-millivolt = <3300>;
+			aldo1-enabled;
+			aldo2-millivolt = <3300>;
+			aldo2-enabled;
+			aldo3-millivolt = <3300>;
+			aldo3-enabled;
+			aldo4-millivolt = <1800>;
+			aldo4-enabled;
+			// BLDO1/BLDO2 are the AXP2101's backlight LDOs.
+			bldo1-millivolt = <1500>;
+			bldo1-enabled;
+			bldo2-millivolt = <2800>;
+			bldo2-enabled;
+			dldo1-millivolt = <3300>;
+			dldo1-enabled;
+			dldo2-millivolt = <3300>;
+			dldo2-enabled;
+
+			// The backlight is an AXP2101 LDO, not a GPIO and not a PWM.
+			//
+			// The vendor's code appears to say otherwise - it writes {5, duty} to the CH32V003
+			// expander at 0x24 and that is what the disassembly attributes the brightness control
+			// to. But on the board, writing that register to 0 does nothing at all: the write lands
+			// (read back verified), the panel stays exactly as bright, and the disassembly also
+			// shows that nothing ever puts pin 5 into PWM mode, so its PWM output is never selected.
+			// Meanwhile the vendor enables both BLDO bits first thing at boot, and BLDO is the
+			// chip's dedicated backlight regulator. So the LDO is the backlight, BLDO2 at 2800 mV is
+			// the vendor's own setting for it, and brightness is that rail's voltage.
+			backlight0 {
+				compatible = "axp2101-backlight";
+				ldo = <AXP2101_BLDO2>;
+				max-millivolt = <2800>;
+			};
+		};
+
 		// The FT6336 sits at 0x38 on this bus and its interrupt is on GPIO3; the vendor's panel
 		// config passes rst_gpio_num = -1, so there is no reset pin. Coordinates are the panel's
 		// native 320x480. If taps land mirrored or transposed relative to what is drawn, the
@@ -134,6 +180,7 @@
 			pin-dc = <&gpio0 5 GPIO_FLAG_NONE>;
 			// No pin-reset: reset_gpio_num is -1 in the vendor firmware and the driver's reset is
 			// the software SWRESET. The panel's real reset is the expander pulse above.
+			backlight = <&backlight0>;
 		};
 	};
 };
