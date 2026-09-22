@@ -9,3 +9,11 @@ properties:
     type: phandle
     required: true
     description: "I2S controller device that carries audio data"
+  no-mclk:
+    type: boolean
+    default: false
+    description: >
+      The codec has no MCLK routed to it and must derive its clock from BCLK instead. Defaults to
+      false, i.e. the codec is told to expect MCLK. Set this where the board does not wire MCLK: with
+      it unset on such a board the codec is configured for a clock that never arrives, and it accepts
+      every sample while producing silence.

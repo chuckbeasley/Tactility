@@ -49,7 +49,12 @@ error_t open(Device* device, const struct AudioCodecStreamConfig* config) {
         .channel = config->channels,
         .channel_mask = 0,
         .sample_rate = config->sample_rate,
-        .mclk_multiple = 0,
+        // 256, matching what the I2S side actually runs: the platform driver builds its clock from
+        // I2S_STD_CLK_DEFAULT_CONFIG, whose mclk_multiple is I2S_MCLK_MULTIPLE_256. The codec needs
+        // the same ratio to divide BCLK down correctly, and the vendor's own measured configuration
+        // for this codec is 16kHz/16-bit/mono at mclk_multiple 256. Left at 0, the codec's dividers
+        // are computed from a ratio that does not describe the bus it is listening to.
+        .mclk_multiple = 256,
     };
 
     if (data->is_open) {
@@ -296,7 +301,9 @@ error_t start_device(Device* device) {
         codec_config.pa_pin = -1;
         codec_config.pa_reverted = false;
         codec_config.master_mode = false;
-        codec_config.use_mclk = true;
+        // Board-configurable: with no MCLK routed to the codec it has to derive its clock from BCLK,
+        // and telling it to expect MCLK instead leaves it accepting samples while producing silence.
+        codec_config.use_mclk = !config->no_mclk;
         codec_config.digital_mic = false;
         codec_config.invert_mclk = false;
         codec_config.invert_sclk = false;

@@ -6,12 +6,14 @@
 #include <tactility/bindings/esp32_gpio.h>
 #include <tactility/bindings/esp32_i2c_master.h>
 #include <tactility/bindings/esp32_spi.h>
+#include <tactility/bindings/esp32_sdspi.h>
 #include <tactility/bindings/esp32_i2s.h>
 #include <bindings/st7796.h>
 #include <bindings/ft6x36.h>
 #include <bindings/axp2101.h>
 #include <bindings/axp2101_backlight.h>
 #include <bindings/es8311.h>
+#include <bindings/qmi8658.h>
 
 /*
  * Waveshare ESP32-C5-Touch-LCD-3.5 (ESP32-C5-WROOM-1U, 32 MB flash, 8 MB PSRAM).
@@ -182,6 +184,15 @@
 			raw-y-max = <476>;
 		};
 
+		// QMI8658 6-axis IMU at 0x6B (SA0 high) on the board bus. Presence was established by an I2C
+		// scan of 27/26, which answers at 0x18, 0x24, 0x34, 0x38, 0x51, 0x6B and 0x70; the driver
+		// additionally verifies WHO_AM_I = 0x05 before it will bind, so a bound imu0 is a chip that
+		// identified itself rather than an address that merely acknowledged.
+		imu0 {
+			compatible = "qst,qmi8658";
+			reg = <0x6B>;
+		};
+
 		// ES8311 audio codec: 7-bit address 0x18 on this bus, data on i2s0 above. No reset GPIO and no
 		// amplifier GPIO - the vendor's codec config passes pa_pin = -1, its "power up" is the
 		// software register write REG0D = 0xFA, and the amplifier is pin 5 of the CH32V003 expander,
@@ -190,13 +201,21 @@
 			compatible = "everest,es8311";
 			reg = <0x18>;
 			i2s = <&i2s0>;
+			// No MCLK is routed to this codec: the vendor's config passes mclk = -1 (I2S_GPIO_UNUSED)
+			// and configures the codec with use_mclk = false, deriving its clock from BCLK. Without
+			// this the codec is set up for a clock that never arrives, which is silent while still
+			// accepting every sample written to it.
+			no-mclk;
 		};
 	};
 
 	spi0 {
 		compatible = "espressif,esp32-spi";
 		host = <SPI2_HOST>;
-		cs-gpios = <&gpio0 8 GPIO_FLAG_NONE>;
+		// One entry per child, indexed by that child's reg: esp32_spi_get_cs_pin() looks the child's
+		// address up in this array, so the card's chip select is declared here rather than in its own
+		// node. [0] is the panel (GPIO8), [1] is the TF card (GPIO9).
+		cs-gpios = <&gpio0 8 GPIO_FLAG_NONE>, <&gpio0 9 GPIO_FLAG_NONE>;
 		pin-mosi = <&gpio0 7 GPIO_FLAG_NONE>;
 		pin-sclk = <&gpio0 6 GPIO_FLAG_NONE>;
 		pin-miso = <&gpio0 2 GPIO_FLAG_NONE>;
@@ -227,6 +246,22 @@
 			// No pin-reset: reset_gpio_num is -1 in the vendor firmware and the driver's reset is
 			// the software SWRESET. The panel's real reset is the expander pulse above.
 			backlight = <&backlight0>;
+		};
+
+		// The TF card, on the same SPI2 bus - the vendor firmware has exactly one SPI bus, so the
+		// card and the panel share these three pins by construction, and the card answers CMD0 with
+		// R1=0x01 at its own CS (GPIO9). No card-detect, write-protect or interrupt pin is wired,
+		// so the node declares none.
+		//
+		// 4MHz: the card mounts and its FAT volume lists at this rate, which is what is verified. The
+		// first mount attempt failed in a way that looked like a bus or clock problem - the card
+		// answered commands (R1=0x05, so powered and talking) but never left idle, at both 20MHz and
+		// 4MHz and identically with the panel disabled - and it was a badly seated card: reseating it
+		// mounted immediately. So 20MHz was never fairly tested and is left alone rather than guessed
+		// at; this is a shared bus, and a conservative clock costs little here.
+		sdcard@1 {
+			compatible = "espressif,esp32-sdspi";
+			frequency-khz = <4000>;
 		};
 	};
 };

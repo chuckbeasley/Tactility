@@ -8,4 +8,10 @@ dependencies:
   - Drivers/axp2101-module
   # The ES8311 audio codec, on i2s0 and the board I2C bus.
   - Drivers/es8311-module
+  # The stream layer apps and AudioService play through. Without it the codec binds and nothing can
+  # use it: no AUDIO_STREAM_TYPE device exists, so AudioService finds nothing to prime, open_output()
+  # is unreachable, and the ES8311 is an inert device. Every other board with audio lists this.
+  - Drivers/audio-stream-module
+  # The QMI8658 6-axis IMU at 0x6B on the board I2C bus.
+  - Drivers/qmi8658-module
 dts: waveshare,esp32c5.dts

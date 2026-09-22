@@ -25,6 +25,14 @@ struct Es8311Config {
     uint8_t address;
     /** I2S controller device that carries audio data */
     struct Device* i2s_device;
+    /**
+     * The codec has no MCLK routed to it and must derive its clock from BCLK instead.
+     *
+     * Field order here MUST match the property order in bindings/everest,es8311.yaml: the devicetree
+     * compiler emits positional (non-designated) initializers, so a mismatch shifts every value into
+     * the wrong field.
+     */
+    bool no_mclk;
 };
 
 #ifdef __cplusplus
