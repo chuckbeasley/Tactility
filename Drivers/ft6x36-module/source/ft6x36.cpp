@@ -29,6 +29,10 @@
 #define TAG "FT6x36"
 #define GET_CONFIG(device) (static_cast<const Ft6x36Config*>((device)->config))
 
+// Power-up settle before the controller is first addressed, for boards with no reset pin (see
+// pulse_reset). The vendor's own driver for this part waits the same 300 ms after its reset pulse.
+constexpr int POWER_UP_SETTLE_MS = 300;
+
 struct Ft6x36Internal {
     esp_lcd_panel_io_handle_t io_handle;
     esp_lcd_touch_handle_t touch_handle;
@@ -47,8 +51,16 @@ static inline gpio_num_t pin_or_nc(const struct GpioPinSpec& pin) {
 // See ili9341-module's pulse_reset() for the full rationale; same idea, same 10ms/10ms timing.
 // esp_lcd_touch's rst_gpio_num is always left at GPIO_NUM_NC (see start()), under which it just
 // skips its own reset step entirely.
+//
+// When there is no reset pin at all this still waits, because the wait is not only about the reset
+// pulse: it is also the controller's power-up time. On boards where the touch supply comes from a
+// power-management device declared just above it in the devicetree, this driver is started within
+// milliseconds of that rail coming up, and the FT6336 does not answer I2C until it has settled -
+// which shows up as "Read vendor ID error" and a touch panel that simply does not work. Where there
+// is a reset pin, the delay below already covers this.
 static error_t pulse_reset(GpioDescriptor* descriptor) {
     if (descriptor == nullptr) {
+        vTaskDelay(pdMS_TO_TICKS(POWER_UP_SETTLE_MS));
         return ERROR_NONE;
     }
     // Logical high (physical low, because of earlier GPIO_FLAG_ACTIVE_LOW)

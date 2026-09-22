@@ -6,12 +6,10 @@
 #include <tactility/bindings/esp32_gpio.h>
 #include <tactility/bindings/esp32_i2c_master.h>
 #include <tactility/bindings/esp32_spi.h>
-#include <tactility/bindings/esp32_i2s.h>
 #include <bindings/st7796.h>
 #include <bindings/ft6x36.h>
 #include <bindings/axp2101.h>
 #include <bindings/axp2101_backlight.h>
-#include <bindings/es8311.h>
 
 /*
  * Waveshare ESP32-C5-Touch-LCD-3.5 (ESP32-C5-WROOM-1U, 32 MB flash, 8 MB PSRAM).
@@ -90,17 +88,9 @@
 	 * routed to any pin, and the codec is configured with use_mclk = false, i.e. it derives its clock
 	 * from BCLK instead (REG01 = 0xBF, bit 7 set). Adding an MCLK pin here would be inventing one.
 	 *
-	 * Declared before i2c0 on purpose: the codec node below references it by phandle, and the
-	 * generator can only resolve a node that has already been emitted.
+	 * Declared before i2c0 on purpose: the codec node references it by phandle, and the generator can
+	 * only resolve a node that has already been emitted.
 	 */
-	i2s0 {
-		compatible = "espressif,esp32-i2s";
-		port = <I2S_NUM_0>;
-		pin-bclk = <&gpio0 23 GPIO_FLAG_NONE>;
-		pin-ws = <&gpio0 10 GPIO_FLAG_NONE>;
-		pin-data-out = <&gpio0 25 GPIO_FLAG_NONE>;
-		pin-data-in = <&gpio0 24 GPIO_FLAG_NONE>;
-	};
 
 	i2c0 {
 		// The modern controller, not the legacy "espressif,esp32-i2c": the latter installs the
@@ -168,16 +158,14 @@
 			pin-interrupt = <&gpio0 3 GPIO_FLAG_NONE>;
 		};
 
-		// ES8311 audio codec, recovered from the vendor image: 7-bit address 0x18, controlled over
-		// this same bus, with its data on i2s0. There is no reset GPIO - the vendor's codec config
-		// passes pa_pin = -1 and no reset field, and the "power up" is a software register write.
-		// The amplifier is not a GPIO either: it is pin 5 of the CH32V003 expander, which the board
-		// bring-up in source/module.cpp already drives high.
-		codec0 {
-			compatible = "everest,es8311";
-			reg = <0x18>;
-			i2s = <&i2s0>;
-		};
+		// ES8311 audio codec: recovered as 7-bit address 0x18 on this bus with its data on an i2s0
+		// controller, but NOT declared here yet. Declaring it broke touch: the codec address is
+		// flagged as undetermined in the recovery (0x18 vs 0x19 depends on CE strapping the image
+		// cannot show), and a codec whose init fails can hold the I2C bus, which leaves the touch
+		// device started but permanently unable to read. It goes back in once a boot log shows what
+		// the codec actually does here. The recovered configuration, for that work:
+		//   i2s: I2S_NUM_0 master, BCLK=23, WS=10, DOUT=25, DIN=24, MCLK unused (use_mclk=false)
+		//   codec: ES8311 7-bit 0x18, no reset GPIO, no PA GPIO (amplifier is expander pin 5)
 	};
 
 	spi0 {

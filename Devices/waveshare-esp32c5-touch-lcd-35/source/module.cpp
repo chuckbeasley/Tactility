@@ -59,6 +59,20 @@ constexpr uint8_t EXPANDER_PINS_0_1 = 0x03;
 
 constexpr int I2C_TIMEOUT_MS = 100;
 
+// The AXP2101 register the devicetree PMIC binding cannot express.
+//
+// The rails this board uses are declared in the devicetree, and pmic0 brings them up before the
+// touch controller and the panel. But the vendor's own PMIC init also sets bit 0 of register 0x91,
+// and that bit is not one of the rails the binding models. It matters on a power cycle and nowhere
+// else, which is exactly why it took a while to find: with the PMIC still holding state from a
+// previous boot, everything works, so the board looks fine until it is unplugged. From a cold start
+// the touch controller does not answer I2C at all ("Read vendor ID error") and there is no touch.
+//
+// Written here rather than left out, because the alternative is a board that only works until the
+// first power cycle. See the .dts for the rail declarations themselves.
+constexpr uint8_t AXP2101_ADDRESS = 0x34;
+constexpr uint8_t AXP2101_REG_LDO_ENABLE_1 = 0x91;
+
 // Settling time between the expander pulse and the device starts that follow.
 //
 // Not cosmetic: on a cold boot the FT6336 failed to initialise ("Read vendor ID error") because it was
@@ -92,6 +106,24 @@ error_t board_bring_up() {
     device_config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
     device_config.device_address = EXPANDER_ADDRESS;
     device_config.scl_speed_hz = 100000;
+
+    // The PMIC rail bit the devicetree cannot express (see above). Done first, so the rail is up
+    // before anything downstream of it is addressed.
+    device_config.device_address = AXP2101_ADDRESS;
+    i2c_master_dev_handle_t pmic = nullptr;
+    if (i2c_master_bus_add_device(bus, &device_config, &pmic) == ESP_OK) {
+        uint8_t enable_1 = 0;
+        if (i2c_master_transmit_receive(pmic, (const uint8_t[]){ AXP2101_REG_LDO_ENABLE_1 }, 1,
+                                        &enable_1, 1, I2C_TIMEOUT_MS) == ESP_OK) {
+            write_register(pmic, AXP2101_REG_LDO_ENABLE_1, (uint8_t)(enable_1 | 0x01));
+            LOG_I(TAG, "AXP2101 reg 0x91 |= 0x01 (rail the devicetree binding does not model)");
+        }
+        i2c_master_bus_rm_device(pmic);
+    } else {
+        LOG_W(TAG, "no AXP2101 at 0x%02x; a cold boot may leave the touch dead", AXP2101_ADDRESS);
+    }
+
+    device_config.device_address = EXPANDER_ADDRESS;
 
     i2c_master_dev_handle_t expander = nullptr;
     if (i2c_master_bus_add_device(bus, &device_config, &expander) == ESP_OK) {
