@@ -198,6 +198,12 @@ static error_t start(Device* device) {
         return ERROR_RESOURCE;
     }
 
+    // Deliberately NOT switching the interrupt-mode register (0xA4) to "polling" mode. The reasoning
+    // looked sound - the part ships in trigger mode (0xA4 = 1), where the interrupt is a pulse and the
+    // point count is only meaningful for an instant, while this driver polls on a timer - but on the
+    // board it made touch worse on USB as well as on battery, so the register does not mean what the
+    // reasoning assumed. Reverted, and recorded here so it is not tried again by the next reader.
+
     device_set_driver_data(device, internal);
     return ERROR_NONE;
 }
