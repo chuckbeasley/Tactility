@@ -32,6 +32,16 @@ namespace tt::service::wifi {
 constexpr auto* TAG = "WifiService";
 constexpr auto AUTO_SCAN_INTERVAL = 10000; // ms
 
+// Consecutive failed association attempts after which auto-connect stops on its own. Measured on this
+// board against cb2enterprises5G: every attempt reaches "wifi:state: assoc -> run (0x10)" and is torn
+// down again with "run -> init (0xf00)" about three seconds later, IP_EVENT_STA_GOT_IP never arrives,
+// and the service used to scan and re-associate every 15 seconds for as long as the board was on.
+// Each attempt is a transmit burst that pulls the battery supply down far enough to stop the touch
+// panel's capacitive sensing (measured: on battery, touch works with the radio off and fails with it
+// on; on USB both work because the supply is ample). Three attempts ride out a genuine AP restart
+// without leaving the radio retrying forever.
+constexpr uint8_t AUTO_CONNECT_MAX_FAILURES = 3;
+
 const char* radioStateToString(RadioState state) {
     switch (state) {
         using enum RadioState;
@@ -79,6 +89,11 @@ struct WifiServiceState {
     std::atomic<bool> externalScanPause{false};
     bool connectionTargetRemember = false;
     settings::WifiApSettings connectionTarget;
+    // Connection attempts that ended without an IP, counted consecutively. Auto-connect stops at
+    // AUTO_CONNECT_MAX_FAILURES and only a manual connect() clears the count. Atomic because the
+    // failures are recorded on the wifi-events thread (connection results) and read on the main task
+    // (dispatchAutoConnect()/shouldScanForAutoConnect()) as well as by whichever task calls connect().
+    std::atomic<uint8_t> autoConnectFailures{0};
     uint16_t scanRecordLimit = TT_WIFI_SCAN_RECORD_LIMIT;
     TickType_t lastScanTime = MAX_TICKS;
     std::unique_ptr<Timer> autoConnectTimer;
@@ -227,6 +242,25 @@ void dispatchScan() {
     }
 }
 
+// ---- Auto-connect retry budget ----
+
+// Records one connection attempt that ended without an IP. At AUTO_CONNECT_MAX_FAILURES in a row,
+// auto-connect stops: the failure has repeated identically every time, and each retry costs a scan
+// plus an association burst on the supply that the touch panel shares (see the constant's comment).
+// Both manual and automatic attempts are counted - connect() clears the count before a manual one, so
+// a manual attempt that fails costs one of the budget rather than being exempt from it.
+void recordConnectionFailure(const char* ssid) {
+    const auto failures = state.autoConnectFailures.fetch_add(1) + 1;
+    if (failures != AUTO_CONNECT_MAX_FAILURES) {
+        return;
+    }
+    LOG_W(TAG,
+        "Auto-connect stopped after %u consecutive attempts to %s failed: the station reaches run and is "
+        "torn down again within seconds, without ever getting an IP, so retrying only repeats the "
+        "scan-and-associate burst every 15s that drops touch sensing on battery. Connect manually to try again.",
+        (unsigned)failures, ssid);
+}
+
 void dispatchConnect() {
     LOG_I(TAG, "dispatchConnect()");
     if (!started || state.device == nullptr) return;
@@ -243,7 +277,42 @@ void dispatchConnect() {
 
     LOG_I(TAG, "Connecting to %s", target.ssid.c_str());
 
-    wifi_station_connect(state.device, target.ssid.c_str(), target.password.c_str(), target.channel);
+    error_t result = wifi_station_connect(state.device, target.ssid.c_str(), target.password.c_str(), target.channel);
+    if (result != ERROR_NONE) {
+        // The driver refused the attempt outright, so no connection result event follows and this
+        // failure would otherwise never reach the retry budget.
+        LOG_E(TAG, "Failed to connect to %s (%s)", target.ssid.c_str(), error_to_string(result));
+        recordConnectionFailure(target.ssid.c_str());
+    }
+}
+
+// The shared body of connect(). The public entry point clears the failure count first; the automatic
+// path in dispatchAutoConnect() deliberately does not, because an automatic attempt that reset the
+// count would make AUTO_CONNECT_MAX_FAILURES unreachable.
+void startConnection(const settings::WifiApSettings& ap, bool remember) {
+    LOG_I(TAG, "connect(%s, %d)", ap.ssid.c_str(), (int)remember);
+    if (!started || state.device == nullptr) return;
+
+    bool radio_off;
+    {
+        auto lock = state.mutex.asScopedLock();
+        if (!lock.lock(10 / portTICK_PERIOD_MS)) {
+            LOG_E(TAG, LOG_MESSAGE_MUTEX_LOCK_FAILED);
+            return;
+        }
+        // Stop auto-connecting until the connection is established.
+        state.pauseAutoConnect = true;
+        state.connectionTarget = ap;
+        state.connectionTargetRemember = remember;
+        radio_off = !isRadioOn();
+    }
+
+    getMainDispatcher().dispatch([radio_off] {
+        if (radio_off) {
+            dispatchSetEnabled(true);
+        }
+        dispatchConnect();
+    });
 }
 
 void dispatchDisconnect() {
@@ -276,6 +345,11 @@ bool findAutoConnectAp(settings::WifiApSettings& out) {
 
 void dispatchAutoConnect() {
     LOG_I(TAG, "dispatchAutoConnect()");
+    if (state.autoConnectFailures >= AUTO_CONNECT_MAX_FAILURES) {
+        // Gave up on the saved AP after AUTO_CONNECT_MAX_FAILURES attempts in a row; the last failure
+        // already logged why. Nothing automatic clears this - only a manual connect() does.
+        return;
+    }
     if (state.pauseAutoConnect || state.externalScanPause.load() || !isRadioOn()) {
         // A manual disconnect() or an in-progress manual connect() has paused
         // auto-connect, or a caller (e.g. AutoScanPauseGuard) has externally paused it.
@@ -296,14 +370,19 @@ void dispatchAutoConnect() {
     settings::WifiApSettings target;
     if (findAutoConnectAp(target)) {
         LOG_I(TAG, "Auto-connecting to %s", target.ssid.c_str());
-        connect(target, false);
-        // connect() pauses auto-connect (it assumes a manual/user call); undo that
+        startConnection(target, false);
+        // startConnection() pauses auto-connect (it assumes a manual/user call); undo that
         // since this call was automatic.
         state.pauseAutoConnect = false;
     }
 }
 
 bool shouldScanForAutoConnect() {
+    // The periodic scan exists only to find an auto-connect AP, so once auto-connect has given up it
+    // would just keep putting transmit bursts on the supply that stopping the retries removed. Scans
+    // requested by apps (e.g. WifiManage on show) go through scan() and are unaffected.
+    if (state.autoConnectFailures >= AUTO_CONNECT_MAX_FAILURES) return false;
+
     bool radio_scannable = getRadioState() == RadioState::On && !isScanning() &&
         !state.pauseAutoConnect && !state.externalScanPause.load();
     if (!radio_scannable) return false;
@@ -361,6 +440,8 @@ void onWifiDeviceEvent(Device* device, ::WifiEvent event) {
                         state.pauseAutoConnect = false;
                     }
                 }
+                // A connection that got an IP clears the retry budget: whatever was wrong is gone.
+                state.autoConnectFailures = 0;
                 LOG_I(TAG, "Connected to %s", target.ssid.c_str());
                 if (remember && !settings::save(target)) {
                     LOG_E(TAG, "Failed to store credentials");
@@ -368,10 +449,14 @@ void onWifiDeviceEvent(Device* device, ::WifiEvent event) {
             } else {
                 // The pending connection attempt (which paused auto-connect via connect())
                 // failed; unpause so auto-connect can try other saved APs.
+                std::string failed_ssid;
                 auto lock = state.mutex.asScopedLock();
                 if (lock.lock(50 / portTICK_PERIOD_MS)) {
                     state.pauseAutoConnect = false;
+                    failed_ssid = state.connectionTarget.ssid;
                 }
+                // Counted outside the lock: recordConnectionFailure() logs when it gives up.
+                recordConnectionFailure(failed_ssid.c_str());
             }
             break;
 
@@ -426,29 +511,11 @@ bool isScanning() {
 }
 
 void connect(const settings::WifiApSettings& ap, bool remember) {
-    LOG_I(TAG, "connect(%s, %d)", ap.ssid.c_str(), (int)remember);
-    if (!started || state.device == nullptr) return;
-
-    bool radio_off;
-    {
-        auto lock = state.mutex.asScopedLock();
-        if (!lock.lock(10 / portTICK_PERIOD_MS)) {
-            LOG_E(TAG, LOG_MESSAGE_MUTEX_LOCK_FAILED);
-            return;
-        }
-        // Stop auto-connecting until the connection is established.
-        state.pauseAutoConnect = true;
-        state.connectionTarget = ap;
-        state.connectionTargetRemember = remember;
-        radio_off = !isRadioOn();
-    }
-
-    getMainDispatcher().dispatch([radio_off] {
-        if (radio_off) {
-            dispatchSetEnabled(true);
-        }
-        dispatchConnect();
-    });
+    // A manual request always goes through, and re-arms auto-connect: the user asking for this AP
+    // (possibly after correcting its password) is new information, so it gets a fresh budget of
+    // attempts even after the automatic ones in AUTO_CONNECT_MAX_FAILURES are used up.
+    state.autoConnectFailures = 0;
+    startConnection(ap, remember);
 }
 
 void disconnect() {
