@@ -6,6 +6,6 @@ dependencies:
   - Drivers/ft6x36-module
   # The AXP2101 PMIC powers the panel and its backlight, and provides the backlight device itself.
   - Drivers/axp2101-module
-  # Audio (ES8311 on i2s0) is recovered but deliberately not declared yet - see the .dts. Its codec
-  # node appears to be what broke touch, and it goes back in once a boot log shows what it does here.
+  # The ES8311 audio codec, on i2s0 and the board I2C bus.
+  - Drivers/es8311-module
 dts: waveshare,esp32c5.dts
