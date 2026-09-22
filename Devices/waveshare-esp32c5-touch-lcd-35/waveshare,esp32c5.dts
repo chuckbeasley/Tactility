@@ -167,19 +167,19 @@
 			y-max = <480>;
 			pin-interrupt = <&gpio0 3 GPIO_FLAG_NONE>;
 
-			// The panel's reachable rectangle, measured on this board: x never goes below ~14 or above
-			// ~306, and y never below ~44 or above ~390 - the touch panel's active area is smaller than
-			// the LCD and its bottom strip cannot be pressed at all. The four properties below rescale
-			// that rectangle onto the full display, and they are set to 0 (no rescaling) on purpose
-			// right now: pressing the centre reports raw (167,254) for a display centre of (160,240),
-			// which says raw coordinates are already close to display space, so stretching the range
-			// onto the display pushes presses away from where they land instead of towards it. Set them
-			// from a completed calibration's raw values - not from where a press is aimed - and the
-			// driver will apply the correction; the mapping in force is printed in the boot log.
+			// The panel's raw rectangle, from the calibration completed on this board (read back from
+			// its saved settings: x -9..320, y 9..476, clamped here to what the properties' unsigned
+			// type can hold - the negative ends are the fit's extrapolation beyond the glass and are
+			// worth a few pixels at the very edge). Raw coordinates are display coordinates on this
+			// panel, so this is close to identity and only takes the ~9px vertical offset out; it
+			// exists so the mapping belongs to the device profile instead of to one board's NVS, and
+			// the driver prints it at every boot. Do not stretch the reachable rectangle onto the
+			// display here: raw y stops around 390 because the panel's bottom strip cannot be pressed,
+			// and stretching was measured to move presses away from the finger rather than towards it.
 			raw-x-min = <0>;
-			raw-x-max = <0>;
-			raw-y-min = <0>;
-			raw-y-max = <0>;
+			raw-x-max = <320>;
+			raw-y-min = <9>;
+			raw-y-max = <476>;
 		};
 
 		// ES8311 audio codec: 7-bit address 0x18 on this bus, data on i2s0 above. No reset GPIO and no
