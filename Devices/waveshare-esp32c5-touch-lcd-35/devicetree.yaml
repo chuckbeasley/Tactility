@@ -6,4 +6,6 @@ dependencies:
   - Drivers/ft6x36-module
   # The AXP2101 PMIC powers the panel and its backlight, and provides the backlight device itself.
   - Drivers/axp2101-module
+  # The ES8311 audio codec on i2s0.
+  - Drivers/es8311-module
 dts: waveshare,esp32c5.dts

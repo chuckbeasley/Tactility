@@ -6,10 +6,12 @@
 #include <tactility/bindings/esp32_gpio.h>
 #include <tactility/bindings/esp32_i2c_master.h>
 #include <tactility/bindings/esp32_spi.h>
+#include <tactility/bindings/esp32_i2s.h>
 #include <bindings/st7796.h>
 #include <bindings/ft6x36.h>
 #include <bindings/axp2101.h>
 #include <bindings/axp2101_backlight.h>
+#include <bindings/es8311.h>
 
 /*
  * Waveshare ESP32-C5-Touch-LCD-3.5 (ESP32-C5-WROOM-1U, 32 MB flash, 8 MB PSRAM).
@@ -80,6 +82,26 @@
 	 * 26, 27 (I2C), 3 (touch interrupt), 9 (SD chip select), 13/14 (USB console).
 	 */
 
+	/*
+	 * I2S for the ES8311, from the 72-byte i2s_std_config_t template in the vendor image. The codec
+	 * runs as an I2S slave, so the ESP32 is the master and drives these.
+	 *
+	 * MCLK is deliberately absent: the vendor's config has mclk = -1 (I2S_GPIO_UNUSED), so it is not
+	 * routed to any pin, and the codec is configured with use_mclk = false, i.e. it derives its clock
+	 * from BCLK instead (REG01 = 0xBF, bit 7 set). Adding an MCLK pin here would be inventing one.
+	 *
+	 * Declared before i2c0 on purpose: the codec node below references it by phandle, and the
+	 * generator can only resolve a node that has already been emitted.
+	 */
+	i2s0 {
+		compatible = "espressif,esp32-i2s";
+		port = <I2S_NUM_0>;
+		pin-bclk = <&gpio0 23 GPIO_FLAG_NONE>;
+		pin-ws = <&gpio0 10 GPIO_FLAG_NONE>;
+		pin-data-out = <&gpio0 25 GPIO_FLAG_NONE>;
+		pin-data-in = <&gpio0 24 GPIO_FLAG_NONE>;
+	};
+
 	i2c0 {
 		// The modern controller, not the legacy "espressif,esp32-i2c": the latter installs the
 		// deprecated I2C driver, which exposes no bus handle for IDF 6.1's panel-IO API to bind to.
@@ -144,6 +166,17 @@
 			x-max = <320>;
 			y-max = <480>;
 			pin-interrupt = <&gpio0 3 GPIO_FLAG_NONE>;
+		};
+
+		// ES8311 audio codec, recovered from the vendor image: 7-bit address 0x18, controlled over
+		// this same bus, with its data on i2s0. There is no reset GPIO - the vendor's codec config
+		// passes pa_pin = -1 and no reset field, and the "power up" is a software register write.
+		// The amplifier is not a GPIO either: it is pin 5 of the CH32V003 expander, which the board
+		// bring-up in source/module.cpp already drives high.
+		codec0 {
+			compatible = "everest,es8311";
+			reg = <0x18>;
+			i2s = <&i2s0>;
 		};
 	};
 
