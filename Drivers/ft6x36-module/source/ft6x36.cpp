@@ -295,6 +295,12 @@ static error_t start(Device* device) {
         LOG_I(TAG, "registers: threshold=%u rate=%u interrupt_mode=%u", check_threshold, check_rate, check_mode);
     }
 
+    // Print the panel geometry in force, so the boot log states the mapping rather than leaving it to be
+    // inferred from where taps land. Zero ranges mean no rescaling (see the binding).
+    LOG_I(TAG, "panel mapping: raw x %u..%u -> 0..%u, raw y %u..%u -> 0..%u", (unsigned)config->raw_x_min,
+          (unsigned)config->raw_x_max, (unsigned)config->x_max, (unsigned)config->raw_y_min,
+          (unsigned)config->raw_y_max, (unsigned)config->y_max);
+
     internal->poll_task = nullptr;
     internal->poll_task_stop = false;
     internal->finger_down = false;
@@ -367,6 +373,22 @@ static error_t ft6x36_exit_sleep(Device* device) {
     return esp_lcd_touch_exit_sleep(internal->touch_handle) == ESP_OK ? ERROR_NONE : ERROR_RESOURCE;
 }
 
+// Rescales one raw axis onto the display, using the reachable rectangle the board declares. A pair with
+// raw_max <= raw_min means the board did not declare one, and the raw value is passed through.
+static uint16_t ft6x36_scale_axis(uint16_t value, uint16_t raw_min, uint16_t raw_max, uint16_t display_max) {
+    if (raw_max <= raw_min || display_max == 0) {
+        return value;
+    }
+    const int32_t span = (int32_t)raw_max - (int32_t)raw_min;
+    int32_t mapped = ((int32_t)value - (int32_t)raw_min) * (int32_t)display_max / span;
+    if (mapped < 0) {
+        mapped = 0;
+    } else if (mapped > (int32_t)display_max) {
+        mapped = (int32_t)display_max;
+    }
+    return (uint16_t)mapped;
+}
+
 static error_t ft6x36_read_data(Device* device, TickType_t timeout) {
     (void)timeout; // esp_lcd_touch_read_data() has no timeout parameter
     auto* internal = static_cast<Ft6x36Internal*>(device_get_driver_data(device));
@@ -400,8 +422,9 @@ static error_t ft6x36_read_data(Device* device, TickType_t timeout) {
     portENTER_CRITICAL(&touch->data.lock);
     touch->data.points = pressed ? 1 : 0;
     if (pressed) {
-        touch->data.coords[0].x = x;
-        touch->data.coords[0].y = y;
+        const auto* config = GET_CONFIG(device);
+        touch->data.coords[0].x = ft6x36_scale_axis(x, config->raw_x_min, config->raw_x_max, config->x_max);
+        touch->data.coords[0].y = ft6x36_scale_axis(y, config->raw_y_min, config->raw_y_max, config->y_max);
     }
     portEXIT_CRITICAL(&touch->data.lock);
 

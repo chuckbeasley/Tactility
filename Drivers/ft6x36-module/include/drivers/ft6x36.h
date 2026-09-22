@@ -21,6 +21,14 @@ struct Ft6x36Config {
     bool mirror_y;
     struct GpioPinSpec pin_reset;
     struct GpioPinSpec pin_interrupt;
+    // Panel geometry correction from the devicetree (see the binding): the raw coordinates that sit at
+    // the display's edges. A pair with max <= min is ignored, so the default (all zero) leaves raw
+    // coordinates untouched. Field order must match the binding's property order - the devicetree
+    // compiler emits positional initializers.
+    uint16_t raw_x_min;
+    uint16_t raw_x_max;
+    uint16_t raw_y_min;
+    uint16_t raw_y_max;
 };
 
 #ifdef __cplusplus

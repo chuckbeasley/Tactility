@@ -35,3 +35,26 @@ properties:
     type: phandles
     default: GPIO_PIN_SPEC_NONE
     description: Interrupt GPIO pin
+  # Panel geometry correction. A touch panel's raw coordinate space is not always the display's: on
+  # boards where the panel's active area is smaller than, or offset from, the LCD, the reachable
+  # rectangle reported in raw coordinates is narrower and shifted relative to x-max/y-max. Setting
+  # these four to the raw coordinates that lie at the display's edges makes the driver rescale
+  # [raw-*-min, raw-*-max] onto [0, x-max]/[0, y-max] and clamp, so the whole display is reachable from
+  # the glass that actually senses. Zero means "raw is already display space" and no rescaling happens,
+  # which is the right default: these are measured per board, and the calibration app refines them.
+  raw-x-min:
+    type: int
+    default: 0
+    description: Raw X at the display's left edge (0 disables X rescaling)
+  raw-x-max:
+    type: int
+    default: 0
+    description: Raw X at the display's right edge (0 disables X rescaling)
+  raw-y-min:
+    type: int
+    default: 0
+    description: Raw Y at the display's top edge (0 disables Y rescaling)
+  raw-y-max:
+    type: int
+    default: 0
+    description: Raw Y at the display's bottom edge (0 disables Y rescaling)

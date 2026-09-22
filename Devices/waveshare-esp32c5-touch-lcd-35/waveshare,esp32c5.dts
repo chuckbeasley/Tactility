@@ -166,6 +166,17 @@
 			x-max = <320>;
 			y-max = <480>;
 			pin-interrupt = <&gpio0 3 GPIO_FLAG_NONE>;
+
+			// The panel's raw coordinate space, measured on this board by pressing its edges and
+			// reading what the controller reported: x never goes below ~14 or above ~306, and y never
+			// below ~44 or above ~390, because the touch panel's active area is smaller than the LCD
+			// and offset from it. Without this the middle of the screen lands correctly but the error
+			// grows towards the edges (nothing above y=390 - the bottom strip - is reachable at all).
+			// These four stretch the reachable rectangle onto the full display.
+			raw-x-min = <14>;
+			raw-x-max = <306>;
+			raw-y-min = <44>;
+			raw-y-max = <390>;
 		};
 
 		// ES8311 audio codec: 7-bit address 0x18 on this bus, data on i2s0 above. No reset GPIO and no
