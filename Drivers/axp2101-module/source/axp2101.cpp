@@ -392,8 +392,26 @@ error_t axp2101_power_off(Device* device) {
 
 // region Power supply child device
 
+// Rough LiPo discharge curve, used to estimate a charge percentage from the measured battery voltage.
+// This mirrors TactilityKernel's battery_sense driver, which is in the same position.
+//
+// The AXP2101's own fuel gauge is not an alternative: it ships disabled (measured 0x18 = 0x0a, bit2
+// clear, on this board both on USB and on battery) and the SOC register it would feed then reads a
+// static 0x64 = 100 regardless of the pack, so there is no usable reading to prefer over the
+// voltage. Unlike a coulomb counter this ignores load and charge state, which is why it is an
+// estimate and not a measurement.
+#define BATTERY_MIN_MV 3200
+#define BATTERY_MAX_MV 4200
+
+static int estimate_capacity_from_mv(int battery_mv) {
+    if (battery_mv <= BATTERY_MIN_MV) return 0;
+    if (battery_mv >= BATTERY_MAX_MV) return 100;
+    return (battery_mv - BATTERY_MIN_MV) * 100 / (BATTERY_MAX_MV - BATTERY_MIN_MV);
+}
+
 static bool ps_supports_property(Device*, PowerSupplyProperty property) {
-    return property == POWER_SUPPLY_PROP_IS_CHARGING || property == POWER_SUPPLY_PROP_VOLTAGE;
+    return property == POWER_SUPPLY_PROP_IS_CHARGING || property == POWER_SUPPLY_PROP_VOLTAGE ||
+           property == POWER_SUPPLY_PROP_CAPACITY;
 }
 
 static error_t ps_get_property(Device* device, PowerSupplyProperty property, PowerSupplyPropertyValue* out_value) {
@@ -417,6 +435,31 @@ static error_t ps_get_property(Device* device, PowerSupplyProperty property, Pow
                 return err;
             }
             out_value->int_value = millivolts;
+            return ERROR_NONE;
+        }
+        case POWER_SUPPLY_PROP_CAPACITY: {
+            bool connected;
+            error_t err = axp2101_is_battery_connected(axp2101_device, &connected);
+            if (err != ERROR_NONE) {
+                return err;
+            }
+            // A board without a pack must not report 0%: consumers draw that as a flat battery
+            // rather than as no battery at all. ERROR_NOT_FOUND means "(temporarily) not
+            // available", which is what the status bar treats as "hide the icon".
+            if (!connected) {
+                return ERROR_NOT_FOUND;
+            }
+            uint16_t millivolts;
+            err = axp2101_get_battery_voltage(axp2101_device, &millivolts);
+            if (err != ERROR_NONE) {
+                return err;
+            }
+            // axp2101_get_battery_voltage() also answers 0 when it has no reading, and 0 mV is not
+            // an empty battery - it is no measurement.
+            if (millivolts == 0) {
+                return ERROR_NOT_FOUND;
+            }
+            out_value->int_value = estimate_capacity_from_mv(millivolts);
             return ERROR_NONE;
         }
         default:
