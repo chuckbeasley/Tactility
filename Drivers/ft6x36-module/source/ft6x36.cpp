@@ -198,11 +198,31 @@ static error_t start(Device* device) {
         return ERROR_RESOURCE;
     }
 
-    // Deliberately NOT switching the interrupt-mode register (0xA4) to "polling" mode. The reasoning
-    // looked sound - the part ships in trigger mode (0xA4 = 1), where the interrupt is a pulse and the
-    // point count is only meaningful for an instant, while this driver polls on a timer - but on the
-    // board it made touch worse on USB as well as on battery, so the register does not mean what the
-    // reasoning assumed. Reverted, and recorded here so it is not tried again by the next reader.
+    // Put the controller's configuration registers back to their stock values explicitly.
+    //
+    // This part has no reset pin on this board (see pulse_reset), so nothing hardware-resets it between
+    // boots: it keeps whatever registers it was last given, across a reflash, a reboot and even a
+    // firmware change. Two experiments on this board wrote non-stock values into it (interrupt mode
+    // 0xA4 = 0 and scan rate 0x88 = 60) and the misses they caused survived the reverting commit,
+    // because the revert had nothing to undo them with. The component's own init writes 0x00, 0x80 and
+    // 0x88 but never 0xA4, so the interrupt mode in particular was left at whatever it had been.
+    //
+    // The values here are the ones measured on a freshly powered controller: 0x80 = 128 (threshold),
+    // 0x88 = 0x0E (14 Hz, the component's own value) and 0xA4 = 1 (trigger mode). Power mode (0xA5) is
+    // deliberately left alone: the controller manages that itself, and it was 0x01 (monitor) when idle
+    // on a fresh part, which is normal.
+    const uint8_t stock_threshold = 128;
+    const uint8_t stock_point_rate = 0x0E;
+    const uint8_t stock_interrupt_mode = 0x01;
+    const esp_err_t threshold_result =
+        esp_lcd_panel_io_tx_param(internal->io_handle, 0x80, &stock_threshold, 1);
+    const esp_err_t rate_result =
+        esp_lcd_panel_io_tx_param(internal->io_handle, 0x88, &stock_point_rate, 1);
+    const esp_err_t mode_result =
+        esp_lcd_panel_io_tx_param(internal->io_handle, 0xA4, &stock_interrupt_mode, 1);
+    if (threshold_result != ESP_OK || rate_result != ESP_OK || mode_result != ESP_OK) {
+        LOG_W(TAG, "could not restore the controller's stock registers; leaving it as it is");
+    }
 
     device_set_driver_data(device, internal);
     return ERROR_NONE;
@@ -257,42 +277,31 @@ static error_t ft6x36_read_data(Device* device, TickType_t timeout) {
     (void)timeout; // esp_lcd_touch_read_data() has no timeout parameter
     auto* internal = static_cast<Ft6x36Internal*>(device_get_driver_data(device));
 
-    const esp_err_t result = esp_lcd_touch_read_data(internal->touch_handle);
-    if (result != ESP_OK) {
+    // One transaction, one coherent snapshot: the count byte and the coordinates come out of the same
+    // block read, so they cannot disagree with each other, and no other reader has to touch the
+    // controller first.
+    //
+    // The stock component reads the other way round - the count register first, returning immediately
+    // if it reads zero, and only then the block - which on battery power disagreed with itself in 14 of
+    // 98 samples (never once on USB, in 63) and silently threw the touch away every time it did. The
+    // next attempt let the component read first and fetched the block only when it reported nothing:
+    // that fixed battery but cost missed taps on USB, because on this part a read consumes the
+    // detection it just reported, so a second reader steals the first one's touch. A single read by a
+    // single reader has neither problem.
+    uint8_t block[TOUCH_BLOCK_SIZE] = {};
+    if (esp_lcd_panel_io_rx_param(internal->io_handle, TOUCH_BLOCK_REGISTER, block, sizeof(block)) != ESP_OK) {
+        // A failed read must not leave the previous touch standing as if it were current.
+        auto* failed = internal->touch_handle;
+        portENTER_CRITICAL(&failed->data.lock);
+        failed->data.points = 0;
+        portEXIT_CRITICAL(&failed->data.lock);
         return ERROR_RESOURCE;
     }
 
-    // The component's read trusts register 0x02 and gives up when it reads 0, without ever fetching
-    // the data block:
-    //   esp_lcd_touch_ft6x36.c: if (points > 2 || points == 0) { return ESP_OK; }
-    // On this board that gate is not reliable. Measured on battery power (and never once on USB, in
-    // 63 compared samples): 14 of 98 samples had 0x02 reading 0 while the block's own count byte read
-    // 1 with valid coordinates - every one of those touches was silently discarded, which is exactly
-    // the "touch does not work on battery" this board has shown from the start. The block is the same
-    // data the component would have used; fetch it here and publish what it missed.
-    //
-    // Gated on the interrupt line being asserted, so this cannot invent a touch out of bus noise: the
-    // controller asserts INT for its own detections, and a published touch only becomes a click if
-    // LVGL sees it pressed and then released.
-    if (internal->touch_handle->data.points != 0) {
-        return ERROR_NONE; // the component's own read already has this one
-    }
-
-    const auto* config = GET_CONFIG(device);
-    const gpio_num_t interrupt_pin = pin_or_nc(config->pin_interrupt);
-    if (interrupt_pin == GPIO_NUM_NC || gpio_get_level(interrupt_pin) != 0) {
-        return ERROR_NONE;
-    }
-
-    uint8_t block[TOUCH_BLOCK_SIZE] = {};
-    if (esp_lcd_panel_io_rx_param(internal->io_handle, TOUCH_BLOCK_REGISTER, block, sizeof(block)) != ESP_OK) {
-        return ERROR_NONE;
-    }
-
-    const uint8_t point_count = block[TOUCH_BLOCK_COUNT_OFFSET] & 0x0F;
-    if (point_count == 0 || point_count > CONFIG_ESP_LCD_TOUCH_MAX_POINTS) {
-        return ERROR_NONE;
-    }
+    // 0x0F is not a count this controller can report, so a block of all-ones (a bus that answered
+    // nothing meaningful) lands here as "no touch" rather than as fifteen of them.
+    const uint8_t raw_count = block[TOUCH_BLOCK_COUNT_OFFSET] & 0x0F;
+    const uint8_t point_count = raw_count <= CONFIG_ESP_LCD_TOUCH_MAX_POINTS ? raw_count : 0;
 
     auto* touch = internal->touch_handle;
     portENTER_CRITICAL(&touch->data.lock);

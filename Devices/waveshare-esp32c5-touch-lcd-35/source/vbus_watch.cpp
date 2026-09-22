@@ -365,38 +365,41 @@ void recovery_stage2() {
 // register that flickered between 0 and 1, and light taps were often not detected at all, while the
 // same gestures on USB were detected every time. That is not something the PMIC registers explain -
 // with the cable out the board floats instead of sharing the host's ground reference, which is the
-// classic way a capacitive panel ends up marginal - but the detection threshold is a firmware knob
-// and lowering it is the one lever available. The vendor's value (and the component's init) is 128;
-// 64 is used on battery only, so USB behaviour is untouched.
+// classic way a capacitive panel ends up marginal.
+//
+// Lowering the detection threshold (0x80 = 64) and raising the scan rate (0x88 = 60 instead of 14) were
+// both tried as battery-only tuning, and both are gone again: they did not make touch reliable on
+// battery, and the scan-rate write turned out to be worse than that. The controller has no reset pin,
+// so a register it was given survives reboots and reflashes - the out-of-range rate stayed in the chip
+// and went on causing missed taps on USB, after the code that wrote it had already been removed. What
+// remains here re-applies the values the driver itself uses, so this watch cannot leave the controller
+// in a state the driver does not expect.
 constexpr uint8_t TOUCH_THRESHOLD_REGISTER = 0x80;
 constexpr uint8_t TOUCH_POINT_RATE_REGISTER = 0x88;
-// The controller reports its scan rate as a plain number of hertz, and ships at 14 Hz (the component's
-// own init writes 0x0E and logs "Point Rate Hz: 14"). At 14 Hz a ~100 ms tap is only ever a scan or two
-// wide, which is the other half of why taps on battery land only sometimes. 60 Hz is a normal reporting
-// rate for this family and gives a tap several scans to be seen by.
-constexpr uint8_t TOUCH_POINT_RATE_VALUE = 60;
-constexpr uint8_t BATTERY_TOUCH_THRESHOLD = 64;
+constexpr uint8_t TOUCH_THRESHOLD_STOCK = 128;
+constexpr uint8_t TOUCH_POINT_RATE_STOCK = 0x0E;
 
-// The controller still answers I2C on battery, so it is not unpowered - but it stops sensing
-// reliably. The same initialisation the driver performs at boot, with a lower threshold, is the
-// obvious thing to try: if the controller needs a kick to resume scanning after the cable is pulled,
-// this is that kick.
+// The controller still answers I2C on battery, so it is not unpowered - but it stops sensing reliably.
+// Re-applying the configuration it had at boot is the one thing worth doing here, and it is idempotent.
 void recovery_stage3() {
     uint8_t previous_threshold = 0;
     read_register(touch_device, TOUCH_THRESHOLD_REGISTER, &previous_threshold, 1);
-    note("[vw] stage 3: re-initialising the FT6336, threshold %u -> %u\n", previous_threshold,
-         BATTERY_TOUCH_THRESHOLD);
+    note("[vw] stage 3: restoring the controller's stock configuration (threshold was %u)\n",
+         previous_threshold);
     write_register(touch_device, 0x00, 0x00);
-    write_register(touch_device, TOUCH_THRESHOLD_REGISTER, BATTERY_TOUCH_THRESHOLD);
-    write_register(touch_device, TOUCH_POINT_RATE_REGISTER, TOUCH_POINT_RATE_VALUE);
+    write_register(touch_device, TOUCH_THRESHOLD_REGISTER, TOUCH_THRESHOLD_STOCK);
+    write_register(touch_device, TOUCH_POINT_RATE_REGISTER, TOUCH_POINT_RATE_STOCK);
     write_register(touch_device, FT_REG_POWER_MODE, 0x00);
     uint8_t mode = 0;
     uint8_t power_mode = 0;
     uint8_t threshold = 0;
+    uint8_t point_rate = 0;
     read_register(touch_device, 0x00, &mode, 1);
     read_register(touch_device, FT_REG_POWER_MODE, &power_mode, 1);
     read_register(touch_device, TOUCH_THRESHOLD_REGISTER, &threshold, 1);
-    note("[vw]   FT6336 now mode=0x%02x power_mode=0x%02x threshold=%u\n", mode, power_mode, threshold);
+    read_register(touch_device, TOUCH_POINT_RATE_REGISTER, &point_rate, 1);
+    note("[vw]   controller now mode=0x%02x power_mode=0x%02x threshold=%u rate=%u\n", mode, power_mode,
+         threshold, point_rate);
 }
 
 // ---------------------------------------------------------------------------------------------
