@@ -32,6 +32,17 @@
 //
 // The I2C bus is created here and torn down again on purpose: the devicetree's i2c0 node starts its
 // own bus on the same port moments later, and two masters cannot share I2C_NUM_0.
+//
+// The rest of the vendor's AXP2101 initialisation - the DCDC group, the VBUS/power-path registers and
+// a dozen configuration registers that the binding cannot express - is in board_pmic_init.h, together
+// with the replay helper, because the VBUS watch re-applies it when the cable is pulled.
+//
+// That watch (vbus_watch.cpp) exists because of the one behaviour on this board that a full replay of
+// the vendor's init did *not* explain: touch works while the USB cable is in and dies when it is out,
+// with the display still running and no reboot. The watch measures what actually changes, and tries
+// the candidate fixes.
+#include "board_pmic_init.h"
+
 #include <tactility/error.h>
 #include <tactility/log.h>
 #include <tactility/module.h>
@@ -39,6 +50,9 @@
 #include <driver/i2c_master.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+
+/// Defined in vbus_watch.cpp.
+extern "C" void waveshare_c5_vbus_watch_start();
 
 namespace {
 
@@ -59,107 +73,7 @@ constexpr uint8_t EXPANDER_PINS_0_1 = 0x03;
 
 constexpr int I2C_TIMEOUT_MS = 100;
 
-// The rest of the vendor's AXP2101 initialisation, which the devicetree binding cannot express.
-//
-// The binding models the ALDO/BLDO/DLDO/CPUSLDO channels - their voltages and enables - and nothing
-// else. The vendor's init also programmes the whole DCDC group, the VBUS/power-path registers and a
-// dozen configuration registers, and leaving those out is not cosmetic: it left this board with a
-// touch controller whose supply follows VBUS, so touch worked while the USB cable was plugged in and
-// died the moment it was unplugged (on battery, with the display still running), then came back by
-// itself when the cable went back in.
-//
-// Recovered by disassembling the factory image's init (see wrk/axp2101_init_report.md), which was
-// calibrated against a real cold boot of the vendor firmware: it reproduces all nine rail enables
-// (register 0x90 = 0xFF, 0x91 bit 0) and all fifteen rail voltages that the vendor's own log prints.
-//
-// Entries are read-modify-write: {register, mask, value} writes (read(reg) & mask) | value. The
-// vendor's setters are RMW, so replaying them literally preserves bits it deliberately keeps.
-struct AxpWrite {
-    uint8_t reg;
-    uint8_t mask;
-    uint8_t value;
-};
-
-constexpr AxpWrite AXP2101_INIT[] = {
-    // begin(), immediately after the chip-ID check
-    { 0x30, 0xFD, 0x00 }, // clear bit 1
-    { 0x15, 0xF0, 0x06 },
-    { 0x16, 0xF8, 0x04 },
-    { 0x24, 0xF8, 0x00 }, // power-off voltage 2600 mV
-
-    // The DCDC group: the rails the binding has no properties for at all.
-    { 0x82, 0xFF, 0x12 }, // DC1 = 3300 mV
-    { 0x83, 0x80, 0x32 }, // DC2 = 1000 mV
-    { 0x84, 0x80, 0x69 }, // DC3 = 3300 mV
-    { 0x85, 0x80, 0x32 }, // DC4 = 1000 mV
-    { 0x86, 0xE0, 0x13 }, // DC5 = 3300 mV
-    { 0x92, 0xE0, 0x1C }, // ALDO1 = 3300 mV
-    { 0x93, 0xE0, 0x1C }, // ALDO2 = 3300 mV
-    { 0x94, 0xE0, 0x1C }, // ALDO3 = 3300 mV
-    { 0x95, 0xE0, 0x1C }, // ALDO4, transient - rewritten to 1800 mV below
-    { 0x96, 0xE0, 0x0A }, // BLDO1 = 1500 mV
-    { 0x97, 0xE0, 0x17 }, // BLDO2 = 2800 mV
-    { 0x98, 0xE0, 0x0A }, // CPUSLDO = 1000 mV
-    { 0x99, 0xE0, 0x1C }, // DLDO1 = 3300 mV
-    { 0x9A, 0xE0, 0x1C }, // DLDO2 = 3300 mV
-
-    // DCDC enables
-    { 0x80, 0xFD, 0x02 },
-    { 0x80, 0xFB, 0x04 },
-    { 0x80, 0xF7, 0x08 },
-    { 0x80, 0xEF, 0x10 },
-
-    // Rail enables, one bit at a time, in the vendor's order
-    { 0x90, 0xFE, 0x01 },
-    { 0x90, 0xFD, 0x02 },
-    { 0x90, 0xFB, 0x04 },
-    { 0x90, 0xF7, 0x08 },
-    { 0x90, 0xEF, 0x10 },
-    { 0x90, 0xDF, 0x20 },
-    { 0x90, 0xBF, 0x40 },
-    { 0x90, 0x7F, 0x80 },
-    { 0x91, 0xFE, 0x01 },
-
-    // Seconds pass and rails are re-applied; ALDO4 settles at 1800 mV, not 3300.
-    { 0x82, 0xFF, 0x12 },
-    { 0x80, 0xFE, 0x01 },
-    { 0x92, 0xE0, 0x1C },
-    { 0x90, 0xFE, 0x01 },
-    { 0x93, 0xE0, 0x1C },
-    { 0x90, 0xFD, 0x02 },
-    { 0x95, 0xE0, 0x0D }, // ALDO4 final = 1800 mV
-    { 0x90, 0xF7, 0x08 },
-    { 0x97, 0xE0, 0x17 },
-    { 0x90, 0xDF, 0x20 },
-
-    // Power-key timings, the ADC/fuel-gauge block and the interrupt enables.
-    { 0x27, 0xF3, 0x00 },
-    { 0x27, 0xFC, 0x00 },
-    { 0x30, 0xFD, 0x00 },
-    { 0x68, 0xFE, 0x01 },
-    { 0x30, 0xFB, 0x04 },
-    { 0x30, 0xFE, 0x01 },
-    { 0x30, 0xF7, 0x08 },
-    { 0x69, 0xF9, 0x01 },
-    { 0x40, 0x00, 0x00 },
-    { 0x41, 0x00, 0x00 },
-    { 0x42, 0x00, 0x00 },
-    { 0x48, 0xFF, 0xFF },
-    { 0x49, 0xFF, 0xFF },
-    { 0x4A, 0xFF, 0xFF },
-    { 0x41, 0x00, 0xFC },
-    { 0x42, 0x00, 0x18 },
-    { 0x61, 0xFC, 0x02 },
-    { 0x62, 0xE0, 0x08 },
-    { 0x64, 0xFC, 0x02 },
-    { 0x19, 0xCF, 0x00 },
-    { 0x19, 0xF8, 0x02 },
-    { 0x42, 0x00, 0x80 },
-    { 0x6A, 0xF8, 0x07 },
-};
-
 constexpr uint8_t AXP2101_ADDRESS = 0x34;
-constexpr uint8_t AXP2101_REG_LDO_ENABLE_1 = 0x91;
 
 // Settling time between the expander pulse and the device starts that follow.
 //
@@ -195,19 +109,11 @@ error_t board_bring_up() {
     device_config.device_address = EXPANDER_ADDRESS;
     device_config.scl_speed_hz = 100000;
 
-    // The vendor's full PMIC init, which the devicetree cannot express (see the table above).
+    // The vendor's full PMIC init, which the devicetree cannot express (see board_pmic_init.h).
     device_config.device_address = AXP2101_ADDRESS;
     i2c_master_dev_handle_t pmic = nullptr;
     if (i2c_master_bus_add_device(bus, &device_config, &pmic) == ESP_OK) {
-        int applied = 0;
-        for (const auto& entry : AXP2101_INIT) {
-            uint8_t current = 0;
-            if (i2c_master_transmit_receive(pmic, &entry.reg, 1, &current, 1, I2C_TIMEOUT_MS) != ESP_OK) {
-                continue;
-            }
-            write_register(pmic, entry.reg, (uint8_t)((current & entry.mask) | entry.value));
-            ++applied;
-        }
+        const int applied = board_axp_apply_init(pmic);
         i2c_master_bus_rm_device(pmic);
         LOG_I(TAG, "AXP2101 init replayed (%d writes: DCDC group, power path, rail enables)", applied);
     } else {
@@ -234,6 +140,11 @@ error_t board_bring_up() {
 
     // Release the port: the devicetree's i2c0 device starts its own bus on I2C_NUM_0 next.
     i2c_del_master_bus(bus);
+
+    // Starts once the kernel has started the PMIC and touch devices this depends on; see the file
+    // header of vbus_watch.cpp for what it measures and why it lives in the firmware.
+    waveshare_c5_vbus_watch_start();
+
     return ERROR_NONE;
 }
 

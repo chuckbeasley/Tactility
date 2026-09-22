@@ -15,6 +15,7 @@
 #include <tactility/log.h>
 
 #include <esp_err.h>
+#include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_io_i2c.h>
 #include <esp_lcd_panel_io.h>
@@ -32,6 +33,15 @@
 // Power-up settle before the controller is first addressed, for boards with no reset pin (see
 // pulse_reset). The vendor's own driver for this part waits the same 300 ms after its reset pulse.
 constexpr int POWER_UP_SETTLE_MS = 300;
+
+// The controller's touch block: register 0x00 upwards, one transaction, containing the point count at
+// offset 0x02 and up to two sets of coordinates at 0x03..0x08. The same block the component's read
+// fetches as its second half.
+constexpr uint8_t TOUCH_BLOCK_REGISTER = 0x00;
+constexpr size_t TOUCH_BLOCK_SIZE = 16;
+constexpr uint8_t TOUCH_BLOCK_COUNT_OFFSET = 0x02;
+constexpr uint8_t TOUCH_BLOCK_FIRST_POINT_OFFSET = 0x03;
+constexpr size_t TOUCH_POINT_STRIDE = 6;
 
 struct Ft6x36Internal {
     esp_lcd_panel_io_handle_t io_handle;
@@ -240,7 +250,55 @@ static error_t ft6x36_exit_sleep(Device* device) {
 static error_t ft6x36_read_data(Device* device, TickType_t timeout) {
     (void)timeout; // esp_lcd_touch_read_data() has no timeout parameter
     auto* internal = static_cast<Ft6x36Internal*>(device_get_driver_data(device));
-    return esp_lcd_touch_read_data(internal->touch_handle) == ESP_OK ? ERROR_NONE : ERROR_RESOURCE;
+
+    const esp_err_t result = esp_lcd_touch_read_data(internal->touch_handle);
+    if (result != ESP_OK) {
+        return ERROR_RESOURCE;
+    }
+
+    // The component's read trusts register 0x02 and gives up when it reads 0, without ever fetching
+    // the data block:
+    //   esp_lcd_touch_ft6x36.c: if (points > 2 || points == 0) { return ESP_OK; }
+    // On this board that gate is not reliable. Measured on battery power (and never once on USB, in
+    // 63 compared samples): 14 of 98 samples had 0x02 reading 0 while the block's own count byte read
+    // 1 with valid coordinates - every one of those touches was silently discarded, which is exactly
+    // the "touch does not work on battery" this board has shown from the start. The block is the same
+    // data the component would have used; fetch it here and publish what it missed.
+    //
+    // Gated on the interrupt line being asserted, so this cannot invent a touch out of bus noise: the
+    // controller asserts INT for its own detections, and a published touch only becomes a click if
+    // LVGL sees it pressed and then released.
+    if (internal->touch_handle->data.points != 0) {
+        return ERROR_NONE; // the component's own read already has this one
+    }
+
+    const auto* config = GET_CONFIG(device);
+    const gpio_num_t interrupt_pin = pin_or_nc(config->pin_interrupt);
+    if (interrupt_pin == GPIO_NUM_NC || gpio_get_level(interrupt_pin) != 0) {
+        return ERROR_NONE;
+    }
+
+    uint8_t block[TOUCH_BLOCK_SIZE] = {};
+    if (esp_lcd_panel_io_rx_param(internal->io_handle, TOUCH_BLOCK_REGISTER, block, sizeof(block)) != ESP_OK) {
+        return ERROR_NONE;
+    }
+
+    const uint8_t point_count = block[TOUCH_BLOCK_COUNT_OFFSET] & 0x0F;
+    if (point_count == 0 || point_count > CONFIG_ESP_LCD_TOUCH_MAX_POINTS) {
+        return ERROR_NONE;
+    }
+
+    auto* touch = internal->touch_handle;
+    portENTER_CRITICAL(&touch->data.lock);
+    touch->data.points = point_count;
+    for (uint8_t i = 0; i < point_count; ++i) {
+        const size_t offset = TOUCH_BLOCK_FIRST_POINT_OFFSET + (i * TOUCH_POINT_STRIDE);
+        touch->data.coords[i].x = (uint16_t)(((block[offset] & 0x0F) << 8) | block[offset + 1]);
+        touch->data.coords[i].y = (uint16_t)(((block[offset + 2] & 0x0F) << 8) | block[offset + 3]);
+    }
+    portEXIT_CRITICAL(&touch->data.lock);
+
+    return ERROR_NONE;
 }
 
 static bool ft6x36_get_touched_points(Device* device, uint16_t* x, uint16_t* y, uint16_t* strength, uint8_t* point_count, uint8_t max_point_count) {
