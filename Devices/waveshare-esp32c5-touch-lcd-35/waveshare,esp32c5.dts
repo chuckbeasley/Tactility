@@ -4,9 +4,10 @@
 #include <tactility/bindings/esp32_ble.h>
 #include <tactility/bindings/esp32_wifi_pinned.h>
 #include <tactility/bindings/esp32_gpio.h>
-#include <tactility/bindings/esp32_i2c.h>
+#include <tactility/bindings/esp32_i2c_master.h>
 #include <tactility/bindings/esp32_spi.h>
 #include <bindings/st7796.h>
+#include <bindings/ft6x36.h>
 
 /*
  * Waveshare ESP32-C5-Touch-LCD-3.5 (ESP32-C5-WROOM-1U, 32 MB flash, 8 MB PSRAM).
@@ -35,8 +36,8 @@
  *              the expander itself, so the panel is lit without help from here; there is no
  *              devicetree binding for it yet, which is why display@0 has no 'backlight' property.
  *
- *   Touch      FT6336 at I2C address 0x38 on the same bus, INT = GPIO3, no reset pin. No binding in
- *              this tree yet, so it is not declared below.
+ *   Touch      FT6336 at I2C address 0x38 on the same bus, INT = GPIO3, no reset pin. The FT6336 is
+ *              a member of the FT6x36 family, which this tree already has a driver for.
  *
  * IMPORTANT: the panel does not respond to SPI until two things have happened, and they are done by
  * this device's module start hook (see source/module.cpp) because they must run before the display
@@ -78,11 +79,26 @@
 	 */
 
 	i2c0 {
-		compatible = "espressif,esp32-i2c";
+		// The modern controller, not the legacy "espressif,esp32-i2c": the latter installs the
+		// deprecated I2C driver, which exposes no bus handle for IDF 6.1's panel-IO API to bind to.
+		compatible = "espressif,esp32-i2c-master";
 		port = <I2C_NUM_0>;
 		pin-sda = <&gpio0 27 GPIO_FLAG_NONE>;
 		pin-scl = <&gpio0 26 GPIO_FLAG_NONE>;
 		clock-frequency = <100000>;
+
+		// The FT6336 sits at 0x38 on this bus and its interrupt is on GPIO3; the vendor's panel
+		// config passes rst_gpio_num = -1, so there is no reset pin. Coordinates are the panel's
+		// native 320x480. If taps land mirrored or transposed relative to what is drawn, the
+		// controller's axes are inverted with respect to the panel's, and swap-xy / mirror-x here
+		// are what correct it - they are deliberately left unset until that has been observed.
+		touch0 {
+			compatible = "focaltech,ft6x36";
+			reg = <0x38>;
+			x-max = <320>;
+			y-max = <480>;
+			pin-interrupt = <&gpio0 3 GPIO_FLAG_NONE>;
+		};
 	};
 
 	spi0 {

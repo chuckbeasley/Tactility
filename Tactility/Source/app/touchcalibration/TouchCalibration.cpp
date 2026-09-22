@@ -15,6 +15,7 @@
 
 #include <tactility/log.h>
 #include <tactility/device.h>
+#include <tactility/driver.h>
 #include <tactility/drivers/pointer.h>
 #include <drivers/xpt2046_softspi.h>
 #include <lvgl/lvgl.h>
@@ -33,6 +34,13 @@ constexpr auto* TAG = "TouchCalibration";
 extern const ::AppManifest manifest;
 
 namespace {
+
+// True only for the resistive controller the threshold retry was written for, so that every other
+// pointer device (capacitive included) goes through the generic path.
+bool isXpt2046SoftSpi(Device* pointerDevice) {
+    auto* driver = device_get_driver(pointerDevice);
+    return driver != nullptr && driver_is_compatible(driver, "xptek,xpt2046-softspi");
+}
 
 // Touch_Calibrate assumes corner samples are taken near the true display corners.
 // Keep this tight to avoid shrinking the measured span (which biases bottom/right inward).
@@ -105,10 +113,26 @@ static bool captureStableRawSample(lv_point_t* outPoint) {
         bool accepted = false;
         uint16_t x = 0;
         uint16_t y = 0;
-        for (uint16_t threshold : thresholds) {
-            if (xpt2046_softspi_read_valid_touch(pointerDevice, &x, &y, threshold, RAW_SAMPLE_ATTEMPT_TIMEOUT) == ERROR_NONE) {
-                accepted = true;
-                break;
+        // The threshold retry is an XPT2046 behaviour: it re-reads the panel at progressively lower
+        // pressure thresholds because that controller reports a resistive pressure value that varies
+        // with how hard the panel is pressed. A capacitive controller has no such notion, and calling
+        // into that driver anyway is not merely useless - xpt2046_softspi_read_valid_touch() runs
+        // against internal state that only exists for a device the devicetree actually declared, so
+        // on a board with a different touch controller it dereferences a null GPIO descriptor and the
+        // device panics about ten seconds into every boot:
+        //
+        //   Load access fault, MTVAL 0x3c
+        //   gpio_descriptor_set_level <- read_spi_command <- read_raw_z
+        //     <- xpt2046_softspi_read_valid_touch <- TouchCalibration::appMain
+        //
+        // So it is only attempted when the pointer device really is that driver. Everything else
+        // takes the generic pointer path below, which is what makes this app work on any panel.
+        if (isXpt2046SoftSpi(pointerDevice)) {
+            for (uint16_t threshold : thresholds) {
+                if (xpt2046_softspi_read_valid_touch(pointerDevice, &x, &y, threshold, RAW_SAMPLE_ATTEMPT_TIMEOUT) == ERROR_NONE) {
+                    accepted = true;
+                    break;
+                }
             }
         }
         if (!accepted) {

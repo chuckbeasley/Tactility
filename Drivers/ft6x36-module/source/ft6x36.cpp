@@ -15,6 +15,7 @@
 #include <tactility/log.h>
 
 #include <esp_err.h>
+#include <driver/i2c_master.h>
 #include <esp_lcd_io_i2c.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_touch.h>
@@ -73,14 +74,28 @@ static esp_err_t create_io_handle(Device* parent, esp_lcd_panel_io_handle_t* out
     esp_lcd_panel_io_i2c_config_t io_config = ESP_LCD_TOUCH_IO_I2C_FT6x36_CONFIG();
 
     auto* parent_driver = device_get_driver(parent);
-    if (driver_is_compatible(parent_driver, "espressif,esp32-i2c")) {
-        auto port = static_cast<const Esp32I2cConfig*>(parent->config)->port;
-        return esp_lcd_new_panel_io_i2c_v1(port, &io_config, out_handle);
-    }
+    // IDF 6.1 declares only esp_lcd_new_panel_io_i2c(i2c_master_bus_handle_t, ...): the port-based
+    // _v1 and the _v2 spellings this used to call are gone, so the bus handle is what both paths
+    // need. That is also why the modern "espressif,esp32-i2c-master" controller (which installs the
+    // new driver with i2c_new_master_bus) is the one to bind against.
     if (driver_is_compatible(parent_driver, "espressif,esp32-i2c-master")) {
         auto bus = esp32_i2c_master_get_bus_handle(parent);
         io_config.scl_speed_hz = esp32_i2c_master_get_clock_frequency(parent);
-        return esp_lcd_new_panel_io_i2c_v2(bus, &io_config, out_handle);
+        return esp_lcd_new_panel_io_i2c(bus, &io_config, out_handle);
+    }
+    if (driver_is_compatible(parent_driver, "espressif,esp32-i2c")) {
+        // The legacy controller installs the deprecated I2C driver (i2c_driver_install) rather than a
+        // master bus, so there is usually no handle to find. Try anyway, and say plainly what to do
+        // about it instead of failing somewhere less obvious later.
+        auto port = static_cast<const Esp32I2cConfig*>(parent->config)->port;
+        i2c_master_bus_handle_t bus = nullptr;
+        const esp_err_t error = i2c_master_get_bus_handle(port, &bus);
+        if (error != ESP_OK) {
+            LOG_E(TAG, "espressif,esp32-i2c has no I2C master bus handle on IDF 6.1 - "
+                       "use espressif,esp32-i2c-master for this controller");
+            return error;
+        }
+        return esp_lcd_new_panel_io_i2c(bus, &io_config, out_handle);
     }
 
     LOG_E(TAG, "Unsupported I2C driver");
