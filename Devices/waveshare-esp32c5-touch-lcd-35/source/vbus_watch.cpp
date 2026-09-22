@@ -383,6 +383,17 @@ constexpr uint8_t TOUCH_POINT_RATE_STOCK = 0x0E;
 // firmware can do about a signal that is marginal rather than absent are to lower the detection
 // threshold and to sample as fast as the part allows. 0x88 is a sample period in milliseconds with a
 // documented minimum of 10, so 0x0A is its fastest setting.
+//
+// Measured on the board, same session and same gestures: threshold 128 -> 0 detections in 16 s of
+// tapping, 48 -> 7, and 32 -> more again with nothing happening without a finger (verified by hand).
+// The reason a stock threshold starves this board is visible in the vendor's own firmware, which was
+// disassembled for comparison (wrk/vendor_touch_vbus_report.md): it never writes a single register to
+// the touch controller - its driver only reads 0x02 and 0x03 - so the part runs at its power-on
+// defaults there, and the three writes our stack performs (0x00, 0x80 = 128, 0x88 = 0x0E) are ours
+// alone. Raising the threshold to 128 is therefore the most likely reason this board behaves
+// differently from the factory firmware on battery. Two things follow that are not yet done: reading
+// 0x80 after a reset pulse, before anything writes it, would show what the part's own default actually
+// is, and if it is low then not writing 0x80 at all is a better fix than any value here.
 constexpr uint8_t TOUCH_THRESHOLD_BATTERY = 32;
 constexpr uint8_t TOUCH_POINT_RATE_BATTERY = 0x0A;
 
