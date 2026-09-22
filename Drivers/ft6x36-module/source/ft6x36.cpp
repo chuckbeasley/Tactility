@@ -268,16 +268,22 @@ static error_t start(Device* device) {
     // because the revert had nothing to undo them with. The component's own init writes 0x00, 0x80 and
     // 0x88 but never 0xA4, so the interrupt mode in particular was left at whatever it had been.
     //
-    // The threshold is READ, not written. The vendor's firmware never writes this controller at all, so
-    // that part runs at its power-on default, on USB and on battery alike, and its touch does not depend
-    // on which power source it is on. Matching it means leaving the threshold alone; the boot log states
-    // the value the part itself chose.
-    uint8_t reported_threshold = 0;
-    esp_lcd_panel_io_rx_param(internal->io_handle, 0x80, &reported_threshold, 1);
-    LOG_I(TAG, "threshold in force: %u (this driver does not write it)", (unsigned)reported_threshold);
+    // The threshold is set to 32, after the component's own init has already written its 128 - so this
+    // is the value the part ends up with.
+    //
+    // Measured on this board: 128 -> zero detections in 16 s of firm tapping on battery, 48 -> seven,
+    // 32 -> more again, with nothing happening without a finger, and USB normal at all three. What the
+    // part's *own* default is remains unknown, because until this session nothing ever power-cycled it:
+    // the rail that feeds it is ALDO2 (found by toggling each LDO and watching the part NACK), and that
+    // rail has been up continuously. The vendor's firmware writes nothing and therefore runs at that
+    // default. Reproducing that exactly needs the managed component vendored into the tree so its three
+    // writes can be deleted - it is not tracked, so it cannot be patched in place - and until then this
+    // is the configuration the board has actually been verified with.
+    const uint8_t touch_threshold = 32;
     const uint8_t stock_point_rate = 0x0E;
     const uint8_t stock_interrupt_mode = 0x01;
-    const esp_err_t threshold_result = ESP_OK;
+    const esp_err_t threshold_result =
+        esp_lcd_panel_io_tx_param(internal->io_handle, 0x80, &touch_threshold, 1);
     const esp_err_t rate_result =
         esp_lcd_panel_io_tx_param(internal->io_handle, 0x88, &stock_point_rate, 1);
     const esp_err_t mode_result =
