@@ -438,13 +438,23 @@ extern const ::AppManifest manifest = {
     .name = "Bluetooth",
     .category = APP_CATEGORY_SETTINGS,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
-    // Deliberately back to 16 KB rather than the 32 KB tried to survive the list-rebuild stack
-    // fault: that did not fix the fault (it still faulted with 32 KB) and the extra 16 KB of
-    // internal RAM starved the Bluetooth driver, which allocates a node per discovered peer and
-    // was logging "malloc addr node failed" - i.e. it could no longer record every device it found.
-    // The depth is instead kept down by the coalesced refresh, which rebuilds the list at most once
-    // per interval instead of once per event.
-    .stack = { .depth = 4096 }, // 16 KB
+    // 32 KB, sized against the row cap in View.cpp - the two are one budget.
+    //
+    // This app's list rebuild costs roughly 500 bytes of stack per rendered row and does not give it
+    // back until the rebuild returns, so its stack requirement scales with how many rows the cap
+    // allows. Measured with uxTaskGetSystemState under the same workload, that is why a larger stack
+    // never "fixed" the fault on its own: the overflow was truncating the rebuild, so 16 KB stopped
+    // at ~30 rows with 92 bytes left, 24 KB reached ~45 rows, and 32 KB rendered all 60 (30 paired
+    // + 30 available) with 4184 bytes to spare. The row cap is what bounds the peak; this size fits
+    // that bound.
+    //
+    // The earlier note here said 32 KB had been tried and did not fix the fault, and that its extra
+    // internal RAM starved the Bluetooth driver. Both parts are stale: that attempt predates the
+    // coalesced refresh, the row cap and the snprintf change, and with those in place the RAM cost is
+    // affordable - measured with both this app and BleToolbox (48 KB of stack) open, internal heap
+    // holds 33927 bytes free with a 15360-byte largest block, and the driver logs no allocation
+    // failures while scanning.
+    .stack = { .depth = 8192 }, // 32 KB
 };
 
 } // namespace tt::app::btmanage

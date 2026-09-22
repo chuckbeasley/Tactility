@@ -235,9 +235,15 @@ void View::updatePeerList() {
     const int32_t scroll_y = lv_obj_get_scroll_y(peers_list);
 
     // A busy RF environment can produce dozens of peers per scan. Rebuilding the LVGL list for
-    // every one of them creates a very deep widget tree on the app task (8 KB default stack),
-    // whose redraw recursion overflows the stack and crashes the device with a Stack protection
-    // fault. Cap how many peers we render so the widget tree stays bounded.
+    // every one of them creates a very deep widget tree on the app task, whose redraw recursion
+    // overflows the stack and crashes the device with a Stack protection fault. Cap how many peers
+    // we render so the widget tree stays bounded.
+    //
+    // This cap is load-bearing for the task's stack size, not just for legibility: measured with
+    // uxTaskGetSystemState, each rendered row costs roughly 500 bytes of stack that is not given
+    // back until the rebuild returns - 16 KB held ~30 rows, 24 KB ~45, and 32 KB rendered all 60
+    // (30 paired + 30 available) with 4184 bytes left. Raising this number therefore needs the
+    // manifest's stack raised with it; the two are one budget.
     constexpr size_t MAX_VISIBLE_PEERS = 30;
 
     lv_obj_clean(peers_list);
