@@ -87,6 +87,34 @@ static const char* getSdCardStatusIcon(bool mounted) {
     return LVGL_ICON_STATUSBAR_SD_CARD_ALERT;
 }
 
+/**
+ * Whether external power is connected, which is what the bolt on the battery icon means.
+ *
+ * "Plugged in" and "charging" are not the same thing: a pack the charger has finished with reports
+ * not charging while the cable is still attached - measured on this board sitting at 84% on USB,
+ * where a cable cycle does not even restart the charge. So POWER_SUPPLY_PROP_IS_ONLINE is preferred
+ * where a device offers it, and POWER_SUPPLY_PROP_IS_CHARGING is the fallback for the drivers that
+ * only report that, where the bolt then appears only while current actually flows.
+ */
+static bool isPowerConnected(Device* power) {
+    static constexpr PowerSupplyProperty CONNECTION_PROPERTIES[] = {
+        POWER_SUPPLY_PROP_IS_ONLINE,
+        POWER_SUPPLY_PROP_IS_CHARGING,
+    };
+
+    for (auto property : CONNECTION_PROPERTIES) {
+        if (!power_supply_supports_property(power, property)) {
+            continue;
+        }
+        PowerSupplyPropertyValue value = {};
+        if (power_supply_get_property(power, property, &value) == ERROR_NONE && value.int_value != 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static const char* getPowerStatusIcon() {
     // TODO: Support multiple power devices?
     Device* power = nullptr;
@@ -108,6 +136,13 @@ static const char* getPowerStatusIcon() {
     }
 
     int charge = charge_level.int_value;
+
+    // The bolt replaces the level frame rather than adding to it: all STATUSBAR_ICON_LIMIT slots are
+    // claimed, so there is no second icon to put a bolt in, and the bolt glyph is a fixed shape
+    // that carries no level of its own.
+    if (isPowerConnected(power)) {
+        return LVGL_ICON_STATUSBAR_BATTERY_ANDROID_FRAME_BOLT;
+    }
 
     if (charge >= 95) {
         return LVGL_ICON_STATUSBAR_BATTERY_ANDROID_FRAME_FULL;

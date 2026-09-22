@@ -23,6 +23,16 @@ enum PowerSupplyProperty {
     POWER_SUPPLY_PROP_VOLTAGE,
     /** [0, 100]: battery charge level */
     POWER_SUPPLY_PROP_CAPACITY,
+    /**
+     * [0, 1]: whether external power is connected - a plugged-in charger - regardless of whether
+     * current is actually flowing into the battery. Deliberately distinct from
+     * POWER_SUPPLY_PROP_IS_CHARGING: a pack the charger has finished with reports not charging
+     * while the cable is still attached, and a UI that means "plugged in" needs the former.
+     *
+     * Appended rather than inserted: these values are part of the app-facing headers, so adding in
+     * the middle would silently renumber every property after it.
+     */
+    POWER_SUPPLY_PROP_IS_ONLINE,
 };
 
 /**

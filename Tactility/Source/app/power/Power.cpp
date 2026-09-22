@@ -27,6 +27,7 @@ extern const ::AppManifest manifest;
 namespace {
 
 constexpr PowerSupplyProperty DISPLAYED_PROPERTIES[] = {
+    POWER_SUPPLY_PROP_IS_ONLINE,
     POWER_SUPPLY_PROP_IS_CHARGING,
     POWER_SUPPLY_PROP_VOLTAGE,
     POWER_SUPPLY_PROP_CAPACITY,
@@ -69,6 +70,9 @@ bool collectDevice(::Device* device, void* context) {
 
 void setPropertyLabelText(lv_obj_t* label, PowerSupplyProperty property, const PowerSupplyPropertyValue& value) {
     switch (property) {
+        case POWER_SUPPLY_PROP_IS_ONLINE:
+            lv_label_set_text_fmt(label, "External power: %s", value.int_value ? "yes" : "no");
+            break;
         case POWER_SUPPLY_PROP_IS_CHARGING:
             lv_label_set_text_fmt(label, "Charging: %s", value.int_value ? "yes" : "no");
             break;

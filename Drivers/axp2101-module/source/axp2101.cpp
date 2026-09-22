@@ -411,7 +411,7 @@ static int estimate_capacity_from_mv(int battery_mv) {
 
 static bool ps_supports_property(Device*, PowerSupplyProperty property) {
     return property == POWER_SUPPLY_PROP_IS_CHARGING || property == POWER_SUPPLY_PROP_VOLTAGE ||
-           property == POWER_SUPPLY_PROP_CAPACITY;
+           property == POWER_SUPPLY_PROP_CAPACITY || property == POWER_SUPPLY_PROP_IS_ONLINE;
 }
 
 static error_t ps_get_property(Device* device, PowerSupplyProperty property, PowerSupplyPropertyValue* out_value) {
@@ -460,6 +460,18 @@ static error_t ps_get_property(Device* device, PowerSupplyProperty property, Pow
                 return ERROR_NOT_FOUND;
             }
             out_value->int_value = estimate_capacity_from_mv(millivolts);
+            return ERROR_NONE;
+        }
+        case POWER_SUPPLY_PROP_IS_ONLINE: {
+            // VBUS good, i.e. a charger is attached. This is the bit the board's VBUS watch has
+            // been logging as vbus=1/0 across cable pulls, and it stays set when charging has
+            // terminated - which is exactly the difference from POWER_SUPPLY_PROP_IS_CHARGING.
+            bool present;
+            error_t err = axp2101_is_vbus_present(axp2101_device, &present);
+            if (err != ERROR_NONE) {
+                return err;
+            }
+            out_value->int_value = present ? 1 : 0;
             return ERROR_NONE;
         }
         default:
