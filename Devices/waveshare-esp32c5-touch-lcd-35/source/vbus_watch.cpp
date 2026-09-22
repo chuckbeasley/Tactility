@@ -378,17 +378,24 @@ constexpr uint8_t TOUCH_THRESHOLD_REGISTER = 0x80;
 constexpr uint8_t TOUCH_POINT_RATE_REGISTER = 0x88;
 constexpr uint8_t TOUCH_THRESHOLD_STOCK = 128;
 constexpr uint8_t TOUCH_POINT_RATE_STOCK = 0x0E;
+// On battery this panel's sensing does not report anything at all, while the controller answers I2C and
+// every rail is identical to USB - so whatever is lost is lost in the analog path, and the two things
+// firmware can do about a signal that is marginal rather than absent are to lower the detection
+// threshold and to sample as fast as the part allows. 0x88 is a sample period in milliseconds with a
+// documented minimum of 10, so 0x0A is its fastest setting.
+constexpr uint8_t TOUCH_THRESHOLD_BATTERY = 32;
+constexpr uint8_t TOUCH_POINT_RATE_BATTERY = 0x0A;
 
 // The controller still answers I2C on battery, so it is not unpowered - but it stops sensing reliably.
 // Re-applying the configuration it had at boot is the one thing worth doing here, and it is idempotent.
 void recovery_stage3() {
     uint8_t previous_threshold = 0;
     read_register(touch_device, TOUCH_THRESHOLD_REGISTER, &previous_threshold, 1);
-    note("[vw] stage 3: restoring the controller's stock configuration (threshold was %u)\n",
-         previous_threshold);
+    note("[vw] stage 3: battery touch profile (threshold %u -> %u, sample period %u ms)\n",
+         previous_threshold, TOUCH_THRESHOLD_BATTERY, TOUCH_POINT_RATE_BATTERY);
     write_register(touch_device, 0x00, 0x00);
-    write_register(touch_device, TOUCH_THRESHOLD_REGISTER, TOUCH_THRESHOLD_STOCK);
-    write_register(touch_device, TOUCH_POINT_RATE_REGISTER, TOUCH_POINT_RATE_STOCK);
+    write_register(touch_device, TOUCH_THRESHOLD_REGISTER, TOUCH_THRESHOLD_BATTERY);
+    write_register(touch_device, TOUCH_POINT_RATE_REGISTER, TOUCH_POINT_RATE_BATTERY);
     write_register(touch_device, FT_REG_POWER_MODE, 0x00);
     uint8_t mode = 0;
     uint8_t power_mode = 0;
