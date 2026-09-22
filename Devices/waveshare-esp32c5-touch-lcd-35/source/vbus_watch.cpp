@@ -421,6 +421,92 @@ void recovery_stage3() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// One-shot rail discovery: which AXP2101 rail powers the touch controller, and what that part's own
+// power-on defaults are.
+//
+// The chip's defaults matter because the vendor's firmware never writes this controller - it only reads
+// it - so on that board it runs at whatever a fresh power-on gives it, on USB and on battery alike. Our
+// chip has not had a fresh power-on since this firmware started writing to it, which is why deleting
+// our writes alone would not reproduce the vendor: the registers would simply stay as we left them.
+// Toggling a rail off resets whatever sits on it, so this both identifies the rail and reveals the
+// defaults the vendor effectively runs at. Only the LDOs are swept: a DCDC here is likely to be the
+// system rail, and cutting that would take the whole board rather than the controller.
+// ---------------------------------------------------------------------------------------------
+
+struct RailProbe {
+    const char* name;
+    uint8_t enable_register;
+    uint8_t bit;
+};
+
+// NOT called. It did its job once - it identified ALDO2 as the rail that powers the touch controller
+// (cutting it makes the part NACK: id=ERR/0x00, every register 0, while the other LDOs leave it
+// answering) - and then it took the board down with it, because cycling a live rail on a running system
+// disturbs everything else sharing it. Kept only as a record of the measurement, with the call removed.
+[[maybe_unused]] void discover_touch_rail() {
+    static const RailProbe RAILS[] = {
+        { "ALDO1", 0x90, 0x01 },
+        { "ALDO2", 0x90, 0x02 },
+        { "ALDO3", 0x90, 0x04 },
+        { "ALDO4", 0x90, 0x08 },
+        { "BLDO1", 0x90, 0x10 },
+        { "BLDO2", 0x90, 0x20 },
+        { "CPUSLDO", 0x90, 0x40 },
+        { "DLDO1", 0x90, 0x80 },
+        { "DLDO2", 0x91, 0x01 },
+    };
+
+    note("[vw] rail discovery: toggling each LDO, watching the touch controller\n");
+
+    uint8_t id_before = 0;
+    uint8_t threshold_before = 0;
+    read_register(touch_device, 0xA3, &id_before, 1);
+    read_register(touch_device, 0x80, &threshold_before, 1);
+    note("[vw]   before: chip id=0x%02x threshold=%u\n", id_before, threshold_before);
+
+    for (size_t i = 0; i < sizeof(RAILS) / sizeof(RAILS[0]); ++i) {
+        uint8_t enable = 0;
+        if (!read_register(axp_device, RAILS[i].enable_register, &enable, 1)) {
+            note("[vw]   %s: cannot read 0x%02x\n", RAILS[i].name, RAILS[i].enable_register);
+            continue;
+        }
+
+        write_register(axp_device, RAILS[i].enable_register, (uint8_t)(enable & ~RAILS[i].bit));
+        vTaskDelay(pdMS_TO_TICKS(300));
+
+        uint8_t id_off = 0;
+        uint8_t threshold_off = 0;
+        uint8_t mode_off = 0;
+        const bool id_ok = read_register(touch_device, 0xA3, &id_off, 1);
+        read_register(touch_device, 0x80, &threshold_off, 1);
+        read_register(touch_device, 0x00, &mode_off, 1);
+
+        write_register(axp_device, RAILS[i].enable_register, enable);
+        vTaskDelay(pdMS_TO_TICKS(300));
+
+        const bool affected = !id_ok || id_off != id_before || threshold_off != threshold_before;
+        note("[vw]   %s off -> id=%s0x%02x threshold=%u mode=0x%02x %s\n", RAILS[i].name,
+             id_ok ? "" : "ERR/", id_off, threshold_off, mode_off,
+             affected ? "<== affects the touch controller" : "");
+    }
+
+    uint8_t id_after = 0;
+    uint8_t threshold_after = 0;
+    uint8_t rate_after = 0;
+    uint8_t interrupt_mode_after = 0;
+    uint8_t power_mode_after = 0;
+    read_register(touch_device, 0xA3, &id_after, 1);
+    read_register(touch_device, 0x80, &threshold_after, 1);
+    read_register(touch_device, 0x88, &rate_after, 1);
+    read_register(touch_device, 0xA4, &interrupt_mode_after, 1);
+    read_register(touch_device, FT_REG_POWER_MODE, &power_mode_after, 1);
+    note("[vw]   after sweep: chip id=0x%02x threshold=%u rate=%u interrupt_mode=%u power_mode=%u\n",
+         id_after, threshold_after, rate_after, interrupt_mode_after, power_mode_after);
+    note("[vw]   (no writes follow: if a rail reset the controller, these are its own defaults - the\n");
+    note("[vw]    configuration the vendor's firmware runs in, since it never writes this part)\n");
+}
+
+// ---------------------------------------------------------------------------------------------
 
 [[noreturn]] void vbus_watch_task(void* argument) {
     (void)argument;
