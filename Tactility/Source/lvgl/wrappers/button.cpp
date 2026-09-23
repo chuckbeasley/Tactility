@@ -3,6 +3,7 @@
 #include <lvgl.h>
 
 #include <lvgl/lvgl.h>
+#include <lvgl/widgets/click_guard.h>
 
 extern "C" {
 
@@ -22,6 +23,10 @@ lv_obj_t* __wrap_lv_button_create(lv_obj_t* parent) {
         lv_obj_set_style_pad_ver(button, 4, LV_STATE_DEFAULT);
         lv_obj_set_height(button, 28);
     }
+
+    // Buttons inside scrollable screens are dragged over just like list rows, and LVGL reports that
+    // drag as a click when it could not scroll anything. See click_guard.h.
+    lvgl_click_guard_apply(button);
 
     return button;
 }
