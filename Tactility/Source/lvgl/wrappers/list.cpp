@@ -4,6 +4,7 @@
 
 #include <lvgl/lvgl.h>
 #include <lvgl/widgets/click_guard.h>
+#include <lvgl/widgets/scrollbar.h>
 
 extern "C" {
 
@@ -18,6 +19,9 @@ lv_obj_t* __wrap_lv_list_create(lv_obj_t* parent) {
         lv_obj_set_style_pad_column(list, 2, LV_STATE_DEFAULT);
         lv_obj_set_style_pad_all(list, 2, LV_STATE_DEFAULT);
     }
+
+    // The list is the object the user actually scrolls, so its bar is the one worth aiming at.
+    lvgl_apply_readable_scrollbar(list);
 
     return list;
 }

@@ -3,6 +3,7 @@
 #include <lvgl.h>
 
 #include <lvgl/lvgl.h>
+#include <lvgl/widgets/scrollbar.h>
 
 extern "C" {
 
@@ -25,6 +26,13 @@ lv_obj_t* __wrap_lv_dropdown_create(lv_obj_t* parent) {
         lv_obj_set_style_border_color(dropdown, lv_theme_get_color_secondary(parent), LV_PART_MAIN);
     } else {
         lv_obj_set_style_border_color(dropdown, lv_color_hex(0xFAFAFA), LV_PART_MAIN);
+    }
+
+    // The list a dropdown pops up is the part of it that scrolls, and LVGL builds that list itself -
+    // styling the dropdown does not reach it, so it is fetched and styled here.
+    lv_obj_t* popup_list = lv_dropdown_get_list(dropdown);
+    if (popup_list != nullptr) {
+        lvgl_apply_readable_scrollbar(popup_list);
     }
 
     return dropdown;

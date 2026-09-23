@@ -2,6 +2,7 @@
 
 #include <lvgl/lvgl.h>
 #include <lvgl/devices/keyboard.h>
+#include <lvgl/widgets/scrollbar.h>
 
 extern "C" {
 
@@ -9,6 +10,8 @@ extern lv_obj_t* __real_lv_textarea_create(lv_obj_t* parent);
 
 lv_obj_t* __wrap_lv_textarea_create(lv_obj_t* parent) {
     auto textarea = __real_lv_textarea_create(parent);
+    // A text area scrolls once its text outgrows it, so it gets the standard bar too.
+    lvgl_apply_readable_scrollbar(textarea);
 
     if (lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT) {
         lv_obj_set_style_pad_all(textarea, 2, LV_STATE_DEFAULT);

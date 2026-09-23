@@ -3,6 +3,7 @@
 #include <lvgl.h>
 
 #include <lvgl/lvgl.h>
+#include <lvgl/widgets/scrollbar.h>
 
 extern "C" {
 
@@ -25,6 +26,9 @@ lv_obj_t* __wrap_lv_obj_create(lv_obj_t* parent) {
         lv_obj_set_style_radius(obj, 3, LV_STATE_DEFAULT);
         lv_obj_set_style_border_width(obj, 1, LV_STATE_DEFAULT);
     }
+    // Containers are where most of the scrolling happens - a screen's list body - and their bars were
+    // 5 px hairlines. See scrollbar.h.
+    lvgl_apply_readable_scrollbar(obj);
     return obj;
 }
 
