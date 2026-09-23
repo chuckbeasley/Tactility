@@ -35,9 +35,11 @@
 // pulse_reset). The vendor's own driver for this part waits the same 300 ms after its reset pulse.
 constexpr int POWER_UP_SETTLE_MS = 300;
 
-// How often the driver's own task samples the controller. The controller scans at 14 Hz (71 ms) and the
-// input path asks for data every ~35 ms (measured on this board), so polling faster than either is what
-// keeps a short tap from falling between two samples. One 17-byte read costs about 2 ms at 100 kHz.
+// How often the driver's own task samples the controller, measured as a ~11 ms round (10 ms delay plus
+// the bus read) and stretching to ~25 ms while the UI is redrawing. The input path asks for data far
+// less often than that (measured: ~35 ms apart when idle, over 100 ms while redrawing), so polling this
+// fast is what keeps a short tap or flick from falling entirely between two of its reads. One 17-byte
+// read costs about 2 ms at 100 kHz.
 constexpr int POLL_INTERVAL_MS = 10;
 
 // The controller's touch block: register 0x00 upwards, one transaction, containing the point count at
@@ -56,11 +58,11 @@ struct Ft6x36Internal {
     GpioDescriptor* reset_descriptor;
 
     // The controller is polled by this driver's own task rather than only when the input path asks,
-    // because those two rates are far apart and the gap loses taps: measured on this board, LVGL's
-    // timer calls read_data every ~35 ms while the controller itself scans every ~71 ms (14 Hz), so a
-    // ~100 ms tap is one or two scans wide and two or three samples wide, and missing either loses it.
-    // The task samples the controller at POLL_INTERVAL_MS and latches what it sees, so a tap that
-    // happened between two input-path reads is still delivered exactly once.
+    // because those two rates are far apart and the gap loses taps: measured on this board, the input
+    // path calls read_data every ~35 ms when the UI is idle and over 100 ms while it redraws, so a
+    // ~100 ms tap can be over before the first of those calls. The task samples the controller at
+    // POLL_INTERVAL_MS and latches what it sees, so a tap that happened between two input-path reads
+    // is still delivered.
     TaskHandle_t poll_task;
     portMUX_TYPE poll_lock;
     bool poll_task_stop;
@@ -68,6 +70,19 @@ struct Ft6x36Internal {
     bool latch_pending;
     uint16_t latched_x;
     uint16_t latched_y;
+
+    // Where the current touch started, so its first report can be the position the finger landed on
+    // even when the controller has already moved on by the time the input path asks.
+    uint16_t gesture_start_x;
+    uint16_t gesture_start_y;
+
+    // Read path state (only touched by ft6x36_read_data, which the input path calls from one task).
+    // published_* is what the input path was last told; a release is not reported while the controller
+    // knows the finger moved somewhere else, because the movement has to reach the input path first -
+    // see ft6x36_read_data().
+    bool press_delivered;
+    uint16_t published_x;
+    uint16_t published_y;
 };
 
 // Only valid for pin_interrupt: esp_lcd_touch only ever reads this pin's level / attaches an ISR
@@ -128,6 +143,10 @@ static void ft6x36_poll_once(Ft6x36Internal* internal) {
 
     portENTER_CRITICAL(&internal->poll_lock);
     if (point_count > 0) {
+        if (!internal->finger_down) {
+            internal->gesture_start_x = x;
+            internal->gesture_start_y = y;
+        }
         internal->finger_down = true;
         internal->latch_pending = true;
         internal->latched_x = x;
@@ -274,6 +293,11 @@ static error_t start(Device* device) {
     // Measured on this board: 128 -> zero detections in 16 s of firm tapping on battery, 48 -> seven,
     // 32 -> more again, with nothing happening without a finger, and USB normal at all three.
     //
+    // How fast the part reports is separate and was measured too: at the stock 0x88 = 0x0E a moving
+    // finger produced a new position every ~11-25 ms when polled that often, so this driver does not
+    // rely on any particular reading of that register's units. (An earlier note in this file read 0x0E
+    // as 14 Hz / 71 ms; the same measurement contradicts it, which is why it is not repeated here.)
+    //
     // 128 is not our invention and not a value we can blame on the stock driver: it is the part's own
     // power-on default. That was measured rather than assumed - toggling the LDOs showed ALDO2 is the
     // rail that feeds this controller, cutting it power-cycled the part for the first time in this
@@ -319,6 +343,11 @@ static error_t start(Device* device) {
     internal->latch_pending = false;
     internal->latched_x = 0;
     internal->latched_y = 0;
+    internal->gesture_start_x = 0;
+    internal->gesture_start_y = 0;
+    internal->press_delivered = false;
+    internal->published_x = 0;
+    internal->published_y = 0;
     internal->poll_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
 
     device_set_driver_data(device, internal);
@@ -406,21 +435,25 @@ static error_t ft6x36_read_data(Device* device, TickType_t timeout) {
     auto* internal = static_cast<Ft6x36Internal*>(device_get_driver_data(device));
 
     // The controller itself is read by ft6x36_poll_task(), several times per call here, because this
-    // call happens once per LVGL timer tick (~35 ms measured on this board) while the controller scans
-    // every ~71 ms (14 Hz): a ~100 ms tap is one or two scans wide, and anything that fell between two
-    // of these calls used to be lost outright. What is left here is to publish the polled state, with
-    // one addition - a touch the polling task saw but this path has not been told about yet is
-    // reported as a press now, and the next call reports the release, so it arrives as a press/release
-    // pair instead of never arriving at all.
+    // call happens once per LVGL timer tick (~35 ms measured on this board when idle, over 100 ms while
+    // it redraws) while the polling task runs every ~11 ms: anything that happened between two of these
+    // calls used to be lost outright. What is left here is to publish the polled state, with one
+    // addition - a touch the polling task saw but this path has not been told about yet is reported as a
+    // press now, and the next call reports the release, so it arrives as a press/release pair instead of
+    // never arriving at all.
     bool finger_down = false;
     bool unread_tap = false;
     uint16_t x = 0;
     uint16_t y = 0;
+    uint16_t gesture_start_x = 0;
+    uint16_t gesture_start_y = 0;
 
     portENTER_CRITICAL(&internal->poll_lock);
     finger_down = internal->finger_down;
     x = internal->latched_x;
     y = internal->latched_y;
+    gesture_start_x = internal->gesture_start_x;
+    gesture_start_y = internal->gesture_start_y;
     if (finger_down) {
         internal->latch_pending = false; // this press is being delivered now
     } else if (internal->latch_pending) {
@@ -429,14 +462,51 @@ static error_t ft6x36_read_data(Device* device, TickType_t timeout) {
     }
     portEXIT_CRITICAL(&internal->poll_lock);
 
-    const bool pressed = finger_down || unread_tap;
+    // The input path reads this far slower than the controller scans (measured: ~35 ms apart when the
+    // UI is idle, over 100 ms while it redraws, against a ~10 ms poll here), so a gesture can be over
+    // before its movement has ever been reported. Reporting the release at that point loses the
+    // movement entirely: the input path hands LVGL a press and a release at the same coordinates, and
+    // LVGL - which decides "click or scroll" from how far its own samples moved - opens whatever is
+    // under the finger instead of scrolling. A quick flick is a whole gesture of that kind.
+    //
+    // So a gesture is reported as: the position the finger landed on, then wherever it moved to, then
+    // the release - and the release waits one read if the controller knows the finger moved since the
+    // last thing reported. A tap is unaffected: nothing moved, so nothing is deferred, and the press
+    // and release arrive as before.
+    bool pressed = false;
+    uint16_t out_x = 0;
+    uint16_t out_y = 0;
+
+    if (finger_down || unread_tap) {
+        if (!internal->press_delivered) {
+            out_x = gesture_start_x;
+            out_y = gesture_start_y;
+            internal->press_delivered = true;
+        } else {
+            out_x = x;
+            out_y = y;
+        }
+        pressed = true;
+    } else if (internal->press_delivered && (x != internal->published_x || y != internal->published_y)) {
+        out_x = x;
+        out_y = y;
+        pressed = true;
+    } else {
+        internal->press_delivered = false;
+    }
+
+    if (pressed) {
+        internal->published_x = out_x;
+        internal->published_y = out_y;
+    }
+
     auto* touch = internal->touch_handle;
     portENTER_CRITICAL(&touch->data.lock);
     touch->data.points = pressed ? 1 : 0;
     if (pressed) {
         const auto* config = GET_CONFIG(device);
-        touch->data.coords[0].x = ft6x36_scale_axis(x, config->raw_x_min, config->raw_x_max, config->x_max);
-        touch->data.coords[0].y = ft6x36_scale_axis(y, config->raw_y_min, config->raw_y_max, config->y_max);
+        touch->data.coords[0].x = ft6x36_scale_axis(out_x, config->raw_x_min, config->raw_x_max, config->x_max);
+        touch->data.coords[0].y = ft6x36_scale_axis(out_y, config->raw_y_min, config->raw_y_max, config->y_max);
     }
     portEXIT_CRITICAL(&touch->data.lock);
 

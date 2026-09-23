@@ -18,15 +18,14 @@ static const TickType_t LVGL_POINTER_READ_TIMEOUT = pdMS_TO_TICKS(10);
 // indev created by other code (e.g. the deprecated HAL's own LVGL pointer registration).
 static lv_indev_t* default_pointer_indev = NULL;
 
-// Caps nearest-neighbor slot tracking (lvgl_pointer_pool_assign) to a fraction of screen width,
-// so a lifted finger's slot doesn't jump to grab an unrelated new touch elsewhere on screen.
-// Scaled by resolution, not a flat pixel value, so it stays proportionate on any display size.
-// Set generously \wide: a too-tight cap misreads a fast scroll's own motion as release+re-press,
-// firing whatever is under the finger mid-drag.
+// Caps nearest-neighbor slot tracking (lvgl_pointer_pool_assign) to a fraction of screen width, so
+// that when several fingers are down a slot follows the one it was already tracking instead of
+// swapping to a neighbour's point. Scaled by resolution rather than a flat pixel value, so it stays
+// proportionate on any display size.
 //
-// \wide False positives (treating one continued drag as two separate touches) are far more
-//     disruptive than false negatives (merging an unrelated same-spot lift+relanding), which
-//     favors erring toward a larger cap.
+// Only ever applies where there is a choice to make: a single raw point against a single active slot
+// is matched regardless of distance, because a finger can cross this cap in one round of the input
+// path. See the comment on that rule in lvgl_pointer_pool_assign().
 static const int32_t LVGL_POINTER_MAX_TRACK_DIST_FRACTION = 3; // 1/3 of screen width
 
 // One physical touch device backs LVGL_POINTER_MAX_SLOTS independent lv_indev_t instances (a
@@ -169,6 +168,25 @@ static void lvgl_pointer_pool_assign(struct LvglPointerPool* pool, int32_t logic
     // release-then-press.
     bool slot_released_now[LVGL_POINTER_MAX_SLOTS] = {};
 
+    // One active slot and one raw point have exactly one possible pairing, so the distance cap has
+    // nothing to disambiguate and must not be applied to it. This is not a detail: the cap cannot be
+    // large enough to be safe here and still do its job. A finger can cross the whole screen between
+    // two rounds of this input path (measured: 124 px in 140 ms on this board, with rounds up to
+    // 105 ms apart while the UI is redrawing), so any cap that admits a fast flick admits a
+    // cross-screen jump too. Applying the cap to the only possible pairing does not avoid the second
+    // case, it only turns the first one into "the finger never moved": the raw point is dropped, the
+    // slot keeps reporting where the press started, and LVGL sees a motionless press - which is a
+    // CLICK on release, i.e. an app opening under a scrolling finger.
+    //
+    // What the pairing rule gives up: a lift followed by a distant re-touch between two rounds reads
+    // as one continuous drag instead of release+press. That misread scrolls; it cannot open an app,
+    // so it is the cheaper of the two failures.
+    uint8_t active_slot_count = 0;
+    for (uint8_t s = 0; s < pool->slot_count; s++) {
+        if (pool->slot_active[s]) active_slot_count++;
+    }
+    const bool only_possible_pairing = (active_slot_count == 1 && pool->raw_count == 1);
+
     // First pass: let already-active slots keep following their nearest raw point, so a held
     // finger doesn't get reshuffled onto a different slot just because another finger moved.
     for (uint8_t s = 0; s < pool->slot_count; s++) {
@@ -185,7 +203,7 @@ static void lvgl_pointer_pool_assign(struct LvglPointerPool* pool, int32_t logic
                 best_raw = (int8_t)r;
             }
         }
-        if (best_raw >= 0 && best_dist <= max_track_dist_sq) {
+        if (best_raw >= 0 && (only_possible_pairing || best_dist <= max_track_dist_sq)) {
             raw_claimed[best_raw] = true;
             pool->slot_point[s].x = (lv_coord_t)pool->raw_x[best_raw];
             pool->slot_point[s].y = (lv_coord_t)pool->raw_y[best_raw];

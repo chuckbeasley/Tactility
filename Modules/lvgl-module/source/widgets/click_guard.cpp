@@ -61,6 +61,8 @@ void on_event(lv_event_t* event) {
     }
 
     if (!state->pressed) {
+        // A click with no press recorded on this object means the gesture started somewhere else (a
+        // child, or a re-press): there is no press point to compare against, so nothing to suppress.
         return;
     }
 
