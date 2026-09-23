@@ -2,6 +2,10 @@ dependencies:
   espressif/cjson: "1.7.19~2"
   espressif/esp_new_jpeg: "*"
   espressif/esp_codec_dev: "1.5.10"
+  # WAV/MP3/FLAC decoding for the media player app. Its MP3 decoder is fixed-point (Helix-derived),
+  # which matters on this target: the ESP32-C5 builds with -march=rv32imac and no FPU, so a
+  # float-based decoder would run in software emulation.
+  espressif/esp_audio_codec: "2.6.2"
   espressif/esp_video:
     version: "2.2.0"
     rules:
