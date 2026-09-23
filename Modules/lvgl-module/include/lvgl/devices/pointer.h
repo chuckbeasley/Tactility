@@ -24,6 +24,15 @@ extern "C" {
 #define LVGL_POINTER_MAX_SLOTS 5
 
 /**
+ * @brief Minimum span, in raw units, that a calibration axis must cover to be considered valid.
+ *
+ * A span narrower than this cannot be a real calibration: it would mean the raw range measured
+ * during calibration covered only a few units, and applying it would amplify any noise into a jump
+ * across the whole screen.
+ */
+#define LVGL_POINTER_CALIBRATION_MIN_RANGE 20
+
+/**
  * @brief Linear per-axis calibration range for raw pointer coordinates.
  *
  * Values are the raw (pre-calibration) coordinates that should map to the display's
@@ -41,6 +50,16 @@ struct LvglPointerCalibration {
 };
 
 /**
+ * @brief Whether a calibration is usable: both axes must have a positive span of at least
+ *        LVGL_POINTER_CALIBRATION_MIN_RANGE raw units.
+ *
+ * Exported because it is the one rule for what counts as a valid calibration, and the layer that
+ * persists a calibration has to agree with the layer that applies it - when the two disagreed, a
+ * saved calibration could be rejected at apply time with nothing to show for it.
+ */
+bool lvgl_pointer_calibration_is_valid(const struct LvglPointerCalibration* calibration);
+
+/**
  * @brief Sets (or clears, when calibration is NULL) the calibration applied to raw coordinates
  * read from the device before they are written into LVGL indev data, on an indev previously
  * created with lvgl_pointer_add(). Applies to every slot of the same physical device (one panel,
@@ -52,7 +71,7 @@ struct LvglPointerCalibration {
  * @param[in] calibration the calibration range to apply, or NULL to clear/disable calibration
  * @retval ERROR_NONE on success
  * @retval ERROR_INVALID_ARGUMENT if indev is NULL, or calibration is non-NULL but invalid
- *         (x_max <= x_min, y_max <= y_min, or either span smaller than the minimum allowed range)
+ *         (see lvgl_pointer_calibration_is_valid())
  */
 error_t lvgl_pointer_set_calibration(lv_indev_t* indev, const struct LvglPointerCalibration* calibration);
 

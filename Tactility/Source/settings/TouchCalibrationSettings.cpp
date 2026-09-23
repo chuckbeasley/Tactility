@@ -80,10 +80,23 @@ TouchCalibrationSettings getDefault() {
 }
 
 bool isValid(const TouchCalibrationSettings& settings) {
-    constexpr auto MIN_RANGE = 20;
-    return settings.xMax > settings.xMin && settings.yMax > settings.yMin &&
-        (settings.xMax - settings.xMin) >= MIN_RANGE &&
-        (settings.yMax - settings.yMin) >= MIN_RANGE;
+    // Delegated rather than reimplemented: the pointer layer rejects a calibration by this same rule
+    // at apply time, and two copies of it drift - at which point a calibration that saves fine can
+    // silently fail to apply.
+    const LvglPointerCalibration calibration = toPointerCalibration(settings);
+    return lvgl_pointer_calibration_is_valid(&calibration);
+}
+
+LvglPointerCalibration toPointerCalibration(const TouchCalibrationSettings& settings) {
+    return LvglPointerCalibration {
+        .x_min = settings.xMin,
+        .x_max = settings.xMax,
+        .y_min = settings.yMin,
+        .y_max = settings.yMax,
+        .rotate_xy = settings.rotateXy,
+        .invert_x = settings.invertX,
+        .invert_y = settings.invertY,
+    };
 }
 
 bool load(TouchCalibrationSettings& settings) {

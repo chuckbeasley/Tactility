@@ -333,15 +333,9 @@ void finishCalibration(Context* ctx) {
         return;
     }
 
-    LvglPointerCalibration calibration = {
-        .x_min = xMin,
-        .x_max = xMax,
-        .y_min = yMin,
-        .y_max = yMax,
-        .rotate_xy = rotate_xy,
-        .invert_x = invert_x,
-        .invert_y = invert_y,
-    };
+    // The calibration just saved, converted once and applied from that one representation rather
+    // than building the pointer struct by hand beside the settings struct.
+    const LvglPointerCalibration calibration = settings::touch::toPointerCalibration(settings);
     auto* indev = lvgl_pointer_get_default();
     if (indev != nullptr) {
         lvgl_pointer_set_calibration(indev, &calibration);
@@ -501,15 +495,7 @@ int32_t appMain(int argc, char* argv[]) {
         lvgl_lock();
         auto* endIndev = lvgl_pointer_get_default();
         if (endIndev != nullptr && settings::touch::load(settings) && settings.enabled && settings::touch::isValid(settings)) {
-            LvglPointerCalibration calibration = {
-                .x_min = settings.xMin,
-                .x_max = settings.xMax,
-                .y_min = settings.yMin,
-                .y_max = settings.yMax,
-                .rotate_xy = settings.rotateXy,
-                .invert_x = settings.invertX,
-                .invert_y = settings.invertY,
-            };
+            const LvglPointerCalibration calibration = settings::touch::toPointerCalibration(settings);
             lvgl_pointer_set_calibration(endIndev, &calibration);
         }
         lvgl_unlock();

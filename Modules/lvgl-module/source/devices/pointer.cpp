@@ -18,9 +18,6 @@ static const TickType_t LVGL_POINTER_READ_TIMEOUT = pdMS_TO_TICKS(10);
 // indev created by other code (e.g. the deprecated HAL's own LVGL pointer registration).
 static lv_indev_t* default_pointer_indev = NULL;
 
-// Mirrors Tactility/Source/settings/TouchCalibrationSettings.cpp's isValid().
-static const int32_t LVGL_POINTER_CALIBRATION_MIN_RANGE = 20;
-
 // Caps nearest-neighbor slot tracking (lvgl_pointer_pool_assign) to a fraction of screen width,
 // so a lifted finger's slot doesn't jump to grab an unrelated new touch elsewhere on screen.
 // Scaled by resolution, not a flat pixel value, so it stays proportionate on any display size.
@@ -76,7 +73,9 @@ static struct LvglPointerPool* lvgl_pointer_pool_from_indev(lv_indev_t* indev) {
     return (struct LvglPointerPool*)wrapper->context;
 }
 
-static bool lvgl_pointer_calibration_is_valid(const struct LvglPointerCalibration* calibration) {
+// The one rule for a usable calibration; the settings layer calls this rather than keeping its own
+// copy, so the two cannot disagree about what may be saved versus what may be applied.
+bool lvgl_pointer_calibration_is_valid(const struct LvglPointerCalibration* calibration) {
     return calibration->x_max > calibration->x_min &&
         calibration->y_max > calibration->y_min &&
         (calibration->x_max - calibration->x_min) >= LVGL_POINTER_CALIBRATION_MIN_RANGE &&

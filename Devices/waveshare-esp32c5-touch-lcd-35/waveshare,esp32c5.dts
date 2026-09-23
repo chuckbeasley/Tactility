@@ -253,15 +253,21 @@
 		// R1=0x01 at its own CS (GPIO9). No card-detect, write-protect or interrupt pin is wired,
 		// so the node declares none.
 		//
-		// 4MHz: the card mounts and its FAT volume lists at this rate, which is what is verified. The
-		// first mount attempt failed in a way that looked like a bus or clock problem - the card
-		// answered commands (R1=0x05, so powered and talking) but never left idle, at both 20MHz and
-		// 4MHz and identically with the panel disabled - and it was a badly seated card: reseating it
-		// mounted immediately. So 20MHz was never fairly tested and is left alone rather than guessed
-		// at; this is a shared bus, and a conservative clock costs little here.
+		// 20MHz, measured rather than assumed. The first mount attempt failed in a way that looked
+		// like a bus or clock problem - the card answered commands (R1=0x05, so powered and talking)
+		// but never left idle at both 20MHz and 4MHz, identically with the panel disabled - and it
+		// was a badly seated card: reseating it mounted immediately. 4MHz was left in place after
+		// that without ever being compared to anything.
+		//
+		// When it finally was compared, with a probe writing and reading back 2MB of its own on the
+		// card, 20MHz roughly doubled the throughput: 4096-byte reads 339 -> 742 KB/s and 32768-byte
+		// reads 355 -> 905 KB/s (writes 331 and 468 KB/s, not measured at 4MHz). The card reports
+		// 20MHz as its own limit ("Speed: 20.00 MHz (limit: 20.00 MHz)"), so this asks for exactly
+		// what it offers and the driver clamps to it. The panel shares this bus, which is why the
+		// rate is the card's limit rather than a round number above it.
 		sdcard@1 {
 			compatible = "espressif,esp32-sdspi";
-			frequency-khz = <4000>;
+			frequency-khz = <20000>;
 		};
 	};
 };

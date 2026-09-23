@@ -449,15 +449,7 @@ static void applySavedTouchCalibration() {
         return;
     }
 
-    LvglPointerCalibration calibration = {
-        .x_min = settings.xMin,
-        .x_max = settings.xMax,
-        .y_min = settings.yMin,
-        .y_max = settings.yMax,
-        .rotate_xy = settings.rotateXy,
-        .invert_x = settings.invertX,
-        .invert_y = settings.invertY,
-    };
+    LvglPointerCalibration calibration = settings::touch::toPointerCalibration(settings);
 
     lvgl_lock();
     auto* indev = lvgl_pointer_get_default();

@@ -32,15 +32,24 @@ namespace tt::service::wifi {
 constexpr auto* TAG = "WifiService";
 constexpr auto AUTO_SCAN_INTERVAL = 10000; // ms
 
-// Consecutive failed association attempts after which auto-connect stops on its own. Measured on this
-// board against cb2enterprises5G: every attempt reaches "wifi:state: assoc -> run (0x10)" and is torn
-// down again with "run -> init (0xf00)" about three seconds later, IP_EVENT_STA_GOT_IP never arrives,
-// and the service used to scan and re-associate every 15 seconds for as long as the board was on.
+// Auto-connect never gives up, but the wait between attempts doubles for each consecutive failure
+// and stops growing at AUTO_CONNECT_MAX_BACKOFF_MS. Measured on this board against
+// cb2enterprises5G, every failed attempt reaches "wifi:state: assoc -> run (0x10)" and is torn down
+// again with "run -> init (0xf00)" about three seconds later, IP_EVENT_STA_GOT_IP never arrives, and
+// the service used to scan and re-associate every 15 seconds for as long as the board was on.
 // Each attempt is a transmit burst that pulls the battery supply down far enough to stop the touch
 // panel's capacitive sensing (measured: on battery, touch works with the radio off and fails with it
-// on; on USB both work because the supply is ample). Three attempts ride out a genuine AP restart
-// without leaving the radio retrying forever.
-constexpr uint8_t AUTO_CONNECT_MAX_FAILURES = 3;
+// on; on USB both work because the supply is ample).
+//
+// This was a hard stop after three failures until it was measured in anger: this board's link drops
+// its association for seconds at a time (an antenna-less WROOM-1U module; see device.properties),
+// so three bad attempts in a row happen on their own, and the hard stop left the device off the
+// network with nothing but a manual connect to bring it back - which is a poor trade for a device
+// whose whole point is being reachable. A capped backoff keeps what the hard stop was protecting
+// (the retry burst gets rarer - 15s, 30s, 1m, 2m, then 5m - instead of every 15s forever) while
+// still recovering by itself when the AP or the link comes back.
+constexpr uint32_t AUTO_CONNECT_BASE_BACKOFF_MS = 15000;
+constexpr uint32_t AUTO_CONNECT_MAX_BACKOFF_MS = 300000;
 
 const char* radioStateToString(RadioState state) {
     switch (state) {
@@ -89,11 +98,13 @@ struct WifiServiceState {
     std::atomic<bool> externalScanPause{false};
     bool connectionTargetRemember = false;
     settings::WifiApSettings connectionTarget;
-    // Connection attempts that ended without an IP, counted consecutively. Auto-connect stops at
-    // AUTO_CONNECT_MAX_FAILURES and only a manual connect() clears the count. Atomic because the
-    // failures are recorded on the wifi-events thread (connection results) and read on the main task
+    // Connection attempts that ended without an IP, counted consecutively. The count sets the wait
+    // before the next automatic attempt (see autoConnectBackoffMs()). Atomic because the failures are
+    // recorded on the wifi-events thread (connection results) and read on the main task
     // (dispatchAutoConnect()/shouldScanForAutoConnect()) as well as by whichever task calls connect().
     std::atomic<uint8_t> autoConnectFailures{0};
+    // Wall-clock milliseconds before which no automatic attempt may be made. 0 means "no backoff".
+    std::atomic<uint32_t> autoConnectNotBeforeMs{0};
     uint16_t scanRecordLimit = TT_WIFI_SCAN_RECORD_LIMIT;
     TickType_t lastScanTime = MAX_TICKS;
     std::unique_ptr<Timer> autoConnectTimer;
@@ -242,23 +253,43 @@ void dispatchScan() {
     }
 }
 
-// ---- Auto-connect retry budget ----
+// ---- Auto-connect retry backoff ----
 
-// Records one connection attempt that ended without an IP. At AUTO_CONNECT_MAX_FAILURES in a row,
-// auto-connect stops: the failure has repeated identically every time, and each retry costs a scan
-// plus an association burst on the supply that the touch panel shares (see the constant's comment).
-// Both manual and automatic attempts are counted - connect() clears the count before a manual one, so
-// a manual attempt that fails costs one of the budget rather than being exempt from it.
+// The wait after `failures` consecutive failures: 15s, 30s, 1m, 2m, 5m, then 5m for ever.
+uint32_t autoConnectBackoffMs(uint8_t failures) {
+    if (failures == 0) {
+        return 0;
+    }
+    // Shift-capped so a device left failing for days cannot overflow its way back to a short wait.
+    const uint8_t doublings = failures > 5 ? 5 : (uint8_t)(failures - 1);
+    const uint32_t delay = AUTO_CONNECT_BASE_BACKOFF_MS << doublings;
+    return delay > AUTO_CONNECT_MAX_BACKOFF_MS ? AUTO_CONNECT_MAX_BACKOFF_MS : delay;
+}
+
+// Records one connection attempt that ended without an IP, and pushes the next automatic attempt out
+// by a delay that grows with each consecutive failure (see the constants above for why). Both manual
+// and automatic attempts are counted - connect() clears the count before a manual one, so a manual
+// attempt that fails starts the backoff over rather than being exempt from it.
 void recordConnectionFailure(const char* ssid) {
     const auto failures = state.autoConnectFailures.fetch_add(1) + 1;
-    if (failures != AUTO_CONNECT_MAX_FAILURES) {
-        return;
-    }
+    const uint32_t backoffMs = autoConnectBackoffMs(failures);
+    state.autoConnectNotBeforeMs.store(get_millis() + backoffMs);
     LOG_W(TAG,
-        "Auto-connect stopped after %u consecutive attempts to %s failed: the station reaches run and is "
-        "torn down again within seconds, without ever getting an IP, so retrying only repeats the "
-        "scan-and-associate burst every 15s that drops touch sensing on battery. Connect manually to try again.",
-        (unsigned)failures, ssid);
+        "Attempt %u to %s failed (no IP): the station reaches run and is torn down again within seconds. "
+        "Next automatic attempt in %u s.",
+        (unsigned)failures, ssid, (unsigned)(backoffMs / 1000));
+}
+
+/** Clears the retry budget: called on any connection that got an IP, and by a manual connect(). */
+void clearConnectionFailures() {
+    state.autoConnectFailures = 0;
+    state.autoConnectNotBeforeMs.store(0);
+}
+
+/** Whether the backoff that followed the last failure has elapsed. */
+bool autoConnectBackoffElapsed() {
+    const uint32_t notBefore = state.autoConnectNotBeforeMs.load();
+    return notBefore == 0 || (int32_t)(get_millis() - notBefore) >= 0;
 }
 
 void dispatchConnect() {
@@ -286,9 +317,9 @@ void dispatchConnect() {
     }
 }
 
-// The shared body of connect(). The public entry point clears the failure count first; the automatic
-// path in dispatchAutoConnect() deliberately does not, because an automatic attempt that reset the
-// count would make AUTO_CONNECT_MAX_FAILURES unreachable.
+// The shared body of connect(). The public entry point clears the failure count and the backoff
+// first; the automatic path in dispatchAutoConnect() deliberately does not, because an automatic
+// attempt that reset them would keep retrying at the base interval for ever.
 void startConnection(const settings::WifiApSettings& ap, bool remember) {
     LOG_I(TAG, "connect(%s, %d)", ap.ssid.c_str(), (int)remember);
     if (!started || state.device == nullptr) return;
@@ -345,9 +376,9 @@ bool findAutoConnectAp(settings::WifiApSettings& out) {
 
 void dispatchAutoConnect() {
     LOG_I(TAG, "dispatchAutoConnect()");
-    if (state.autoConnectFailures >= AUTO_CONNECT_MAX_FAILURES) {
-        // Gave up on the saved AP after AUTO_CONNECT_MAX_FAILURES attempts in a row; the last failure
-        // already logged why. Nothing automatic clears this - only a manual connect() does.
+    if (!autoConnectBackoffElapsed()) {
+        // A recent attempt failed, so this one waits out the backoff. The failure already logged the
+        // wait it set; nothing here repeats it, because this runs on every SCAN_FINISHED.
         return;
     }
     if (state.pauseAutoConnect || state.externalScanPause.load() || !isRadioOn()) {
@@ -378,10 +409,11 @@ void dispatchAutoConnect() {
 }
 
 bool shouldScanForAutoConnect() {
-    // The periodic scan exists only to find an auto-connect AP, so once auto-connect has given up it
-    // would just keep putting transmit bursts on the supply that stopping the retries removed. Scans
-    // requested by apps (e.g. WifiManage on show) go through scan() and are unaffected.
-    if (state.autoConnectFailures >= AUTO_CONNECT_MAX_FAILURES) return false;
+    // A backoff after a failed attempt gates the periodic scan too, not just the attempt: the scan
+    // exists only to serve auto-connect, and letting it run would put a transmit burst on the supply
+    // that stopping the attempt was meant to avoid. Scans requested by apps (e.g. WifiManage on show)
+    // go through scan() and are unaffected.
+    if (!autoConnectBackoffElapsed()) return false;
 
     bool radio_scannable = getRadioState() == RadioState::On && !isScanning() &&
         !state.pauseAutoConnect && !state.externalScanPause.load();
@@ -441,7 +473,7 @@ void onWifiDeviceEvent(Device* device, ::WifiEvent event) {
                     }
                 }
                 // A connection that got an IP clears the retry budget: whatever was wrong is gone.
-                state.autoConnectFailures = 0;
+                clearConnectionFailures();
                 LOG_I(TAG, "Connected to %s", target.ssid.c_str());
                 if (remember && !settings::save(target)) {
                     LOG_E(TAG, "Failed to store credentials");
@@ -512,9 +544,9 @@ bool isScanning() {
 
 void connect(const settings::WifiApSettings& ap, bool remember) {
     // A manual request always goes through, and re-arms auto-connect: the user asking for this AP
-    // (possibly after correcting its password) is new information, so it gets a fresh budget of
-    // attempts even after the automatic ones in AUTO_CONNECT_MAX_FAILURES are used up.
-    state.autoConnectFailures = 0;
+    // (possibly after correcting its password) is new information, so it starts from a clean budget
+    // and no backoff.
+    clearConnectionFailures();
     startConnection(ap, remember);
 }
 

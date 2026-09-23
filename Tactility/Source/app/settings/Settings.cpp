@@ -118,7 +118,11 @@ extern const ::AppManifest manifest = {
     .category = APP_CATEGORY_SYSTEM,
     .location = { .type = APP_LOCATION_MEMORY, .location = reinterpret_cast<void*>(appMain) },
     .flags = APP_MANIFEST_FLAG_HIDDEN,
-    .stack = { .depth = 2400, .desired_memory_capability = 0 },
+    // 16 KB. It was 9.6 KB and measured only 668 bytes free with the list up - and the peak comes
+    // from building that list, where each row costs this board roughly half a kilobyte of stack
+    // (measured on the Bluetooth app, which overflowed from exactly that). 668 bytes is one more
+    // settings app away from a crash, so the headroom is now about seven rows' worth instead.
+    .stack = { .depth = 4096, .desired_memory_capability = 0 },
 };
 
 } // namespace
