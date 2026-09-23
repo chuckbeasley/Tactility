@@ -103,4 +103,13 @@ menu "Tactility App"
         bool "Set true when a touch screen calibration is required before the device is usable"
         default n
         depends on TT_TOUCH_CALIBRATION_SUPPORTED
+    config TT_IMU_SUPPORTED
+        bool "Set true when the board has a QMI8658 IMU to show in Settings"
+        default n
+        help
+            Includes the Motion app, which reads the QMI8658 through its driver and shows live
+            accelerometer and gyroscope values with a tilt indicator. Set from the device's
+            hardware.imu property, and only for boards that also list Drivers/qmi8658-module in
+            devicetree.yaml: the app calls that driver directly, so the two have to agree or the
+            build fails to link.
 endmenu

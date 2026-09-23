@@ -356,6 +356,15 @@ def write_touch_calibration_variables(output_file, device_properties: dict):
             output_file.write("CONFIG_TT_TOUCH_CALIBRATION_REQUIRED=y\n")
 
 
+def write_imu_variables(output_file, device_properties: dict):
+    # Only for boards that both have the chip and list Drivers/qmi8658-module in devicetree.yaml -
+    # the Motion app calls that driver directly.
+    imu = get_property_or_none(device_properties, "hardware.imu")
+    if imu is not None and imu.lower() == "qmi8658":
+        output_file.write("# Motion app (QMI8658 IMU)\n")
+        output_file.write("CONFIG_TT_IMU_SUPPORTED=y\n")
+
+
 def write_usb_variables(output_file, device_properties: dict):
     has_tiny_usb_msc = get_boolean_property_or_false(device_properties, "hardware.tinyUsbMsc")
     has_tiny_usb_hid = get_boolean_property_or_false(device_properties, "hardware.tinyUsbHid")
@@ -465,6 +474,7 @@ def write_properties(output_file, device_properties: dict, device_id: str, is_de
     write_usbhost_variables(output_file, device_properties)
     write_lvgl_variables(output_file, device_properties)
     write_touch_calibration_variables(output_file, device_properties)
+    write_imu_variables(output_file, device_properties)
     # Keep explicit board overrides last so they win over generated defaults.
     write_custom_sdkconfig(output_file, device_properties)
 

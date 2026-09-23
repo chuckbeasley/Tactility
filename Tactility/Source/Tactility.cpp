@@ -180,6 +180,9 @@ namespace app {
     namespace setup { extern const ::AppManifest manifest; }
     namespace systeminfo { extern const ::AppManifest manifest; }
     namespace timedatesettings { extern const ::AppManifest manifest; }
+#ifdef CONFIG_TT_IMU_SUPPORTED
+    namespace motion { extern const ::AppManifest manifest; }
+#endif
 #ifdef CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED
     namespace touchcalibration { extern const ::AppManifest manifest; }
 #endif
@@ -251,6 +254,9 @@ static void registerInternalApps() {
     app_manager_add(&app::setup::manifest);
     app_manager_add(&app::systeminfo::manifest);
     app_manager_add(&app::timedatesettings::manifest);
+#ifdef CONFIG_TT_IMU_SUPPORTED
+    app_manager_add(&app::motion::manifest);
+#endif
 #ifdef CONFIG_TT_TOUCH_CALIBRATION_SUPPORTED
     app_manager_add(&app::touchcalibration::manifest);
 #endif

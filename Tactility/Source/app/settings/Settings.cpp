@@ -118,10 +118,13 @@ extern const ::AppManifest manifest = {
     .category = APP_CATEGORY_SYSTEM,
     .location = { .type = APP_LOCATION_MEMORY, .location = reinterpret_cast<void*>(appMain) },
     .flags = APP_MANIFEST_FLAG_HIDDEN,
-    // 16 KB. It was 9.6 KB and measured only 668 bytes free with the list up - and the peak comes
-    // from building that list, where each row costs this board roughly half a kilobyte of stack
-    // (measured on the Bluetooth app, which overflowed from exactly that). 668 bytes is one more
-    // settings app away from a crash, so the headroom is now about seven rows' worth instead.
+    // 16 KB, raised from 9.6 KB. The raise was made while chasing a "668 bytes free" reading from
+    // uxTaskGetStackHighWaterMark(), which turned out to be worthless on this build - the same call
+    // reports 5,664 bytes free on a fresh 24 KB stack before the task has run any of its own code, so
+    // it is not finding FreeRTOS' fill pattern. It stays at 16 KB on the strength of what is real:
+    // this list costs roughly half a kilobyte of stack per row (measured on the Bluetooth app, which
+    // overflowed from exactly that), the row count grows with every settings app installed, and the
+    // Motion screen - the same shape of LVGL work - died at 6 KB and is happy here.
     .stack = { .depth = 4096, .desired_memory_capability = 0 },
 };
 
