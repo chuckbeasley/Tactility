@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// Media player: WAV, MP3 and FLAC files from storage and MP3 internet radio, played through the
-// audio stream device.
+// Media player: MP3, WAV, FLAC and M4A/AAC files from storage, and MP3 or ADTS-AAC internet radio,
+// played through the audio stream device.
 //
 // Why the format handling is one call: decoding is delegated to Espressif's audio simple decoder
 // (espressif/esp_audio_codec), which owns both the container parsing and the codec. That matters
@@ -421,6 +421,10 @@ esp_audio_simple_dec_type_t typeForName(const std::string& name) {
     if (endsWithIgnoreCase(name, ".mp3")) return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
     if (endsWithIgnoreCase(name, ".wav")) return ESP_AUDIO_SIMPLE_DEC_TYPE_WAV;
     if (endsWithIgnoreCase(name, ".flac")) return ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC;
+    // AAC in an MP4 container. Raw ADTS AAC files go through the plain AAC decoder instead, which is
+    // the same path an ADTS stream takes.
+    if (endsWithIgnoreCase(name, ".m4a") || endsWithIgnoreCase(name, ".mp4")) return ESP_AUDIO_SIMPLE_DEC_TYPE_M4A;
+    if (endsWithIgnoreCase(name, ".aac")) return ESP_AUDIO_SIMPLE_DEC_TYPE_AAC;
     return ESP_AUDIO_SIMPLE_DEC_TYPE_NONE;
 }
 
@@ -540,15 +544,16 @@ esp_audio_simple_dec_type_t sniffStreamType(const uint8_t* data, size_t length) 
     if (data[0] == 0xFF && (data[1] & 0xE0) == 0xE0) {
         return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
     }
-    // Ogg page capture pattern.
-    if (memcmp(data, "OggS", 4) == 0) {
-        return ESP_AUDIO_SIMPLE_DEC_TYPE_OGG;
-    }
-    // ID3v2 tag: skip it in principle, but a stream that starts with one is MP3 in practice.
+    // ID3v2 tag: skipping it is the decoder's business, but a stream that starts with one is MP3 in
+    // practice.
     if (memcmp(data, "ID3", 3) == 0) {
         return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
     }
 
+    // Ogg is deliberately not recognised, and the OGG branch that used to be here is gone with the
+    // Vorbis decoder: the codec library is built with only the formats this player offers (see the
+    // audio codec block in the device's sdkconfig), so claiming a stream format here would only turn
+    // into "no decoder" a moment later. An Ogg stream now reports as unrecognised instead.
     return ESP_AUDIO_SIMPLE_DEC_TYPE_NONE;
 }
 
@@ -1416,7 +1421,7 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_obj_set_flex_grow(ctx->listWidget, 1);
     if (ctx->tracks.empty()) {
         lv_list_add_text(ctx->listWidget, "No audio files found");
-        lv_list_add_text(ctx->listWidget, "Put .mp3/.wav/.flac in /sdcard");
+        lv_list_add_text(ctx->listWidget, "Put .mp3/.wav/.flac/.m4a in /sdcard");
     } else {
         for (size_t i = 0; i < ctx->tracks.size(); ++i) {
             auto* button = lv_list_add_button(ctx->listWidget, LV_SYMBOL_AUDIO, ctx->tracks[i].name.c_str());
