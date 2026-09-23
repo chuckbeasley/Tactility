@@ -112,4 +112,29 @@ menu "Tactility App"
             hardware.imu property, and only for boards that also list Drivers/qmi8658-module in
             devicetree.yaml: the app calls that driver directly, so the two have to agree or the
             build fails to link.
+    config TT_APP_DEFAULT_STACK_BYTES
+        int "Default app task stack, in bytes"
+        default 8192
+        range 2048 16384
+        help
+            Stack given to an app instance that does not declare one of its own (39 of the 51 apps in
+            this tree today). Raise it per device with a `sdkconfig.CONFIG_TT_APP_DEFAULT_STACK_BYTES`
+            line in that device's device.properties - the same override path as every other
+            board-specific setting. The unit is bytes: on this tree's RISC-V targets FreeRTOS' stack
+            "depth" is a byte count (portSTACK_TYPE is uint8_t), and the range's upper bound is
+            APP_STACK_SIZE_MAX, the largest stack any app may ask for.
+
+            The default is deliberately small because app stacks come from internal RAM: on this
+            kernel they are never allocated in PSRAM (`CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY` and
+            `CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM` are both off for boards whose stacks may be
+            touched while the cache is disabled). A board with 384 KB of SRAM and 8 MB of PSRAM can
+            afford a larger one than a 4 MB board with no PSRAM at all, and apps fail to launch with
+            "Failed to allocate app stack" when internal RAM runs out - so the size belongs to the
+            device, not to this default. Measured on the Waveshare C5 board: 24 KB per instance left
+            room for the launcher plus exactly one more app, 12 KB for several.
+
+            What the screens actually need, from this tree's history: an LVGL list costs roughly half
+            a kilobyte of stack per rendered row (the Bluetooth app overflowed at 8 KB while building
+            up to 60 rows, and the Motion screen died at 1.5 KB inside LVGL's style walk). Screens
+            that declare their own size ask for 2.4 KB to 12 KB, the heavier ones clustering at 4-8 KB.
 endmenu

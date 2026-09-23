@@ -438,23 +438,26 @@ extern const ::AppManifest manifest = {
     .name = "Bluetooth",
     .category = APP_CATEGORY_SETTINGS,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
-    // 32 KB, sized against the row cap in View.cpp - the two are one budget.
+    // 8 KB, sized against the row cap in View.cpp - the two are one budget. NOTE the unit: stack
+    // depths in this tree are BYTES, not words (ESP-IDF's RISC-V ports make portSTACK_TYPE uint8_t -
+    // see APP_STACK_SIZE_MAX in app/manifest.h). The sizes below were originally written up as four
+    // times their real value before that was noticed, so the "16/24/32 KB" this comment used to
+    // quote were the depths 4096/6144/8192 bytes.
     //
     // This app's list rebuild costs roughly 500 bytes of stack per rendered row and does not give it
     // back until the rebuild returns, so its stack requirement scales with how many rows the cap
     // allows. Measured with uxTaskGetSystemState under the same workload, that is why a larger stack
-    // never "fixed" the fault on its own: the overflow was truncating the rebuild, so 16 KB stopped
-    // at ~30 rows with 92 bytes left, 24 KB reached ~45 rows, and 32 KB rendered all 60 (30 paired
-    // + 30 available) with 4184 bytes to spare. The row cap is what bounds the peak; this size fits
-    // that bound.
+    // never "fixed" the fault on its own: the overflow was truncating the rebuild, so 4 KB stopped
+    // at ~30 rows, 6 KB reached ~45 rows, and 8 KB rendered all 60 (30 paired + 30 available). The
+    // row cap is what bounds the peak; this size fits that bound.
     //
-    // The earlier note here said 32 KB had been tried and did not fix the fault, and that its extra
+    // The earlier note here said 8 KB had been tried and did not fix the fault, and that its extra
     // internal RAM starved the Bluetooth driver. Both parts are stale: that attempt predates the
     // coalesced refresh, the row cap and the snprintf change, and with those in place the RAM cost is
-    // affordable - measured with both this app and BleToolbox (48 KB of stack) open, internal heap
+    // affordable - measured with both this app and BleToolbox (12 KB of stack) open, internal heap
     // holds 33927 bytes free with a 15360-byte largest block, and the driver logs no allocation
     // failures while scanning.
-    .stack = { .depth = 8192 }, // 32 KB
+    .stack = { .depth = 8192 }, // 8 KB
 };
 
 } // namespace tt::app::btmanage

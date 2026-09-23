@@ -1261,8 +1261,9 @@ extern const ::AppManifest manifest = {
     // bytes free of its 6,144-byte stack, i.e. 4,984 bytes used at peak. The stack depth here is in
     // BYTES, not words - StackType_t is one byte on IDF's RISC-V port - so the 6144 this used to say
     // bought 6 KB, not the 24 KB its comment claimed, and it was below the 8 KB default it was meant
-    // to exceed. 12,288 is 2.5x the measured peak, still well under APP_STACK_SIZE_MAX (64 KB), and
-    // is only held while this app is open.
+    // to exceed. 12,288 is 2.5x the measured peak and is only held while this app is open.
+    // APP_STACK_SIZE_MAX itself is 16,384 bytes (16 KB) on these targets, not the 64 KB this comment
+    // used to name: it is a byte count too.
     .stack = { .depth = 12288 },
 };
 

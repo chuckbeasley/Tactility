@@ -241,9 +241,11 @@ void View::updatePeerList() {
     //
     // This cap is load-bearing for the task's stack size, not just for legibility: measured with
     // uxTaskGetSystemState, each rendered row costs roughly 500 bytes of stack that is not given
-    // back until the rebuild returns - 16 KB held ~30 rows, 24 KB ~45, and 32 KB rendered all 60
-    // (30 paired + 30 available) with 4184 bytes left. Raising this number therefore needs the
-    // manifest's stack raised with it; the two are one budget.
+    // back until the rebuild returns - 4 KB held ~30 rows, 6 KB ~45, and 8 KB rendered all 60
+    // (30 paired + 30 available). (Those were called 16/24/32 KB here until the unit was checked:
+    // stack depths in this tree are bytes, not words - see APP_STACK_SIZE_MAX in app/manifest.h.)
+    // Raising this number therefore needs the manifest's stack raised with it; the two are one
+    // budget.
     constexpr size_t MAX_VISIBLE_PEERS = 30;
 
     lv_obj_clean(peers_list);

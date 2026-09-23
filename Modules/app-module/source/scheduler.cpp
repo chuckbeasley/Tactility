@@ -32,10 +32,20 @@ constexpr size_t APP_INSTANCE_ID_THREAD_SLOT_INDEX = 1;
 // Matches TactilityKernel's Thread wrapper's THREAD_PRIORITY_NORMAL.
 constexpr UBaseType_t APP_TASK_PRIORITY = 4;
 
-// Used when an app's manifest doesn't request a specific stack depth (0). 8192 bytes' worth.
-// Keep this modest so it fits in internal RAM: a larger default makes apps fail to launch with
-// "Failed to allocate app stack" once the LVGL render task has taken its own internal-RAM stack.
-constexpr size_t APP_DEFAULT_STACK_DEPTH = 8192 / sizeof(StackType_t);
+// Used when an app's manifest doesn't request a specific stack depth (0) - which is most of them: 39
+// of the 51 apps in this tree. The value is per device (CONFIG_TT_APP_DEFAULT_STACK_BYTES, default
+// 8 KB) because it has to balance two opposing facts. App stacks are internal RAM and never PSRAM on
+// this kernel, so a big default is what makes apps fail to launch with "Failed to allocate app stack"
+// once the LVGL render task and the radio have taken theirs; but a small one is what makes an
+// LVGL-heavy screen die inside its own style walk, which is how this default came up at all. Boards
+// with PSRAM and 384 KB of SRAM can afford more than a 4 MB board with none, so the number lives in
+// the device profile (see the option's help for what the screens actually need).
+//
+// The unit is StackType_t, i.e. BYTES on this tree's RISC-V targets - see the note on
+// APP_STACK_SIZE_MAX in app/manifest.h. Sized against the measured cost rather than assumed: on this
+// board a 24 KB default let the launcher and exactly one more app run before the third failed to
+// allocate, while 12 KB leaves room for several.
+constexpr size_t APP_DEFAULT_STACK_DEPTH = CONFIG_TT_APP_DEFAULT_STACK_BYTES / sizeof(StackType_t);
 
 // Task control blocks must stay in internal RAM; only the stack itself may live in external memory.
 constexpr MemoryPolicy APP_TASK_TCB_POLICY = { MEMORY_CAPABILITY_INTERNAL, 0, 0 };
@@ -326,6 +336,19 @@ error_t app_scheduler_start(AppInstanceId app_instance_id, AppLocation location,
         LOG_W(TAG, "[instance %lu] using default stack depth", app_instance_id);
     }
     size_t effective_stack_depth = stack.depth != 0 ? stack.depth : APP_DEFAULT_STACK_DEPTH;
+
+    // The bound applies to what is actually allocated, not just to what a manifest asked for: the
+    // default comes from a configurable option (CONFIG_TT_APP_DEFAULT_STACK_BYTES), and a default
+    // larger than the maximum used to sail straight past the check above.
+    if (effective_stack_depth > APP_STACK_SIZE_MAX) {
+        LOG_E(TAG, "[instance %lu] effective stack depth %u exceeds APP_STACK_SIZE_MAX(%u)", app_instance_id,
+              (unsigned)effective_stack_depth, APP_STACK_SIZE_MAX);
+        vSemaphoreDelete(completion->semaphore);
+        delete completion;
+        loader->unload(runtime);
+        app_arguments_free(argc, argv);
+        return ERROR_INVALID_ARGUMENT;
+    }
 
 #ifdef ESP_PLATFORM
     // ESP-IDF's FreeRTOS port has configSUPPORT_STATIC_ALLOCATION, POSIX doesn't

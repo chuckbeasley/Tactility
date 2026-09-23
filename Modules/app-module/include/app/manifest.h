@@ -28,14 +28,21 @@ enum AppManifestFlags {
     APP_MANIFEST_FLAG_HIDDEN = 1 >> 0,
 };
 
-/** Largest stack depth (in words) an app may request. Keeps `depth * sizeof(StackType_t)` safely
- * bounded and stops one app from claiming an unreasonable share of available RAM. A depth beyond
- * this must be rejected outright, not silently truncated or clamped. */
+/** Largest stack depth an app may request. Keeps `depth * sizeof(StackType_t)` safely bounded and
+ * stops one app from claiming an unreasonable share of available RAM. A depth beyond this must be
+ * rejected outright, not silently truncated or clamped.
+ *
+ * The unit is StackType_t units, i.e. BYTES on every RISC-V target in this tree: ESP-IDF's RISC-V
+ * ports define `portSTACK_TYPE` as `uint8_t`, so a FreeRTOS "depth" here is a byte count, not a word
+ * count as it is on Xtensa. 16384 is therefore 16 KB on this hardware, and a manifest asking for
+ * "8192" is asking for 8 KB. Getting this backwards is easy and silent - every stack in this tree was
+ * once written up as four times its real size because of it. */
 #define APP_STACK_SIZE_MAX 16384
 
 struct AppStackConfig {
-    /** Stack depth (in words, matching FreeRTOS's configSTACK_DEPTH_TYPE) for this app's task.
-     * 0 uses the scheduler's default. Must not exceed APP_STACK_SIZE_MAX. */
+    /** Stack depth in StackType_t units for this app's task - see APP_STACK_SIZE_MAX: that is BYTES
+     * on this tree's RISC-V targets, so 4096 means 4 KB. 0 uses the scheduler's default
+     * (CONFIG_TT_APP_DEFAULT_STACK_BYTES, also in bytes). Must not exceed APP_STACK_SIZE_MAX. */
     uint16_t depth;
     /** Desired memory capability.
      * 0 means default.

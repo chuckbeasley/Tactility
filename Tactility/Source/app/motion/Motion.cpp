@@ -294,13 +294,13 @@ extern const ::AppManifest manifest = {
     .name = "Motion",
     .category = APP_CATEGORY_SETTINGS,
     .location = { .type = APP_LOCATION_MEMORY, .location = reinterpret_cast<void*>(appMain) },
-    // 16 KB, and the honest state of the evidence is this: 6 KB crashed on launch with a stack
-    // protection fault inside lv_obj_get_style_prop(), and 16 KB has run stably since, including
-    // three concurrent instances (see the commit that added this). The exact peak is NOT known:
-    // uxTaskGetStackHighWaterMark() is not usable on this build - it reports 5,664 bytes free on a
-    // fresh 24 KB stack before the task has run a line of its own code, so its scan is not finding
-    // FreeRTOS' fill pattern and every "headroom" number it produces is meaningless. Sized to match
-    // the Settings screen, which does the same shape of LVGL work.
+    // 4 KB (stack depths here are bytes, not words - see APP_STACK_SIZE_MAX in app/manifest.h). The
+    // honest state of the evidence: 1,536 bytes crashed on launch with a stack protection fault
+    // inside lv_obj_get_style_prop(), and 4 KB has run stably since, including three concurrent
+    // instances. The exact peak is NOT known: uxTaskGetStackHighWaterMark() is not usable on this
+    // build - it reports 5,664 bytes free on a fresh 24 KB stack before the task has run a line of
+    // its own code, so its scan is not finding FreeRTOS' fill pattern and every "headroom" number it
+    // produces is meaningless.
     .stack = { .depth = 4096, .desired_memory_capability = 0 },
 };
 

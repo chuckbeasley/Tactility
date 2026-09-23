@@ -121,7 +121,10 @@ constexpr TickType_t RING_WRITE_WAIT = pdMS_TO_TICKS(500);
 constexpr TickType_t GAP_MIN_TICKS = pdMS_TO_TICKS(200);
 
 // Stack and chunk size for the writer task. It only ever copies out of the ring and calls the codec.
-constexpr uint32_t WRITER_STACK_WORDS = 3072 / sizeof(StackType_t);
+// Stack for the writer task, in StackType_t units - which is bytes on this tree's RISC-V targets
+// (see APP_STACK_SIZE_MAX in app/manifest.h). 3 KB was the intent and 768 units would have been the
+// old words-based reading; this is 3,072 bytes.
+constexpr uint32_t WRITER_STACK_SIZE = 3072;
 constexpr size_t WRITER_CHUNK_BYTES = 8192;
 
 struct Track {
@@ -1491,7 +1494,7 @@ int32_t appMain(int argc, char* argv[]) {
     if (writerPriority >= configMAX_PRIORITIES) {
         writerPriority = configMAX_PRIORITIES - 1;
     }
-    if (xTaskCreate(writerMain, "media_writer", WRITER_STACK_WORDS, &ctx, writerPriority, &ctx.writerTask) != pdPASS) {
+    if (xTaskCreate(writerMain, "media_writer", WRITER_STACK_SIZE, &ctx, writerPriority, &ctx.writerTask) != pdPASS) {
         LOG_E(TAG, "could not create the writer task");
         ringDestroy(ctx.ring);
         free(ctx.inputBuffer);
@@ -1578,11 +1581,12 @@ extern const ::AppManifest manifest = {
     .name = "Media Player",
     .category = APP_CATEGORY_USER,
     .location = { APP_LOCATION_MEMORY, reinterpret_cast<void*>(appMain) },
-    // 32 KB: rendering rows into an LVGL list costs close to a kilobyte of this task's stack per row
-    // on this board (measured on the Bluetooth app, which crashed from exactly that), and an https://
-    // stream adds a TLS handshake on top. Decoding now happens in this task while the writer task
-    // plays, but neither the list nor the TLS peak grows because of that - the writer has its own
-    // 3 KB stack.
+    // 8 KB (stack depths here are bytes, not words - see APP_STACK_SIZE_MAX in app/manifest.h, where
+    // this comment used to claim 32 KB). Rendering rows into an LVGL list costs close to half a
+    // kilobyte of this task's stack per row on this board (measured on the Bluetooth app, which
+    // crashed from exactly that), and an https:// stream adds a TLS handshake on top. Decoding now
+    // happens in this task while the writer task plays, but neither the list nor the TLS peak grows
+    // because of that - the writer has its own 3 KB stack.
     .stack = { .depth = 8192 },
 };
 
