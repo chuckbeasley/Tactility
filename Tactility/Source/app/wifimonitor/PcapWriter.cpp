@@ -1,5 +1,10 @@
 #include "PcapWriter.h"
 
+#include <Tactility/DeprecatedPaths.h>
+#include <Tactility/file/File.h>
+
+#include <tactility/log.h>
+
 #include <cstring>
 #include <cstdlib>
 
@@ -10,6 +15,12 @@
 namespace tt::app::wifimonitor {
 
 namespace {
+
+constexpr auto* TAG = "PcapWriter";
+
+// Subdirectory of the SD card's root that captures go into, so the card's own contents stay separate
+// from them. The same name is what the app screen shows the user.
+constexpr auto* SD_CAPTURE_SUBDIRECTORY = "captures";
 
 // PCAP global header constants (little-endian on ESP32, which is RISC-V LE).
 constexpr size_t RADIOTAP_HEADER_LEN = 16;
@@ -40,6 +51,22 @@ uint16_t channelToFlags(uint8_t channel) {
 }
 
 } // namespace
+
+std::string pcapCaptureDirectory() {
+    std::string sdcard_path;
+    if (findFirstMountedSdCardPath(sdcard_path)) {
+        std::string directory = sdcard_path + "/" + SD_CAPTURE_SUBDIRECTORY;
+        // A card can be mounted and still refuse the directory (read-only, or a filesystem with no
+        // space for another entry), and a capture that silently went to internal flash instead would
+        // be found in neither place by someone looking for it on the card. Falling through is still
+        // the better outcome than refusing to capture, but the log says which happened.
+        if (file::findOrCreateDirectory(directory, 0777)) {
+            return directory;
+        }
+        LOG_W(TAG, "Could not create %s; capturing to internal flash", directory.c_str());
+    }
+    return getUserHomePath();
+}
 
 PcapWriter::~PcapWriter() {
     close();

@@ -276,8 +276,10 @@ void onPacket(void* context, const uint8_t* payload, size_t length, WifiPromiscu
 int32_t captureWriterMain(void* context) {
     auto* ctx = static_cast<Context*>(context);
 
-    // Timestamped filename so consecutive captures don't overwrite each other.
-    std::string path = std::format("{}/wifi-monitor-{}.pcap", getUserHomePath(), (long long)esp_timer_get_time());
+    // Timestamped filename so consecutive captures don't overwrite each other. The directory follows
+    // the same rule as the Wi-Fi Toolbox's captures: the SD card when one is mounted, internal flash
+    // otherwise (see pcapCaptureDirectory()).
+    std::string path = std::format("{}/wifi-monitor-{}.pcap", tt::app::wifimonitor::pcapCaptureDirectory(), (long long)esp_timer_get_time());
     if (!ctx->writer.open(path.c_str())) {
         LOG_E(TAG, "Failed to open capture file %s", path.c_str());
         return 1;

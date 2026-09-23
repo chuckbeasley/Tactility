@@ -3,8 +3,24 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 namespace tt::app::wifimonitor {
+
+/**
+ * Directory a capture file belongs in, created if it does not exist yet.
+ *
+ * The first mounted SD card wins, under `<card>/captures`, so a capture can be read by pulling the
+ * card and opening the file in Wireshark instead of going back through the device for it. With no card
+ * mounted (or a card whose directory cannot be created) it falls back to the app's own directory on
+ * internal flash, so capturing keeps working and never silently writes somewhere the caller did not
+ * intend.
+ *
+ * Both capture apps call this rather than choosing a path themselves: they write the same kind of file,
+ * and a divergence here would put one app's captures somewhere the other's documentation does not
+ * mention.
+ */
+std::string pcapCaptureDirectory();
 
 /**
  * Writes captured 802.11 frames to a standard PCAP file with a per-packet

@@ -167,7 +167,6 @@ struct Context {
     uint32_t appInstanceId = 0;
     Screen screen = Screen::Main;
     Device* wifi = nullptr;
-
     // Capture counters.
     std::atomic<uint32_t> packetCount{0};
     std::atomic<uint32_t> eapolCount{0};
@@ -186,6 +185,9 @@ struct Context {
     RingbufHandle_t ringBuffer = nullptr;
     ::Thread* writerThread = nullptr;
     tt::app::wifimonitor::PcapWriter writer;
+    // Where the next capture's file goes: the SD card when one is mounted, internal flash otherwise.
+    // Chosen when the capture starts and kept, so the screen and the writer thread cannot disagree.
+    std::string captureDirectory;
     // Every frame the sniffer hands us, before any filtering. Without this there is no way to tell
     // "the radio is barely receiving" apart from "it is receiving plenty and the target-MAC filter
     // is rejecting nearly all of it" - Pkts only counts what survived the filter, so it answers
@@ -268,6 +270,7 @@ struct Context {
     lv_obj_t* body = nullptr;
     lv_obj_t* statusLabel = nullptr;
     lv_obj_t* statsLabel = nullptr;
+    lv_obj_t* pathLabel = nullptr;
     lv_obj_t* startButtonLabel = nullptr;
     lv_obj_t* resultLabel = nullptr;
 };
@@ -435,7 +438,9 @@ static void onPacket(void* context, const uint8_t* payload, size_t length, WifiP
 
 static int32_t captureWriterMain(void* context) {
     auto* ctx = static_cast<Context*>(context);
-    std::string path = std::format("{}/wifi-eapol-{}.pcap", getUserHomePath(), (long long)esp_timer_get_time());
+    // The directory was chosen on the app task when the capture started (see startCapture), not here:
+    // it is what the screen shows the user, and the two must not disagree about where the file went.
+    std::string path = std::format("{}/wifi-eapol-{}.pcap", ctx->captureDirectory, (long long)esp_timer_get_time());
     if (!ctx->writer.open(path.c_str())) {
         LOG_E(TAG, "Failed to open capture file %s", path.c_str());
         return 1;
@@ -497,6 +502,13 @@ static bool startCapture(Context* ctx) {
         return false;
     }
     joinWriter(ctx);
+
+    // Decide where this capture's file goes before anything else happens, so a failure to prepare the
+    // destination is reported as "the capture did not start" rather than as an empty capture. This
+    // creates the directory on the card when needed, which is a filesystem operation and does not
+    // belong on the writer thread, where it would look like a stalled capture.
+    ctx->captureDirectory = tt::app::wifimonitor::pcapCaptureDirectory();
+    LOG_I(TAG, "Capture directory: %s", ctx->captureDirectory.c_str());
 
     ctx->wifi = getWifiDevice();
     if (ctx->wifi == nullptr) {
@@ -1104,6 +1116,7 @@ static void ShowScreen(Context* ctx, Screen screen) {
     }
     ctx->statusLabel = nullptr;
     ctx->statsLabel = nullptr;
+    ctx->pathLabel = nullptr;
     ctx->startButtonLabel = nullptr;
     ctx->resultLabel = nullptr;
     switch (screen) {
@@ -1156,6 +1169,26 @@ static void showMainScreen(Context* ctx) {
 }
 
 // ---- Capture screen ----
+
+// Says where the PCAP file goes, because "the SD card if there is one" is exactly the kind of thing
+// that is invisible until someone goes looking for the file. While a capture is running this reports
+// the directory that capture actually opened its file in; otherwise it reports the directory the next
+// capture would choose, which is re-evaluated so a card inserted since the screen was built shows up.
+static void setCapturePathLabel(Context* ctx) {
+    if (ctx->pathLabel == nullptr) return;
+
+    std::string directory;
+#if defined(CONFIG_SOC_WIFI_SUPPORTED)
+    if (ctx->writerThread != nullptr && !ctx->captureDirectory.empty()) {
+        directory = ctx->captureDirectory;
+    }
+#endif
+    if (directory.empty()) {
+        directory = tt::app::wifimonitor::pcapCaptureDirectory();
+    }
+    lv_label_set_text_fmt(ctx->pathLabel, "PCAP: %s", directory.c_str());
+}
+
 static void onCaptureStartStop(lv_event_t* event) {
     auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
@@ -1173,7 +1206,12 @@ static void onCaptureStartStop(lv_event_t* event) {
         ctx->eapolCount = 0;
         ctx->pmkidCount = 0;
         ctx->deauthCount = 0;
-        startCapture(ctx);
+        // The label is refreshed on success because startCapture() re-chooses the directory: a card
+        // can have been inserted or removed since this screen was built, and the file follows the
+        // choice made now, not the one shown before.
+        if (startCapture(ctx)) {
+            setCapturePathLabel(ctx);
+        }
         if (ctx->autoDeauth) ctx->deauthTimer->start();
     }
 #endif
@@ -1280,6 +1318,8 @@ static void onCaptureDeauthToggled(lv_event_t* event) {
 static void showCaptureScreen(Context* ctx) {
     auto* label = lv_label_create(ctx->body);
     lv_label_set_text(label, "Captures 802.11 EAPOL/PMKID to PCAP.");
+    ctx->pathLabel = lv_label_create(ctx->body);
+    setCapturePathLabel(ctx);
     ctx->statusLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->statusLabel, "Stopped");
 
