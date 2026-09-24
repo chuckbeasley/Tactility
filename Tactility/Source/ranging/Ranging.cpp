@@ -4,6 +4,7 @@
 #include <Tactility/DeprecatedPaths.h>
 #include <Tactility/file/File.h>
 #include <Tactility/file/PropertiesFile.h>
+#include <Tactility/units/Units.h>
 
 #include <tactility/log.h>
 
@@ -253,14 +254,17 @@ Estimate estimateBleWithTxPower(float rssiDbm, int8_t txPower, const Calibration
 
 void formatBand(const Estimate& value, char* out, size_t outSize) {
     const float sigma_factor = (value.lowMeters > 0.0f) ? (value.meters / value.lowMeters) : 1.0f;
-    std::snprintf(out, outSize, "%s  %.1f-%.1f m  +/-%.1fx",
-        value.band, (double)value.lowMeters, (double)value.highMeters, (double)sigma_factor);
+    // The range goes through tt::units, so a reader who chose imperial gets feet - and the band name
+    // is deliberately unit-free ("same room", "within reach"), which is what keeps it a band rather
+    // than a measurement in either system.
+    const std::string range = units::formatDistanceRange(value.lowMeters, value.highMeters, 1);
+    std::snprintf(out, outSize, "%s  %s  +/-%.1fx", value.band, range.c_str(), (double)sigma_factor);
 }
 
 void formatBandCompact(const Estimate& value, char* out, size_t outSize) {
     const float sigma_factor = (value.lowMeters > 0.0f) ? (value.meters / value.lowMeters) : 1.0f;
-    std::snprintf(out, outSize, "~%.1f-%.1fm +/-%.1fx",
-        (double)value.lowMeters, (double)value.highMeters, (double)sigma_factor);
+    const std::string range = units::formatDistanceRange(value.lowMeters, value.highMeters, 1);
+    std::snprintf(out, outSize, "~%s +/-%.1fx", range.c_str(), (double)sigma_factor);
 }
 
 void RssiFilter::add(int8_t rssi) {

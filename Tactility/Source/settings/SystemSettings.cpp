@@ -57,6 +57,14 @@ static bool loadSystemSettingsFromFile(SystemSettings& properties) {
         properties.dateFormat = "MM/DD/YYYY";
     }
 
+    // Unit system. An absent key means the file predates the setting, and metric is what it has to
+    // mean: every stored measurement is metric and every screen showed metric before the choice
+    // existed, so treating "missing" as imperial would change what a user sees on upgrade.
+    auto unit_system_entry = map.find("unitSystem");
+    properties.unitSystem = (unit_system_entry != map.end() && unit_system_entry->second == "imperial")
+        ? UnitSystem::Imperial
+        : UnitSystem::Metric;
+
     LOG_I(TAG, "System settings loaded");
     return true;
 }
@@ -80,6 +88,7 @@ bool saveSystemSettings(const SystemSettings& properties) {
     map["language"] = toString(properties.language);
     map["timeFormat24h"] = properties.timeFormat24h ? "true" : "false";
     map["dateFormat"] = properties.dateFormat;
+    map["unitSystem"] = (properties.unitSystem == UnitSystem::Imperial) ? "imperial" : "metric";
 
     if (!file::findOrCreateParentDirectory(file_path, 0755)) {
         LOG_E(TAG, "Failed to create parent dir for %s", file_path.c_str());

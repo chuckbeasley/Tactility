@@ -21,6 +21,7 @@
 #include <Tactility/file/File.h>
 #include <Tactility/file/PropertiesFile.h>
 #include <Tactility/time.h>
+#include <Tactility/units/Units.h>
 
 #include <app/event.h>
 #include <app/manager.h>
@@ -155,16 +156,10 @@ void savePostalCode(const std::string& postalCode) {
 
 // region Formatting
 
-/** NWS reports observations in metric (degC, km/h, Pa). The screen shows imperial: degF, mph, inHg. */
-float toFahrenheit(float celsius) {
-    return (celsius * 9.0f / 5.0f) + 32.0f;
-}
-
+/** NWS reports observations in metric (degC, km/h, Pa). Which of the two the screen shows is the
+ * user's choice in Region & Language; tt::units does the conversion and the formatting. */
 std::string formatTemperature(float celsius) {
-    if (std::isnan(celsius)) {
-        return "--";
-    }
-    return std::format("{:.1f}\u00b0F", toFahrenheit(celsius));
+    return units::formatTemperatureFromCelsius(celsius, 1);
 }
 
 std::string formatWind(const CurrentConditions& current) {
@@ -172,16 +167,16 @@ std::string formatWind(const CurrentConditions& current) {
         return {};
     }
 
-    const float mph = current.windSpeedKph * 0.621371f;
+    const std::string speed = units::formatSpeedFromKph(current.windSpeedKph, 0);
     if (std::isnan(current.windDirectionDegrees)) {
-        return std::format("Wind {:.0f} mph", mph);
+        return std::format("Wind {}", speed);
     }
 
     // Eight compass points: this is a glanceable readout, and no one reads "WSW" off a 480px screen
     // any faster than "SW".
     static const char* points[] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
     const int index = static_cast<int>(((current.windDirectionDegrees / 45.0f) + 0.5f)) & 7;
-    return std::format("Wind {:.0f} mph {}", mph, points[index]);
+    return std::format("Wind {} {}", speed, points[index]);
 }
 
 std::string formatHumidity(const CurrentConditions& current) {
@@ -195,7 +190,7 @@ std::string formatPressure(const CurrentConditions& current) {
     if (std::isnan(current.pressurePa)) {
         return {};
     }
-    return std::format("{:.2f} inHg", current.pressurePa / 3386.389f);
+    return units::formatPressureFromPascal(current.pressurePa, 0);
 }
 
 /** Joins the parts that the station actually reported, so a gap does not leave a stray separator. */
@@ -441,7 +436,9 @@ void render(Context* ctx) {
                 if (!period.windDirection.empty()) {
                     text += period.windDirection + " ";
                 }
-                text += period.windSpeed;
+                // The API's forecast wind is a phrase with the unit attached ("5 to 10 mph"), so it is
+                // converted as text rather than as a number.
+                text += units::convertSpeedText(period.windSpeed);
             }
 
             auto* textLabel = lv_label_create(row);
@@ -449,16 +446,15 @@ void render(Context* ctx) {
             lv_label_set_text(textLabel, text.c_str());
 
             auto* temperatureLabel = lv_label_create(row);
-            // Forecast periods arrive in Fahrenheit from the NWS, but the unit is part of the
-            // response rather than an assumption, so it is honoured instead of converted blindly.
-            if (period.temperatureUnit == "C") {
-                lv_label_set_text(
-                    temperatureLabel,
-                    std::format("{:.0f}\u00b0F", toFahrenheit(static_cast<float>(period.temperature))).c_str()
-                );
-            } else {
-                lv_label_set_text(temperatureLabel, std::format("{}\u00b0{}", period.temperature, period.temperatureUnit).c_str());
-            }
+            // Forecast periods carry their unit with them - the API says "F" or "C" per period - so
+            // the value is converted from whatever it arrived in to whatever the user reads. That
+            // also fixes what the previous version did with a Celsius period: it converted it to
+            // Fahrenheit unconditionally, which was right only while the screen was imperial-only.
+            const char source_unit = period.temperatureUnit.empty() ? 'C' : period.temperatureUnit[0];
+            lv_label_set_text(
+                temperatureLabel,
+                units::formatTemperature(static_cast<float>(period.temperature), source_unit, 0).c_str()
+            );
         }
     }
 

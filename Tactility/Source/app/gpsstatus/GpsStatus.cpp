@@ -16,6 +16,7 @@
 #include <gps/gps.h>
 
 #include <Tactility/time.h>
+#include <Tactility/units/Units.h>
 
 #include <app/event.h>
 #include <app/manifest.h>
@@ -203,27 +204,29 @@ std::string formatFixed(const struct minmea_float* value, int decimals, const ch
 
 /**
  * GGA reports altitude in metres. NMEA defines that field's unit as 'M' and nothing else, which is
- * what makes converting it unconditionally safe rather than a guess. 1 m = 3.280839895 ft exactly.
+ * what makes the stored value unambiguous; how it is *shown* follows the unit system in Region &
+ * Language, because "1400 ft" is what a reader in the US expects and "430 m" is what everyone else
+ * does. The conversion lives in tt::units so every screen converts the same way.
  */
 std::string formatAltitude(const struct minmea_float* value) {
     const float metres = minmea_tofloat(value);
     if (std::isnan(metres)) {
         return "--";
     }
-    return std::format("{:.1f} ft", metres * 3.280839895f);
+    return units::formatDistance(metres, 1);
 }
 
 /**
  * RMC reports speed in knots, which is fixed by the sentence definition - minmea parses it as a
- * bare value with no unit field, so there is nothing else it could be. 1 knot = 1.150779448 mph
- * (1 nmi = 1852 m, 1 statute mile = 1609.344 m), so this is a scale factor, not an approximation.
+ * bare value with no unit field, so there is nothing else it could be. Knots are neither metric nor
+ * imperial, so this is a conversion either way: 1 kn = 1.852 km/h exactly, and 1.150779448 mph.
  */
 std::string formatSpeed(const struct minmea_float* value) {
     const float knots = minmea_tofloat(value);
     if (std::isnan(knots)) {
         return "--";
     }
-    return std::format("{:.1f} mph", knots * 1.150779448f);
+    return units::formatSpeedFromKnots(knots, 1);
 }
 
 /** Coordinates are DDMM.MMMM in the sentence; minmea_tocoord converts to signed decimal degrees. */

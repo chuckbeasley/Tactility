@@ -5,6 +5,7 @@
 #include <Tactility/app/localesettings/TextResources.h>
 #include <Tactility/settings/Language.h>
 #include <Tactility/settings/SystemSettings.h>
+#include <Tactility/units/Units.h>
 
 #include <app/event.h>
 #include <app/manager.h>
@@ -39,9 +40,16 @@ struct Context {
     tt::i18n::TextResources textResources = tt::i18n::TextResources(TEXT_RESOURCE_PATH);
     RecursiveMutex mutex;
     lv_obj_t* languageDropdown = nullptr;
+    lv_obj_t* unitsDropdown = nullptr;
     bool settingsUpdated = false;
 
     std::map<settings::Language, std::string> languageMap;
+};
+
+/** The two unit systems, in the order the dropdown shows them. */
+constexpr settings::UnitSystem UNIT_SYSTEMS[] = {
+    settings::UnitSystem::Metric,
+    settings::UnitSystem::Imperial,
 };
 
 
@@ -77,6 +85,39 @@ void updateViews(Context* ctx) {
     std::string language_options = getLanguageOptions(ctx);
     lv_dropdown_set_options(ctx->languageDropdown, language_options.c_str());
     lv_dropdown_set_selected(ctx->languageDropdown, static_cast<uint32_t>(settings::getLanguage()));
+
+    if (ctx->unitsDropdown != nullptr) {
+        // Labels rather than the raw enum: the dropdown is what a user reads.
+        std::string options = ctx->textResources[i18n::Text::METRIC] + "\n" +
+                              ctx->textResources[i18n::Text::IMPERIAL];
+        lv_dropdown_set_options(ctx->unitsDropdown, options.c_str());
+
+        const auto current = units::getSystem();
+        const uint32_t index = (current == UNIT_SYSTEMS[1]) ? 1 : 0;
+        lv_dropdown_set_selected(ctx->unitsDropdown, index);
+    }
+}
+
+void onUnitsSet(lv_event_t* event) {
+    auto* ctx = static_cast<Context*>(lv_event_get_user_data(event));
+    auto* dropdown = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    const uint32_t index = lv_dropdown_get_selected(dropdown);
+    if (index >= sizeof(UNIT_SYSTEMS) / sizeof(UNIT_SYSTEMS[0])) {
+        return;
+    }
+
+    const auto chosen = UNIT_SYSTEMS[index];
+    units::setSystem(chosen);
+    LOG_I(TAG, "Unit system set to %s", units::toString(chosen));
+
+    // Deliberately no updateViews() here. That function re-sets the dropdown's options, and doing that
+    // from inside the dropdown's own value-changed callback rebuilds the option list while LVGL is
+    // iterating it - observed on the device as a list that grows a duplicate entry ("Metric, Imperial,
+    // Imperial"). The selection is already displayed by the dropdown itself, and every screen that
+    // shows a measurement reads the setting through tt::units when it renders, so there is nothing to
+    // refresh. updateViews() is still what a *language* change calls, because then the option labels
+    // themselves have changed and they belong to different dropdowns.
+    (void)ctx;
 }
 
 void onLanguageSet(lv_event_t* event) {
@@ -139,6 +180,28 @@ void createWidgets(lv_obj_t* parent, void* userData) {
     lv_dropdown_set_options(ctx->languageDropdown, language_options.c_str());
     lv_dropdown_set_selected(ctx->languageDropdown, static_cast<uint32_t>(settings::getLanguage()));
     lv_obj_add_event_cb(ctx->languageDropdown, onLanguageSet, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // Units
+
+    auto* units_wrapper = lv_obj_create(main_wrapper);
+    lv_obj_set_width(units_wrapper, LV_PCT(100));
+    lv_obj_set_height(units_wrapper, LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(units_wrapper, 8, 0);
+    lv_obj_set_style_border_width(units_wrapper, 0, 0);
+
+    auto* unitsLabel = lv_label_create(units_wrapper);
+    lv_label_set_text(unitsLabel, ctx->textResources[i18n::Text::UNITS].c_str());
+    lv_obj_align(unitsLabel, LV_ALIGN_LEFT_MID, 4, 0);
+
+    ctx->unitsDropdown = lv_dropdown_create(units_wrapper);
+    lv_obj_set_width(ctx->unitsDropdown, LV_PCT(55));
+    lv_obj_align(ctx->unitsDropdown, LV_ALIGN_RIGHT_MID, 0, 0);
+    std::string units_options = ctx->textResources[i18n::Text::METRIC] + "\n" +
+                                ctx->textResources[i18n::Text::IMPERIAL];
+    lv_dropdown_set_options(ctx->unitsDropdown, units_options.c_str());
+    lv_dropdown_set_selected(ctx->unitsDropdown,
+        units::getSystem() == settings::UnitSystem::Imperial ? 1 : 0);
+    lv_obj_add_event_cb(ctx->unitsDropdown, onUnitsSet, LV_EVENT_VALUE_CHANGED, ctx);
 }
 
 int32_t appMain(int argc, char* argv[]) {
