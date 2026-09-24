@@ -7,7 +7,7 @@
 #include <Tactility/Mutex.h>
 #include <Tactility/Timer.h>
 #include <Tactility/service/wifi/Wifi.h>
-#include <Tactility/wifi/WifiRanging.h>
+#include <Tactility/ranging/Ranging.h>
 
 #include "PcapWriter.h"
 
@@ -100,8 +100,8 @@ struct Context {
     // Calibration for the distance band, read once when a capture starts: the model's constants do
     // not change while capturing, and reading a file from the 200 ms poll timer would put file I/O
     // on the UI's critical path for no benefit. An edit takes effect on the next start.
-    tt::wifi::ranging::Calibration calibration;
-    tt::wifi::ranging::RssiFilter linkFilter;
+    tt::ranging::Calibration calibration;
+    tt::ranging::RssiFilter linkFilter;
     std::atomic<int16_t> linkRssiX10{kNoLinkReading};
     std::atomic<uint8_t> linkChannel{0};
     lv_obj_t* statusLabel = nullptr;
@@ -144,10 +144,10 @@ void updateLinkLabel(Context* ctx) {
 
     // Calibration was read when the capture started; see the note on Context::calibration.
     const float rssi = static_cast<float>(rssi_x10) / 10.0f;
-    const auto value = tt::wifi::ranging::estimate(rssi, ctx->linkChannel.load(), ctx->calibration);
+    const auto value = tt::ranging::estimate(rssi, tt::ranging::wifiRadioForChannel(ctx->linkChannel.load()), ctx->calibration);
 
     char band[64];
-    tt::wifi::ranging::formatBand(value, band, sizeof(band));
+    tt::ranging::formatBand(value, band, sizeof(band));
     auto text = std::format("Signal: {:.0f} dBm\n{}", (double)rssi, band);
     lv_label_set_text(ctx->linkLabel, text.c_str());
 }
@@ -402,7 +402,7 @@ void startCapture(Context* ctx) {
 
     // Fresh calibration and a fresh signal average for this capture: the previous run's smoothed RSSI
     // describes a link that may have moved since.
-    ctx->calibration = tt::wifi::ranging::loadCalibration();
+    ctx->calibration = tt::ranging::loadCalibration();
     ctx->linkFilter.reset();
     ctx->linkRssiX10.store(kNoLinkReading);
 

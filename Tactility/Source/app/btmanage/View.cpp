@@ -12,6 +12,7 @@
 #include <Tactility/bluetooth/Bluetooth.h>
 #include <Tactility/bluetooth/BluetoothSettings.h>
 #include <Tactility/bluetooth/BluetoothPairedDevice.h>
+#include <Tactility/ranging/Ranging.h>
 #include <Tactility/Tactility.h>
 
 #include <app/event.h>
@@ -110,13 +111,6 @@ void View::onConnect(lv_event_t* event) {
 
 // endregion Peer list callbacks
 
-static uint8_t mapRssiToPercentage(int8_t rssi) {
-    auto abs_rssi = std::abs(rssi);
-    if (abs_rssi < 30) abs_rssi = 30;
-    if (abs_rssi > 90) abs_rssi = 90;
-    return static_cast<uint8_t>((float)(90 - abs_rssi) / 60.f * 100.f);
-}
-
 // The connected row's text, in one place so the row can be rewritten in place when the live RSSI
 // changes (see View::refreshConnectedRow) instead of only when the whole list is rebuilt.
 static void formatConnectedRowText(
@@ -124,6 +118,7 @@ static void formatConnectedRowText(
     int8_t tx_power,
     bool rssi_valid,
     int8_t rssi,
+    const tt::ranging::Calibration& calibration,
     char* out,
     size_t out_size
 ) {
@@ -131,19 +126,30 @@ static void formatConnectedRowText(
         std::snprintf(out, out_size, "%s %sConnected", name_part, LV_SYMBOL_OK);
         return;
     }
+
+    // A smoothed reading goes into the model, and the model's answer is shown as a band with the
+    // range behind it and the factor it is uncertain by - never as a bare distance, because an RSSI
+    // cannot support one. Two ways in, and they are not equally good:
+    //
+    //   - the peer advertised a TX Power Level, so its path loss is known directly and no
+    //     calibration is involved at all (estimateBleWithTxPower);
+    //   - it did not, which is the common case (0x7F), so the reference comes from the calibration
+    //     file and is only as good as the walk that produced it.
+    const auto value = (tx_power != 0x7F)
+        ? tt::ranging::estimateBleWithTxPower((float)rssi, tx_power, calibration)
+        : tt::ranging::estimate((float)rssi, tt::ranging::Radio::Ble, calibration);
+
+    char band[64];
+    tt::ranging::formatBand(value, band, sizeof(band));
+
     if (tx_power != 0x7F) {
-        // With the peer's advertised TX power the path loss becomes computable - 20 dB at 10 cm, 40 dB
-        // at 1 m and 50 dB at 3 m in free space - and it is the same number whatever the peer
-        // transmits at. 0x7F is the "not present" value from the advertisement's TX Power Level field,
-        // which is the common case: most keyboards simply do not send it.
-        std::snprintf(out, out_size, "%s %s %ddBm\npath %ddB (peer TX %+ddBm)", name_part, LV_SYMBOL_OK,
-                      (int)rssi, (int)tx_power - (int)rssi, (int)tx_power);
+        std::snprintf(out, out_size, "%s %s %ddBm (TX %+d)\n%s", name_part, LV_SYMBOL_OK,
+                      (int)rssi, (int)tx_power, band);
     } else {
-        // Without it, an absolute reading is all there is. The useful signal is the slope: 2.4 GHz
-        // free-space loss grows about 6 dB per doubling of distance, so moving the keyboard from
-        // touching the board to arm's length should cost roughly 10 dB.
-        std::snprintf(out, out_size, "%s %s %ddBm\npeer advertises no TX power", name_part, LV_SYMBOL_OK,
-                      (int)rssi);
+        // The second line used to say "peer advertises no TX power", which was true but not useful;
+        // it is what makes the band below depend on calibration rather than on the peer's own word,
+        // and that is what the band's +/- already conveys.
+        std::snprintf(out, out_size, "%s %s %ddBm\n%s", name_part, LV_SYMBOL_OK, (int)rssi, band);
     }
 }
 
@@ -196,21 +202,35 @@ void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired
         // into a path loss, which is the figure that says whether the link is healthy: about 20 dB at
         // 10 cm, 40 dB at 1 m and 50 dB at 3 m in free space.
         live_rssi_valid = state->getConnectedRssi(live_rssi);
-        formatConnectedRowText(name_part, record.txPower, live_rssi_valid, live_rssi, label, sizeof(label));
+        formatConnectedRowText(name_part, record.txPower, live_rssi_valid, live_rssi,
+                               state->getRangingCalibration(), label, sizeof(label));
     } else if (record.rssi == 0) {
         // No reading at all: a paired peer that has not been heard in a scan (its stored record
         // carries rssi 0). Mapping that to a percentage read as "100%" - the most optimistic possible
         // answer for the one case with no data behind it - so it is left blank instead.
         std::snprintf(label, sizeof(label), "%s", name_part);
     } else if (record.txPower != 0x7F) {
-        // Scanned peer: percentage from the advertisement's RSSI, plus the TX power that peer quoted in
-        // the same advertisement. That number is what makes readings comparable between devices - a
-        // peer transmitting at -20 dBm reads exactly like one 20 dB further away.
-        std::snprintf(label, sizeof(label), "%s %u%% (TX%+d)", name_part,
-                      static_cast<unsigned>(mapRssiToPercentage(record.rssi)), (int)record.txPower);
+        // Scanned peer: the distance band, which needs no calibration here because the peer quoted its
+        // TX Power Level in the same advertisement and its path loss is therefore known directly.
+        //
+        // The percentage this row used to lead with is gone, not because it was wrong but because it
+        // was the same RSSI mapped through a linearisation with no physical meaning, and the band says
+        // it better. It also cost the width that a name needs: with both, the row wrapped and the
+        // device's own name was what got cut off.
+        char band[40];
+        const auto value = tt::ranging::estimateBleWithTxPower(
+            (float)record.rssi, record.txPower, state->getRangingCalibration());
+        tt::ranging::formatBandCompact(value, band, sizeof(band));
+        std::snprintf(label, sizeof(label), "%s (TX%+d) %s", name_part, (int)record.txPower, band);
     } else {
-        std::snprintf(label, sizeof(label), "%s %u%%", name_part,
-                      static_cast<unsigned>(mapRssiToPercentage(record.rssi)));
+        // No advertised TX power (the common case), so the reference comes from the calibration file -
+        // which is why its uncertainty is larger and the band visibly wider: a peer that does not say
+        // what it transmits can be tens of dB away from what the model assumes.
+        char band[40];
+        const auto value = tt::ranging::estimate(
+            (float)record.rssi, tt::ranging::Radio::Ble, state->getRangingCalibration());
+        tt::ranging::formatBandCompact(value, band, sizeof(band));
+        std::snprintf(label, sizeof(label), "%s %s", name_part, band);
     }
 
     auto* button = lv_list_add_button(peers_list, nullptr, label);
@@ -402,7 +422,8 @@ void View::refreshConnectedRow() {
     }
 
     char label[192];
-    formatConnectedRowText(connected_row_name, connected_row_tx_power, valid, live_rssi, label, sizeof(label));
+    formatConnectedRowText(connected_row_name, connected_row_tx_power, valid, live_rssi,
+                           state->getRangingCalibration(), label, sizeof(label));
     lv_label_set_text(connected_row_label, label);
     connected_row_rssi = live_rssi;
     connected_row_rssi_valid = valid;

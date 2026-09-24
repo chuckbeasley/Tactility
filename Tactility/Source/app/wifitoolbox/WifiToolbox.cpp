@@ -9,7 +9,7 @@
 #include <Tactility/Mutex.h>
 #include <Tactility/Timer.h>
 #include <Tactility/service/wifi/Wifi.h>
-#include <Tactility/wifi/WifiRanging.h>
+#include <Tactility/ranging/Ranging.h>
 
 #include "../wifimonitor/PcapWriter.h"
 
@@ -221,8 +221,8 @@ struct Context {
     // Signal of the link being captured, as a band rather than a number - the same treatment the
     // Wi-Fi Monitor gives it, from the same frames. The filter is written only by onPacket() on the
     // Wi-Fi task; the band is rendered in the poll tick under the LVGL lock.
-    tt::wifi::ranging::Calibration calibration;
-    tt::wifi::ranging::RssiFilter linkFilter;
+    tt::ranging::Calibration calibration;
+    tt::ranging::RssiFilter linkFilter;
     std::atomic<int16_t> linkRssiX10{kNoLinkReading};
     std::atomic<uint8_t> linkChannel{0};
     lv_obj_t* linkLabel = nullptr;
@@ -1238,7 +1238,7 @@ static void onCaptureStartStop(lv_event_t* event) {
         ctx->deauthCount = 0;
         // Fresh calibration and a fresh signal average per capture: the constants do not change while
         // running, and the previous run's average describes a link that may have moved since.
-        ctx->calibration = tt::wifi::ranging::loadCalibration();
+        ctx->calibration = tt::ranging::loadCalibration();
         ctx->linkFilter.reset();
         ctx->linkRssiX10.store(kNoLinkReading);
         // The label is refreshed on success because startCapture() re-chooses the directory: a card
@@ -1716,9 +1716,9 @@ static void onPollTick(Context* ctx) {
                 lv_label_set_text(ctx->linkLabel, "Signal: no frames yet");
             } else {
                 const float rssi = static_cast<float>(rssi_x10) / 10.0f;
-                const auto value = tt::wifi::ranging::estimate(rssi, ctx->linkChannel.load(), ctx->calibration);
+                const auto value = tt::ranging::estimate(rssi, tt::ranging::wifiRadioForChannel(ctx->linkChannel.load()), ctx->calibration);
                 char band[64];
-                tt::wifi::ranging::formatBand(value, band, sizeof(band));
+                tt::ranging::formatBand(value, band, sizeof(band));
                 char line[96];
                 std::snprintf(line, sizeof(line), "Signal: %.0f dBm\n%s", (double)rssi, band);
                 lv_label_set_text(ctx->linkLabel, line);

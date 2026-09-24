@@ -2,6 +2,7 @@
 
 #include <Tactility/bluetooth/Bluetooth.h>
 #include <Tactility/RecursiveMutex.h>
+#include <Tactility/ranging/Ranging.h>
 
 #include <array>
 
@@ -31,6 +32,12 @@ class State final {
     // connected, or when the controller had no reading to give.
     int8_t connectedRssi = 0;
     bool connectedRssiValid = false;
+    // The constants the connected row's distance band is computed from, read once when the app starts
+    // rather than per refresh: the model does not change while the app runs, and the row is rewritten
+    // up to twice a second off a live link. The file behind it is
+    // <data>/settings/ranging.properties, whose BLE reference is the one that has to be measured -
+    // a keyboard does not advertise what it transmits at.
+    ranging::Calibration rangingCalibration = ranging::loadCalibration();
 
 public:
     State() = default;
@@ -55,6 +62,9 @@ public:
 
     /** @return true when `out_rssi` was filled with a live connection reading. */
     bool getConnectedRssi(int8_t& out_rssi) const;
+
+    /** The calibration the connected row's distance band is derived from. */
+    const ranging::Calibration& getRangingCalibration() const { return rangingCalibration; }
 
     /** Marks a connection as in flight to `addr`, so the view can show it as pending. */
     void beginConnecting(const std::array<uint8_t, 6>& addr);
