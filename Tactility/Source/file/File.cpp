@@ -320,10 +320,19 @@ bool readLines(const std::string& filePath, bool stripNewLine, std::function<voi
     char line[256];
 
     while (fgets(line, sizeof(line), file) != nullptr) {
-        // Strip newline
+        // Strip the line ending - both characters of it. A file written on Windows ends its lines with
+        // CRLF, and stripping only the LF leaves the CR at the end of every single line: for
+        // translations that is a stray control character in every string, and LVGL treats CR as a line
+        // break, so an option list came out with a phantom extra row per entry. The generated .i18n
+        // files are checked in with LF and land in the build as CRLF whenever this repository is
+        // checked out with core.autocrlf set, which is exactly this machine - so the stripping belongs
+        // here, where it is the same on every checkout, rather than in how the files are generated.
         if (stripNewLine) {
             size_t line_length = strlen(line);
             if (line_length > 0 && line[line_length - 1] == '\n') {
+                line[--line_length] = '\0';
+            }
+            if (line_length > 0 && line[line_length - 1] == '\r') {
                 line[line_length - 1] = '\0';
             }
         }
