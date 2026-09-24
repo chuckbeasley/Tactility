@@ -1381,7 +1381,57 @@ bool hidHostGetConnectedPeer(std::array<uint8_t, 6>& addr_out) {
     return true;
 }
 
+// ---- Auto-connect retry, independent of events ----
+//
+// The retry chain above runs on BT_EVENT_SCAN_FINISHED: a scan ends, autoConnectHidHost() looks at
+// what it found, and starts the next scan if the peer was not there. That chain is the whole
+// mechanism by which a keyboard that went to sleep is picked up again when it wakes, and it used to
+// stop dead whenever that one event went missing - the event ring holds four entries, a scan fires
+// dozens of peer-found events per second, and the ring dropped the newest event when it was full.
+// Measured with the keyboard out of range: eight clean five-second retry cycles, then 235 seconds of
+// nothing at all - no scan, no log, no reconnect. (ble_publish_event() no longer drops state events
+// for that reason, but a chain that stops completely when one event is missed is fragile whatever the
+// queue does.)
+//
+// This timer is the part that cannot be starved: every AUTO_CONNECT_RETRY_INTERVAL_US it makes the
+// same check, whether or not any event arrived. The timer task's stack is 2 KB, so the work is handed
+// to the main dispatcher - the same context the event path uses - rather than done in the callback.
+static esp_timer_handle_t hid_host_auto_scan_timer = nullptr;
+constexpr uint64_t AUTO_CONNECT_RETRY_INTERVAL_US = 10 * 1000 * 1000;
+
+static void hidHostAutoScanTick(void* /*arg*/) {
+    if (getRadioState() != RadioState::On) return;
+    // A connect is already in flight: autoConnectHidHost() would only tell hidHostConnect() to
+    // refuse, which logs a warning every tick.
+    if (hid_host_ctx != nullptr) return;
+    getMainDispatcher().dispatch([] { autoConnectHidHost(); });
+}
+
+// Started once, from the first auto-connect check of the radio's life (see autoConnectHidHost).
+// Deliberately not stopped and restarted on radio changes: the tick is a no-op while the radio is
+// off, and a timer that is created and destroyed around state transitions is one more thing that can
+// be left in the wrong state.
+static void ensureAutoScanTimer() {
+    if (hid_host_auto_scan_timer != nullptr) return;
+    esp_timer_create_args_t args = {};
+    args.callback        = hidHostAutoScanTick;
+    args.dispatch_method = ESP_TIMER_TASK;
+    args.name            = "hid_auto_scan";
+    if (esp_timer_create(&args, &hid_host_auto_scan_timer) != ESP_OK) {
+        LOG_E(TAG, "Failed to create the auto-connect retry timer");
+        hid_host_auto_scan_timer = nullptr;
+        return;
+    }
+    if (esp_timer_start_periodic(hid_host_auto_scan_timer, AUTO_CONNECT_RETRY_INTERVAL_US) != ESP_OK) {
+        LOG_E(TAG, "Failed to start the auto-connect retry timer");
+        esp_timer_delete(hid_host_auto_scan_timer);
+        hid_host_auto_scan_timer = nullptr;
+    }
+}
+
 void autoConnectHidHost() {
+    ensureAutoScanTimer();
+
     if (hidHostIsConnected()) return;
 
     // Connect to the first saved HID host peer that appeared in the last scan.

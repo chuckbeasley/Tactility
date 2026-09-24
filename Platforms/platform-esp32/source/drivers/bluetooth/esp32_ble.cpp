@@ -100,11 +100,27 @@ void ble_publish_event(struct Device* device, struct BtEvent event) {
     mutex_lock(&ctx->subscriptionsMutex);
     for (BtEventSubscription* sub = ctx->subscriptions; sub != nullptr; sub = sub->internal.next) {
         mutex_lock(&sub->internal.ring_mutex);
-        if (sub->internal.count < BT_EVENT_QUEUE_CAPACITY) {
-            uint8_t tail = (sub->internal.head + sub->internal.count) % BT_EVENT_QUEUE_CAPACITY;
-            sub->internal.queue[tail] = event;
-            sub->internal.count++;
+        if (sub->internal.count >= BT_EVENT_QUEUE_CAPACITY) {
+            // Full. The ring holds four events and a scan in a busy room fires dozens of peer-found
+            // events per second, so "drop the newest" is not a safe rule: it drops whatever arrives
+            // while the burst is on, and a dropped scan-finished stops the auto-connect retry chain
+            // dead - measured as 235 seconds with no scan running and not one log line, because
+            // nothing else restarts a scan, and the keyboard could not reconnect until an app was
+            // opened. Peer-found is the flood and the only event that is safe to lose, so it is what
+            // gets dropped: one of those makes room for anything else, and only another peer-found is
+            // dropped on arrival.
+            if (event.type == BT_EVENT_PEER_FOUND) {
+                mutex_unlock(&sub->internal.ring_mutex);
+                task_event_group_signal(sub->internal.event_group, sub->bit);
+                continue;
+            }
+            sub->internal.head = (sub->internal.head + 1) % BT_EVENT_QUEUE_CAPACITY;
+            sub->internal.count--;
+            LOG_W(TAG, "Event queue full: dropped the oldest event to deliver type %d", (int)event.type);
         }
+        uint8_t tail = (sub->internal.head + sub->internal.count) % BT_EVENT_QUEUE_CAPACITY;
+        sub->internal.queue[tail] = event;
+        sub->internal.count++;
         mutex_unlock(&sub->internal.ring_mutex);
         task_event_group_signal(sub->internal.event_group, sub->bit);
     }
