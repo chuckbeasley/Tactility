@@ -1031,6 +1031,35 @@ static error_t api_get_paired_peers(struct Device* /*device*/, struct BtPeerReco
     return ERROR_NOT_SUPPORTED;
 }
 
+// NimBLE keeps the authoritative connection list, so this asks it rather than the per-profile handles
+// this driver tracks (spp/midi/hid child): a connection exists for whatever reason, and the caller
+// wants to know how good the radio link to that peer is right now.
+static error_t api_get_connection_rssi(struct Device* device, const BtAddr addr, int8_t* out_rssi) {
+    if (out_rssi == nullptr) return ERROR_INVALID_ARGUMENT;
+    BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
+    if (!ctx) return ERROR_INVALID_STATE;
+
+    // Peers are stored by address only; the address type is not carried through this API, and every
+    // peripheral this firmware connects to is addressed publicly, which is what the pairing path
+    // assumes as well (see api_unpair).
+    ble_addr_t ble_addr = {};
+    ble_addr.type = BLE_ADDR_PUBLIC;
+    memcpy(ble_addr.val, addr, BT_ADDR_LEN);
+
+    struct ble_gap_conn_desc desc = {};
+    if (ble_gap_conn_find_by_addr(&ble_addr, &desc) != 0) {
+        return ERROR_NOT_FOUND;
+    }
+
+    int8_t rssi = 0;
+    if (ble_gap_conn_rssi(desc.conn_handle, &rssi) != 0) {
+        return ERROR_NOT_FOUND;
+    }
+
+    *out_rssi = rssi;
+    return ERROR_NONE;
+}
+
 static error_t api_connect(struct Device* device, const BtAddr addr, enum BtProfileId profile) {
     BleCtx* ctx = (BleCtx*)device_get_driver_data(device);
     if (!ctx) return ERROR_INVALID_STATE;
@@ -1292,6 +1321,7 @@ const BluetoothApi nimble_bluetooth_api = {
     .get_paired_peers       = api_get_paired_peers,
     .connect                = api_connect,
     .disconnect             = api_disconnect,
+    .get_connection_rssi    = api_get_connection_rssi,
     .event_subscribe        = api_event_subscribe,
     .event_unsubscribe      = api_event_unsubscribe,
     .set_device_name        = api_set_device_name,

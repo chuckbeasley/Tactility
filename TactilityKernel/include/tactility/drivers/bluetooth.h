@@ -341,6 +341,22 @@ struct BluetoothApi {
     error_t (*disconnect)(struct Device* device, const BtAddr addr, enum BtProfileId profile);
 
     /**
+     * Read the current RSSI of an established connection to a peer, in dBm.
+     *
+     * This is a live figure for the connection that exists now, unlike BtPeerRecord::rssi, which is
+     * what a scan heard from an advertisement at the time it was heard. For a device that stops
+     * advertising once connected - most BLE peripherals, and every BLE HID keyboard - the scan value
+     * freezes at whatever the last advertisement measured, which is why a peer sitting on top of the
+     * board could still read as weak. Nothing else in this API can answer "how good is this link".
+     *
+     * @param[in] device the bluetooth device
+     * @param[in] addr the peer address
+     * @param[out] out_rssi the connection RSSI in dBm (negative; -127 when the controller has no reading)
+     * @return ERROR_NONE on success, ERROR_NOT_FOUND when there is no connection to that address
+     */
+    error_t (*get_connection_rssi)(struct Device* device, const BtAddr addr, int8_t* out_rssi);
+
+    /**
      * Register a subscription for this device's BtEvents.
      * @warning Does not work in ISR context.
      * @param[in] device the bluetooth device
@@ -447,6 +463,8 @@ error_t bluetooth_unpair(struct Device* device, const BtAddr addr);
 error_t bluetooth_get_paired_peers(struct Device* device, struct BtPeerRecord* out, size_t* count);
 error_t bluetooth_connect(struct Device* device, const BtAddr addr, enum BtProfileId profile);
 error_t bluetooth_disconnect(struct Device* device, const BtAddr addr, enum BtProfileId profile);
+/** Live connection RSSI in dBm; ERROR_NOT_FOUND when the peer is not connected. See BluetoothApi. */
+error_t bluetooth_get_connection_rssi(struct Device* device, const BtAddr addr, int8_t* out_rssi);
 error_t bluetooth_set_device_name(struct Device* device, const char* name);
 error_t bluetooth_get_device_name(struct Device* device, char* buf, size_t buf_len);
 error_t bluetooth_start_advertising(struct Device* device, const uint8_t* adv_data, size_t adv_len, bool connectable, bool randomize_address);

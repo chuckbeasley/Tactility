@@ -70,6 +70,15 @@ error_t bluetooth_disconnect(struct Device* device, const BtAddr addr, enum BtPr
     return BT_API(device)->disconnect(device, addr, profile);
 }
 
+error_t bluetooth_get_connection_rssi(struct Device* device, const BtAddr addr, int8_t* out_rssi) {
+    // A driver that does not implement this reports ERROR_NOT_SUPPORTED rather than a fake reading:
+    // the value is used to judge a radio link, so "unknown" has to stay distinguishable from "weak".
+    if (BT_API(device)->get_connection_rssi == nullptr) {
+        return ERROR_NOT_SUPPORTED;
+    }
+    return BT_API(device)->get_connection_rssi(device, addr, out_rssi);
+}
+
 // ---- Event subscription ----
 
 error_t bluetooth_event_subscribe(struct Device* device, struct BtEventSubscription* sub, struct TaskEventGroup* event_group) {

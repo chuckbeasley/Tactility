@@ -25,6 +25,12 @@ class State final {
     // stopped to make room for a connection. Cleared by pressing Stop scan or by clicking a device
     // to connect, and re-armed when the radio is switched on.
     bool scanWanted = true;
+    // Live RSSI of the connected peer, read from the controller on each refresh instead of from a
+    // scan record: a connected keyboard stops advertising, so its scan value freezes at whatever was
+    // measured before the connection (see bluetooth::getConnectionRssi). Invalid when nothing is
+    // connected, or when the controller had no reading to give.
+    int8_t connectedRssi = 0;
+    bool connectedRssiValid = false;
 
 public:
     State() = default;
@@ -37,6 +43,18 @@ public:
 
     void updateScanResults();
     void updatePairedPeers();
+
+    /**
+     * Re-read the live connection RSSI of the connected peer. Call after updatePairedPeers(), which
+     * is what knows whether anything is connected. Logs the value when it moves by 3 dB or more, so a
+     * test that walks a keyboard around the room leaves a readable trace on the console.
+     *
+     * @return true when the value it reports changed, which is the only reason to redraw the row.
+     */
+    bool updateConnectedRssi();
+
+    /** @return true when `out_rssi` was filled with a live connection reading. */
+    bool getConnectedRssi(int8_t& out_rssi) const;
 
     /** Marks a connection as in flight to `addr`, so the view can show it as pending. */
     void beginConnecting(const std::array<uint8_t, 6>& addr);

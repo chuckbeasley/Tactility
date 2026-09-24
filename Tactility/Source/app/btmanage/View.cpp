@@ -117,6 +117,50 @@ static uint8_t mapRssiToPercentage(int8_t rssi) {
     return static_cast<uint8_t>((float)(90 - abs_rssi) / 60.f * 100.f);
 }
 
+// The connected row's text, in one place so the row can be rewritten in place when the live RSSI
+// changes (see View::refreshConnectedRow) instead of only when the whole list is rebuilt.
+static void formatConnectedRowText(
+    const char* name_part,
+    int8_t tx_power,
+    bool rssi_valid,
+    int8_t rssi,
+    char* out,
+    size_t out_size
+) {
+    if (!rssi_valid) {
+        std::snprintf(out, out_size, "%s %sConnected", name_part, LV_SYMBOL_OK);
+        return;
+    }
+    if (tx_power != 0x7F) {
+        // With the peer's advertised TX power the path loss becomes computable - 20 dB at 10 cm, 40 dB
+        // at 1 m and 50 dB at 3 m in free space - and it is the same number whatever the peer
+        // transmits at. 0x7F is the "not present" value from the advertisement's TX Power Level field,
+        // which is the common case: most keyboards simply do not send it.
+        std::snprintf(out, out_size, "%s %s %ddBm\npath %ddB (peer TX %+ddBm)", name_part, LV_SYMBOL_OK,
+                      (int)rssi, (int)tx_power - (int)rssi, (int)tx_power);
+    } else {
+        // Without it, an absolute reading is all there is. The useful signal is the slope: 2.4 GHz
+        // free-space loss grows about 6 dB per doubling of distance, so moving the keyboard from
+        // touching the board to arm's length should cost roughly 10 dB.
+        std::snprintf(out, out_size, "%s %s %ddBm\npeer advertises no TX power", name_part, LV_SYMBOL_OK,
+                      (int)rssi);
+    }
+}
+
+// The label inside a list button. lv_list_add_button builds the button and a label child, and
+// lv_list_get_button_text returns the label's *text*, not the object, so the object is picked out
+// here: rewriting it in place is what keeps the row's identity (and the list's scroll position).
+static lv_obj_t* findButtonLabel(lv_obj_t* button) {
+    const uint32_t count = lv_obj_get_child_count(button);
+    for (uint32_t i = 0; i < count; ++i) {
+        lv_obj_t* child = lv_obj_get_child(button, i);
+        if (lv_obj_check_type(child, &lv_label_class)) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
 void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired) {
     // Built with snprintf rather than std::format, deliberately. This runs once per row, at the
     // very bottom of a deep chain - window creation, then the list rebuild, all on this app's own
@@ -124,24 +168,49 @@ void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired
     // of its own. That was the deepest point when this app crashed opening its device list: the
     // coredump shows createPeerListItem at frame 20 with frames 0..19 all inside libstdc++ format,
     // on a 16 KB stack. snprintf does the same job in a handful of frames.
-    char suffix[32];
-    if (state->isConnectingTo(record.addr)) {
-        std::snprintf(suffix, sizeof(suffix), "%sConnecting...", LV_SYMBOL_REFRESH);
-    } else if (record.connected) {
-        std::snprintf(suffix, sizeof(suffix), "%sConnected", LV_SYMBOL_OK);
+    // Two stages on purpose: the name is built once, then the status is appended in whichever form
+    // fits. A connected row carries two numbers - the live RSSI and the path loss it implies - and on
+    // a 320 px row they only fit on a second line, which is why that one case is multi-line.
+    char name_part[80];
+    if (record.name.empty()) {
+        std::snprintf(name_part, sizeof(name_part), "Unknown (%02x%02x%02x%02x%02x%02x)",
+            record.addr[0], record.addr[1], record.addr[2],
+            record.addr[3], record.addr[4], record.addr[5]);
     } else {
-        // A connected HID host reports no RSSI (rssi=0 maps to "100%"), which is misleading.
-        std::snprintf(suffix, sizeof(suffix), "%u%%", static_cast<unsigned>(mapRssiToPercentage(record.rssi)));
+        std::snprintf(name_part, sizeof(name_part), "%s", record.name.c_str());
     }
 
-    char label[96];
-    if (record.name.empty()) {
-        std::snprintf(label, sizeof(label), "Unknown (%02x%02x%02x%02x%02x%02x) %s",
-            record.addr[0], record.addr[1], record.addr[2],
-            record.addr[3], record.addr[4], record.addr[5],
-            suffix);
+    char label[192];
+    // Hoisted out of the connected branch: the row remembers what it displayed, so
+    // refreshConnectedRow() can tell a current row from a stale one without re-reading the controller.
+    int8_t live_rssi = 0;
+    bool live_rssi_valid = false;
+    bool is_connected_row = false;
+    if (state->isConnectingTo(record.addr)) {
+        std::snprintf(label, sizeof(label), "%s %sConnecting...", name_part, LV_SYMBOL_REFRESH);
+    } else if (record.connected) {
+        is_connected_row = true;
+        // The live connection value, not record.rssi: a connected keyboard stops advertising, so its
+        // scan RSSI is frozen at whatever was heard before the connection - which is how a keyboard
+        // sitting on the board could still read as weak. The peer's advertised TX power turns that
+        // into a path loss, which is the figure that says whether the link is healthy: about 20 dB at
+        // 10 cm, 40 dB at 1 m and 50 dB at 3 m in free space.
+        live_rssi_valid = state->getConnectedRssi(live_rssi);
+        formatConnectedRowText(name_part, record.txPower, live_rssi_valid, live_rssi, label, sizeof(label));
+    } else if (record.rssi == 0) {
+        // No reading at all: a paired peer that has not been heard in a scan (its stored record
+        // carries rssi 0). Mapping that to a percentage read as "100%" - the most optimistic possible
+        // answer for the one case with no data behind it - so it is left blank instead.
+        std::snprintf(label, sizeof(label), "%s", name_part);
+    } else if (record.txPower != 0x7F) {
+        // Scanned peer: percentage from the advertisement's RSSI, plus the TX power that peer quoted in
+        // the same advertisement. That number is what makes readings comparable between devices - a
+        // peer transmitting at -20 dBm reads exactly like one 20 dB further away.
+        std::snprintf(label, sizeof(label), "%s %u%% (TX%+d)", name_part,
+                      static_cast<unsigned>(mapRssiToPercentage(record.rssi)), (int)record.txPower);
     } else {
-        std::snprintf(label, sizeof(label), "%s %s", record.name.c_str(), suffix);
+        std::snprintf(label, sizeof(label), "%s %u%%", name_part,
+                      static_cast<unsigned>(mapRssiToPercentage(record.rssi)));
     }
 
     auto* button = lv_list_add_button(peers_list, nullptr, label);
@@ -155,7 +224,24 @@ void View::createPeerListItem(const bluetooth::PeerRecord& record, bool isPaired
     const size_t row_key = rowAddresses.size();
     rowAddresses.push_back(record.addr);
     lv_obj_set_user_data(button, reinterpret_cast<void*>((row_key << 1) | (isPaired ? 1u : 0u)));
-    lv_obj_add_event_cb(button, onConnect, LV_EVENT_SHORT_CLICKED, nullptr);
+    // LV_EVENT_CLICKED, not SHORT_CLICKED: LVGL withholds SHORT_CLICKED when the press outlasted
+    // long_press_time (400 ms), so a deliberate, slightly slow tap on a device row did nothing at all
+    // - which reads as "clicking it no longer connects". CLICKED arrives on release as long as the
+    // press did not turn into a scroll, which is the rule this action wants. The click guard still
+    // suppresses it when the finger moved.
+    lv_obj_add_event_cb(button, onConnect, LV_EVENT_CLICKED, nullptr);
+
+    if (is_connected_row) {
+        // The connected peer's row is the one row that goes stale on its own: its reading changes
+        // continuously and nothing the list is rebuilt for reports that. Remember the label object and
+        // what it currently says, so refreshConnectedRow() can rewrite that one label between rebuilds.
+        connected_row_label = findButtonLabel(button);
+        connected_row_addr = record.addr;
+        connected_row_rssi = live_rssi;
+        connected_row_rssi_valid = live_rssi_valid;
+        connected_row_tx_power = record.txPower;
+        std::snprintf(connected_row_name, sizeof(connected_row_name), "%s", name_part);
+    }
 }
 
 // region Secondary updates
@@ -220,7 +306,7 @@ void View::createEnableOnBootRow(lv_obj_t* parent) {
     enable_on_boot_switch = lv_switch_create(wrapper);
         lv_obj_align(enable_on_boot_switch, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_add_event_cb(enable_on_boot_switch, onEnableOnBootSwitchChanged, LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(wrapper, onEnableOnBootParentClicked, LV_EVENT_SHORT_CLICKED, enable_on_boot_switch);
+    lv_obj_add_event_cb(wrapper, onEnableOnBootParentClicked, LV_EVENT_CLICKED, enable_on_boot_switch);
 
     if (lvgl_get_ui_density() == LVGL_UI_DENSITY_COMPACT) {
         lv_obj_set_style_pad_ver(wrapper, 2, LV_STATE_DEFAULT);
@@ -252,6 +338,10 @@ void View::updatePeerList() {
     // The rendered rows are gone, so the addresses behind them are too. Refilled below, in the same
     // order the rows are created.
     rowAddresses.clear();
+    // Same reasoning for the tracked connected row: the label it points at was just destroyed, and a
+    // stale pointer here would be written to on the next refresh. Re-set by createPeerListItem below.
+    connected_row_label = nullptr;
+    connected_row_rssi_valid = false;
 
     using enum bluetooth::RadioState;
     if (state->getRadioState() == On) {
@@ -284,7 +374,7 @@ void View::updatePeerList() {
         lv_obj_set_style_margin_ver(scan_button, 4, LV_STATE_DEFAULT);
         auto* scan_label = lv_label_create(scan_button);
         lv_label_set_text(scan_label, state->isScanning() ? "Stop scan" : "Scan");
-        lv_obj_add_event_cb(scan_button, onScanButtonClicked, LV_EVENT_SHORT_CLICKED, context);
+        lv_obj_add_event_cb(scan_button, onScanButtonClicked, LV_EVENT_CLICKED, context);
     }
 
     // Restore where the user was: a rebuild triggered by a newly discovered peer must not
@@ -293,6 +383,29 @@ void View::updatePeerList() {
         lv_obj_update_layout(peers_list);
         lv_obj_scroll_to_y(peers_list, scroll_y, LV_ANIM_OFF);
     }
+}
+
+void View::refreshConnectedRow() {
+    if (connected_row_label == nullptr) {
+        // Nothing connected is rendered - either the list is empty of connected peers, or it has not
+        // been built yet. The next rebuild takes a fresh reading anyway.
+        return;
+    }
+
+    int8_t live_rssi = 0;
+    const bool valid = state->getConnectedRssi(live_rssi);
+    // Only touch the label when the number on screen would actually change. update() runs on every
+    // loop tick of this app, and lv_label_set_text invalidates the row and re-runs layout, so writing
+    // it unconditionally would spend the whole loop re-laying out a row that says the same thing.
+    if (valid == connected_row_rssi_valid && (!valid || live_rssi == connected_row_rssi)) {
+        return;
+    }
+
+    char label[192];
+    formatConnectedRowText(connected_row_name, connected_row_tx_power, valid, live_rssi, label, sizeof(label));
+    lv_label_set_text(connected_row_label, label);
+    connected_row_rssi = live_rssi;
+    connected_row_rssi_valid = valid;
 }
 
 bool View::isUserInteractingWithList() const {
@@ -386,6 +499,11 @@ void View::update() {
 
     updateBtToggle();
     updateScanning();
+
+    // Before the change detection below, because the live link RSSI is exactly what that detection
+    // cannot see: it changes with no event, no count and no state behind it, so update() returned early
+    // on every tick and the row kept the reading it was built with however far the device then moved.
+    refreshConnectedRow();
 
     const auto current_radio = state->getRadioState();
     const auto current_scanning = state->isScanning();

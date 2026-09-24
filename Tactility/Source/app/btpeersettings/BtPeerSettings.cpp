@@ -132,21 +132,21 @@ void createWidgets(lv_obj_t* parent, void* userData) {
 
     ctx->connectButton = lv_button_create(wrapper);
     lv_obj_set_width(ctx->connectButton, LV_PCT(100));
-    lv_obj_add_event_cb(ctx->connectButton, onPressConnect, LV_EVENT_SHORT_CLICKED, ctx);
+    lv_obj_add_event_cb(ctx->connectButton, onPressConnect, LV_EVENT_CLICKED, ctx);
     auto* connect_label = lv_label_create(ctx->connectButton);
     lv_obj_align(connect_label, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(connect_label, "Connect");
 
     ctx->disconnectButton = lv_button_create(wrapper);
     lv_obj_set_width(ctx->disconnectButton, LV_PCT(100));
-    lv_obj_add_event_cb(ctx->disconnectButton, onPressDisconnect, LV_EVENT_SHORT_CLICKED, ctx);
+    lv_obj_add_event_cb(ctx->disconnectButton, onPressDisconnect, LV_EVENT_CLICKED, ctx);
     auto* disconnect_label = lv_label_create(ctx->disconnectButton);
     lv_obj_align(disconnect_label, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(disconnect_label, "Disconnect");
 
     auto* forget_button = lv_button_create(wrapper);
     lv_obj_set_width(forget_button, LV_PCT(100));
-    lv_obj_add_event_cb(forget_button, onPressForget, LV_EVENT_SHORT_CLICKED, ctx);
+    lv_obj_add_event_cb(forget_button, onPressForget, LV_EVENT_CLICKED, ctx);
     auto* forget_label = lv_label_create(forget_button);
     lv_obj_align(forget_label, LV_ALIGN_CENTER, 0, 0);
     lv_label_set_text(forget_label, "Forget");

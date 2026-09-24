@@ -39,6 +39,12 @@ constexpr TickType_t VIEW_REFRESH_INTERVAL_TICKS = pdMS_TO_TICKS(100);
 // no way to tell that nothing is happening.
 constexpr TickType_t CONNECT_TIMEOUT_TICKS = pdMS_TO_TICKS(15000);
 
+// How often the connected peer's link RSSI is re-read. This is the one value that changes with no
+// event behind it - walking a keyboard across the room produces neither a peer-found nor a state
+// change - so it is polled rather than refreshed on demand. Twice a second is fast enough to watch
+// while moving the device, and the row is only redrawn when the reading actually changes.
+constexpr TickType_t CONNECTED_RSSI_POLL_INTERVAL_TICKS = pdMS_TO_TICKS(500);
+
 static void onBtToggled(void* context, bool requestOn) {
 #if defined(CONFIG_BT_NIMBLE_ENABLED)
     auto* ctx = static_cast<Context*>(context);
@@ -296,6 +302,7 @@ int32_t appMain(int argc, char* argv[]) {
 
     bool shouldClose = false;
     TickType_t last_refresh_ticks = 0;
+    TickType_t last_rssi_poll_ticks = 0;
     while (!shouldClose) {
         // While unsubscribed, wake on a timeout instead of blocking forever: the BT device only
         // gains its event queue once the radio is enabled, so an app opened with the radio off has
@@ -404,9 +411,26 @@ int32_t appMain(int argc, char* argv[]) {
                     ctx.state.updatePairedPeers();
                     ctx.paired_peers_dirty = false;
                 }
+                // Re-read the live link value on the same refresh as the peer list: a connected
+                // keyboard stops advertising, so its scan RSSI is frozen and cannot show that it was
+                // just moved closer (see bluetooth::getConnectionRssi). Cheap - one HCI read.
+                ctx.state.updateConnectedRssi();
                 ctx.view_dirty = false;
                 last_refresh_ticks = now;
                 requestViewUpdate(&ctx);
+            }
+        }
+
+        // The live link value polled on its own cadence: it changes without any event, so nothing else
+        // would ever ask for it (see CONNECTED_RSSI_POLL_INTERVAL_TICKS). Redrawn only on a change, so
+        // a stationary keyboard does not rebuild the list underneath the user.
+        if (ctx.state.getConnectedPeerCount() > 0) {
+            const TickType_t now = xTaskGetTickCount();
+            if ((TickType_t)(now - last_rssi_poll_ticks) >= CONNECTED_RSSI_POLL_INTERVAL_TICKS) {
+                last_rssi_poll_ticks = now;
+                if (ctx.state.updateConnectedRssi()) {
+                    requestViewUpdate(&ctx);
+                }
             }
         }
     }

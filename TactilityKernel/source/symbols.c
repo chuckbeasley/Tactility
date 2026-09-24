@@ -331,6 +331,7 @@ const struct ModuleSymbol KERNEL_SYMBOLS[] = {
     DEFINE_MODULE_SYMBOL(bluetooth_get_paired_peers),
     DEFINE_MODULE_SYMBOL(bluetooth_connect),
     DEFINE_MODULE_SYMBOL(bluetooth_disconnect),
+    DEFINE_MODULE_SYMBOL(bluetooth_get_connection_rssi),
     DEFINE_MODULE_SYMBOL(bluetooth_event_subscribe),
     DEFINE_MODULE_SYMBOL(bluetooth_event_unsubscribe),
     DEFINE_MODULE_SYMBOL(bluetooth_event_poll),

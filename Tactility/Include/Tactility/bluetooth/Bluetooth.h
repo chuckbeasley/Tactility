@@ -25,6 +25,14 @@ struct PeerRecord {
     bool connected;
     /** Profile used to pair (BtProfileId value). Only meaningful for paired peers. */
     int profileId = 0;
+    /**
+     * TX power the peer quoted in its advertisement, in dBm, or 0x7F when it advertised none (the
+     * sentinel the driver uses). It comes from the advertisement the scan heard, so it is still valid
+     * for a peer that has since connected and stopped advertising, and it is the constant that turns an
+     * RSSI into a path loss: path_loss_db = txPower - rssi. Without it a weak reading cannot be
+     * attributed - a device transmitting at -20 dBm reads exactly like one 20 dB further away.
+     */
+    int8_t txPower = 0x7F;
 };
 
 // Turns the BT radio on (dev is already started - see ble0's devicetree status)
@@ -46,6 +54,19 @@ std::vector<PeerRecord> getScanResults();
 
 /** @return the list of currently paired peers */
 std::vector<PeerRecord> getPairedPeers();
+
+/**
+ * @brief Read the live RSSI of an existing connection, in dBm.
+ *
+ * Unlike PeerRecord::rssi - which is what a scan last heard from an advertisement and therefore
+ * freezes once a peer connects and stops advertising - this asks the controller about the connection
+ * that exists now, so it follows the peer as it moves.
+ *
+ * @param[in] addr the peer address
+ * @param[out] out_rssi the connection RSSI in dBm
+ * @return true when the peer is connected and the controller reported a value
+ */
+bool getConnectionRssi(const std::array<uint8_t, 6>& addr, int8_t& out_rssi);
 
 /**
  * @brief Initiate pairing with a peer.

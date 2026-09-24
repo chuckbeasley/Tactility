@@ -69,9 +69,18 @@ bool load(const std::string& addr_hex, PairedDevice& device) {
     if (!file::isFile(file_path)) return false;
 
     std::map<std::string, std::string> map;
-    if (!file::loadPropertiesFile(file_path, map)) return false;
-    if (!map.contains(KEY_ADDR)) return false;
-    if (!hexToAddr(map[KEY_ADDR], device.addr)) return false;
+    if (!file::loadPropertiesFile(file_path, map)) {
+        LOG_E(TAG, "Failed to read %s as a properties file", file_path.c_str());
+        return false;
+    }
+    if (!map.contains(KEY_ADDR)) {
+        LOG_E(TAG, "%s has no %s key", file_path.c_str(), KEY_ADDR);
+        return false;
+    }
+    if (!hexToAddr(map[KEY_ADDR], device.addr)) {
+        LOG_E(TAG, "%s has an unparsable addr '%s'", file_path.c_str(), map[KEY_ADDR].c_str());
+        return false;
+    }
 
     device.name = map.contains(KEY_NAME) ? map[KEY_NAME] : "";
 
@@ -105,10 +114,14 @@ bool remove(const std::string& addr_hex) {
     return ::remove(file_path.c_str()) == 0;
 }
 
-std::vector<PairedDevice> loadAll() {
+// Shared by loadAll() and loadByName(). The file name carries the address a record is filed under,
+// which loadAll() drops - so the pairs are what both need, and neither should walk the directory
+// itself.
+static std::vector<std::pair<std::string, PairedDevice>> loadStoredDevices() {
+    std::vector<std::pair<std::string, PairedDevice>> result;
     std::vector<dirent> entries;
     if (!file::isDirectory(getSettingsFilePath())) {
-        return {};
+        return result;
     }
     file::scandir(getSettingsFilePath(), entries, [](const dirent* entry) -> int {
         if (entry->d_type != file::TT_DT_REG && entry->d_type != file::TT_DT_UNKNOWN) return -1;
@@ -116,17 +129,42 @@ std::vector<PairedDevice> loadAll() {
         return name.ends_with(".device.properties") ? 0 : -1;
     }, nullptr);
 
-    std::vector<PairedDevice> result;
     result.reserve(entries.size());
+    constexpr std::string_view suffix = ".device.properties";
     for (const auto& entry : entries) {
-        std::string filename = entry.d_name;
-        constexpr std::string_view suffix = ".device.properties";
+        const std::string filename = entry.d_name;
         if (filename.size() <= suffix.size()) continue;
         const std::string addr_hex = filename.substr(0, filename.size() - suffix.size());
         PairedDevice device;
         if (load(addr_hex, device)) {
-            result.push_back(std::move(device));
+            result.emplace_back(addr_hex, std::move(device));
         }
+    }
+    return result;
+}
+
+bool loadByName(const std::string& name, PairedDevice& out_device, std::string& out_addr_hex) {
+    if (name.empty()) {
+        // Without this, an unnamed record would match every unnamed lookup - and the scan cache is
+        // full of peers that never advertised a name.
+        return false;
+    }
+    for (auto& [addr_hex, device] : loadStoredDevices()) {
+        if (device.name == name) {
+            out_device = device;
+            out_addr_hex = addr_hex;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<PairedDevice> loadAll() {
+    std::vector<PairedDevice> result;
+    auto stored = loadStoredDevices();
+    result.reserve(stored.size());
+    for (auto& [addr_hex, device] : stored) {
+        result.push_back(std::move(device));
     }
     return result;
 }

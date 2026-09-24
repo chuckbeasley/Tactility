@@ -723,6 +723,7 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
         // Resolved here, in the callback, rather than inside the dispatch below: ble_gap_conn_find()
         // belongs to the NimBLE host task, which is where this code is running.
         std::array<uint8_t, 6> identity_addr = peer_addr;
+        bool identity_usable = false;
         {
             struct ble_gap_conn_desc conn_desc = {};
             if (ctx.connHandle != BLE_HS_CONN_HANDLE_NONE &&
@@ -735,11 +736,12 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
                 }
                 if (usable) {
                     std::memcpy(identity_addr.data(), conn_desc.peer_id_addr.val, 6);
+                    identity_usable = true;
                 }
             }
         }
 
-        getMainDispatcher().dispatch([peer_addr, identity_addr] {
+        getMainDispatcher().dispatch([peer_addr, identity_addr, identity_usable] {
             // Find name from cached scan results
             std::string name;
             {
@@ -758,6 +760,55 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
                 device.autoConnect = existing.autoConnect;
             }
             device.name = name;
+
+            // One record per device, whichever key this connection would use.
+            //
+            // Two things make the key move. A peer that rotates its address and never bonds has no
+            // identity address, so the key is the temporary one it happens to be using - a different
+            // key on every connection, and therefore a new settings file every time; one BLE keyboard
+            // was stored four times this way, each entry with autoConnect=true. And a peer that *does*
+            // bond does not fix it retroactively: the first, unbonded connection filed it under a
+            // temporary address, and the bonded one files it under the identity address, which leaves
+            // the temporary entry behind - observed as two files named "Bluetooth Keyboard", one of
+            // which can never match again.
+            //
+            // Either way the leftover is a row for an address the device no longer uses, and those
+            // rows open the device settings screen rather than connecting, which reads as "clicking
+            // the keyboard no longer connects". The name is the only thing that survives the move, so
+            // a record already stored under this name is moved to the current key. What this gives up:
+            // two different devices advertising the same name would collapse into one.
+            if (!name.empty()) {
+                std::string previous_hex;
+                settings::PairedDevice previous;
+                if (settings::loadByName(name, previous, previous_hex)) {
+                    if (previous_hex != addr_hex) {
+                        if (settings::remove(previous_hex)) {
+                            // The user's own choice about auto-connect belongs to the device, not to
+                            // the key.
+                            device.autoConnect = previous.autoConnect;
+                            LOG_I(TAG, "Moved paired entry for %s from %s to %s (%s)",
+                                name.c_str(), previous_hex.c_str(), addr_hex.c_str(),
+                                identity_usable ? "identity address" : "new temporary address");
+                        } else {
+                            // Logged rather than folded into one condition: a merge that silently does
+                            // nothing is indistinguishable, from the outside, from one that never ran -
+                            // and that is exactly how three entries for one keyboard were left behind.
+                            LOG_E(TAG, "Could not remove old paired entry %s for %s",
+                                previous_hex.c_str(), name.c_str());
+                        }
+                    }
+                } else {
+                    LOG_I(TAG, "No stored entry named %s; filing %s as a new device",
+                        name.c_str(), addr_hex.c_str());
+                }
+            } else {
+                // The name comes from the scan cache, keyed by the address the peer was scanned at. A
+                // peer that rotated its address since the scan is unknown here, and the record is filed
+                // nameless - which is why a missing name is worth saying out loud.
+                LOG_I(TAG, "Pairing %s without a name: no scan record for that address",
+                    addr_hex.c_str());
+            }
+
             settings::save(device);
 
             // The connect address may already have produced its own file for this same device. Now

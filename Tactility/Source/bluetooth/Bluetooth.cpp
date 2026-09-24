@@ -90,6 +90,7 @@ static void cachePeerRecord(const BtPeerRecord& krecord) {
     rec.paired    = krecord.paired;
     rec.connected = krecord.connected;
     rec.profileId = 0;
+    rec.txPower   = krecord.tx_power;
 
     cacheScanAddr(krecord.addr, krecord.addr_type);
 
@@ -99,6 +100,9 @@ static void cachePeerRecord(const BtPeerRecord& krecord) {
         if (existing.addr == rec.addr) {
             if (!rec.name.empty()) existing.name = rec.name;
             existing.rssi = rec.rssi;
+            // Kept even after the peer stops advertising: it is the constant that makes its RSSI
+            // mean something (see PeerRecord::txPower).
+            if (rec.txPower != 0x7F) existing.txPower = rec.txPower;
             return;
         }
     }
@@ -191,6 +195,14 @@ static void bt_event_bridge(BtEvent event) {
                     std::array<uint8_t, 6> peer_addr;
                     memcpy(peer_addr.data(), addr_buf, 6);
                     const auto hex = settings::addrToHex(peer_addr);
+                    // The HID host path saves this peer itself, and with more to go on: it knows the
+                    // name (which is what lets a rotating address be recognised as the same device)
+                    // and it resolves the identity address. Saving here as well - with no name, under
+                    // whatever address the pair event carried - is how a second record for the same
+                    // keyboard appeared that nothing could later match or merge.
+                    if (profile_copy == BT_PROFILE_HID_HOST) {
+                        return;
+                    }
                     if (!settings::hasFileForDevice(hex)) {
                         settings::PairedDevice dev;
                         dev.addr        = peer_addr;
@@ -477,6 +489,19 @@ std::vector<PeerRecord> getPairedPeers() {
 
 void pair(const std::array<uint8_t, 6>& /*addr*/) {
     // Pairing is handled automatically during connection by NimBLE SM.
+}
+
+bool getConnectionRssi(const std::array<uint8_t, 6>& addr, int8_t& out_rssi) {
+    Device* dev = findFirstRegisteredDevice();
+    if (dev == nullptr) {
+        return false;
+    }
+    int8_t rssi = 0;
+    const bool ok = bluetooth_get_connection_rssi(dev, addr.data(), &rssi) == ERROR_NONE;
+    if (ok) {
+        out_rssi = rssi;
+    }
+    return ok;
 }
 
 void unpair(const std::array<uint8_t, 6>& addr) {
