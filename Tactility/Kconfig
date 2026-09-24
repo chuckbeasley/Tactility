@@ -112,6 +112,26 @@ menu "Tactility App"
             hardware.imu property, and only for boards that also list Drivers/qmi8658-module in
             devicetree.yaml: the app calls that driver directly, so the two have to agree or the
             build fails to link.
+    config TT_WAVESHARE_C5_VBUS_WATCH
+        bool "Waveshare ESP32-C5: include the on-board VBUS watch diagnostic"
+        default n
+        help
+            Compiles in the board's VBUS watch (Devices/waveshare-esp32c5-touch-lcd-35/source/
+            vbus_watch.cpp): a task that logs the PMIC's VBUS state, the touch controller's answer and
+            the CH32V003 expander's registers, and tries candidate fixes when the USB cable is pulled.
+            It answered the "touch dies on battery" question - the controller's threshold register,
+            not a rail - and is off by default now that it has.
+
+            It is off by default for a second reason: to survive the cable being unplugged, the watch
+            writes its log into the partition table's `coredump` partition, whose first uint32_t the
+            core-dump backend reads as a dump size. With the watch on, every boot logs "Incorrect size
+            of core dump image", and a panic dump and the watch's log overwrite each other - so with
+            the watch on you must read a dump before letting the board boot again. With it off the
+            partition belongs to core dumps alone and the boot log stays clean.
+
+            Enable it per device with a `sdkconfig.CONFIG_TT_WAVESHARE_C5_VBUS_WATCH=y` line in that
+            device's device.properties (see that file for the trade recorded in full), or with
+            `idf.py menuconfig` for a one-off build.
     config TT_APP_DEFAULT_STACK_BYTES
         int "Default app task stack, in bytes"
         default 8192

@@ -40,8 +40,11 @@
 // That watch (vbus_watch.cpp) exists because of the one behaviour on this board that a full replay of
 // the vendor's init did *not* explain: touch works while the USB cable is in and dies when it is out,
 // with the display still running and no reboot. The watch measures what actually changes, and tries
-// the candidate fixes.
+// the candidate fixes. It is off unless CONFIG_TT_WAVESHARE_C5_VBUS_WATCH is set: it answered the
+// question, and it costs the coredump partition while it is compiled in.
 #include "board_pmic_init.h"
+
+#include <sdkconfig.h>
 
 #include <tactility/error.h>
 #include <tactility/log.h>
@@ -51,8 +54,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#if defined(CONFIG_TT_WAVESHARE_C5_VBUS_WATCH)
 /// Defined in vbus_watch.cpp.
 extern "C" void waveshare_c5_vbus_watch_start();
+#endif
 
 namespace {
 
@@ -142,8 +147,11 @@ error_t board_bring_up() {
     i2c_del_master_bus(bus);
 
     // Starts once the kernel has started the PMIC and touch devices this depends on; see the file
-    // header of vbus_watch.cpp for what it measures and why it lives in the firmware.
+    // header of vbus_watch.cpp for what it measures and why it lives in the firmware. Compiled out
+    // unless CONFIG_TT_WAVESHARE_C5_VBUS_WATCH is set.
+#if defined(CONFIG_TT_WAVESHARE_C5_VBUS_WATCH)
     waveshare_c5_vbus_watch_start();
+#endif
 
     return ERROR_NONE;
 }

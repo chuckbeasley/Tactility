@@ -18,7 +18,9 @@
 // vendor's setters are RMW, so replaying them literally preserves bits it deliberately keeps.
 //
 // It lives in a header because two callers need it: the boot-time bring-up, and the VBUS watch, which
-// re-applies the whole table when the cable is pulled (see vbus_watch.cpp).
+// re-applies the whole table when the cable is pulled (see vbus_watch.cpp - compiled out unless
+// CONFIG_TT_WAVESHARE_C5_VBUS_WATCH is set, so in a default build the boot-time bring-up is the only
+// caller).
 #include <cstddef>
 #include <cstdint>
 

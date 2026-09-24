@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
+// Gated behind TT_WAVESHARE_C5_VBUS_WATCH, off by default. It answered its question (the controller's
+// threshold register, not a rail - see ft6x36.cpp), and while it is compiled in it owns the coredump
+// partition, which costs a boot-time "Incorrect size of core dump image" and makes panic dumps and its
+// log overwrite each other. Turn it on with `sdkconfig.CONFIG_TT_WAVESHARE_C5_VBUS_WATCH=y` in this
+// device's device.properties when that question needs asking again.
+//
 // Why does touch die when the USB cable is pulled?
 //
 // Measured symptom: with the cable in, touch works; unplug it (the board keeps running from its
@@ -34,9 +40,10 @@
 //   2. pulse the expander's pins 0/1, the same pulse the board bring-up uses, which is the touch (and
 //      panel) reset line if it is one (+2 s).
 // If either restores touch on battery, the log says so and the fix is simply to keep doing it.
-//
-// This is a diagnostic that is expected to be removed once the question is answered; it is committed
-// because the tree does not carry uncommitted diagnostics, not because it belongs in a release.
+#include <sdkconfig.h>
+
+#if defined(CONFIG_TT_WAVESHARE_C5_VBUS_WATCH)
+
 #include "board_pmic_init.h"
 
 #include <cstdarg>
@@ -678,3 +685,5 @@ extern "C" void waveshare_c5_vbus_watch_start() {
     // reason a touch is late.
     xTaskCreate(vbus_watch_task, "vbus-watch", 5120, nullptr, 3, nullptr);
 }
+
+#endif // CONFIG_TT_WAVESHARE_C5_VBUS_WATCH
