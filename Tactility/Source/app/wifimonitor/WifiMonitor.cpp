@@ -7,6 +7,7 @@
 #include <Tactility/Mutex.h>
 #include <Tactility/Timer.h>
 #include <Tactility/service/wifi/Wifi.h>
+#include <Tactility/wifi/WifiRanging.h>
 
 #include "PcapWriter.h"
 
@@ -52,6 +53,10 @@ constexpr uint32_t POLL_INTERVAL_MS = 200;
 constexpr size_t STREAM_BUFFER_SIZE = 1024 * 1024;
 constexpr size_t MAX_FRAME_SIZE = 2346; // 802.11 max MPDU size (sig_len includes FCS)
 
+// "No reading yet" for the atomic the poll tick reads: an int16 holding the smoothed RSSI in tenths
+// of a dBm, so the writer task never shares a float with the UI task.
+constexpr int16_t kNoLinkReading = INT16_MIN;
+
 // Header prepended to each frame in the stream buffer.
 struct CaptureRecord {
     uint32_t length;   // frame payload length
@@ -89,8 +94,19 @@ struct Context {
     bool wifiAutoConnectPaused = false; // set when we paused WiFi auto-connect for capture
     Mutex captureMutex; // serializes start/stop state transitions
 #endif
+    // The monitored link's signal, as a band rather than a number: the filter is fed one sample per
+    // captured frame (on the Wi-Fi task) and the band is rendered from it in the poll tick under the
+    // LVGL lock, which is the only place a label may be touched.
+    // Calibration for the distance band, read once when a capture starts: the model's constants do
+    // not change while capturing, and reading a file from the 200 ms poll timer would put file I/O
+    // on the UI's critical path for no benefit. An edit takes effect on the next start.
+    tt::wifi::ranging::Calibration calibration;
+    tt::wifi::ranging::RssiFilter linkFilter;
+    std::atomic<int16_t> linkRssiX10{kNoLinkReading};
+    std::atomic<uint8_t> linkChannel{0};
     lv_obj_t* statusLabel = nullptr;
     lv_obj_t* statsLabel = nullptr;
+    lv_obj_t* linkLabel = nullptr;
     lv_obj_t* startButtonLabel = nullptr;
 };
 
@@ -113,6 +129,27 @@ void updateStartButtonLabel(Context* ctx) {
     if (ctx->startButtonLabel != nullptr) {
         lv_label_set_text(ctx->startButtonLabel, ctx->capturing ? "Stop" : "Start");
     }
+}
+
+void updateLinkLabel(Context* ctx) {
+    if (ctx->linkLabel == nullptr) return;
+
+    const int16_t rssi_x10 = ctx->linkRssiX10.load();
+    if (rssi_x10 == kNoLinkReading) {
+        // Nothing captured yet, so there is no signal to band. Saying so is better than showing a
+        // band derived from a default.
+        lv_label_set_text(ctx->linkLabel, "Signal: no frames yet");
+        return;
+    }
+
+    // Calibration was read when the capture started; see the note on Context::calibration.
+    const float rssi = static_cast<float>(rssi_x10) / 10.0f;
+    const auto value = tt::wifi::ranging::estimate(rssi, ctx->linkChannel.load(), ctx->calibration);
+
+    char band[64];
+    tt::wifi::ranging::formatBand(value, band, sizeof(band));
+    auto text = std::format("Signal: {:.0f} dBm\n{}", (double)rssi, band);
+    lv_label_set_text(ctx->linkLabel, text.c_str());
 }
 
 void updateStatsLabel(Context* ctx) {
@@ -218,13 +255,25 @@ void onPacket(void* context, const uint8_t* payload, size_t length, WifiPromiscu
     // Reflect the channel this frame was actually received on, so the UI readout
     // shows where the radio really is (not just where we asked it to hop).
     ctx->currentChannel.store(info.channel);
-    // Track the AP BSSID from each frame (used for deauth injection).
+
+    // Track the AP BSSID from each frame (used for deauth injection and for the signal band below).
     if (length >= 22) {
         bool to_ds = (payload[1] & 0x01) != 0;
         bool from_ds = (payload[1] & 0x02) != 0;
         const uint8_t* bssid = (to_ds && !from_ds) ? (payload + 4) : (payload + 16);
         std::memcpy(ctx->apBssid, bssid, 6);
         ctx->apBssidKnown = true;
+    }
+
+    // Every captured frame is a signal sample, but only the ones the access point itself transmitted
+    // describe the link *to the access point*. In promiscuous mode the newest frame is usually some
+    // client's, and a client transmits at a fraction of the AP's power: measured here, the AP at
+    // -46 dBm against a client's -73 dBm - "same room" against "far / other room" from the same spot.
+    // The transmitter is Addr2 (offset 10).
+    if (length >= 22 && ctx->apBssidKnown && std::memcmp(payload + 10, ctx->apBssid, 6) == 0) {
+        ctx->linkFilter.add(info.rssi);
+        ctx->linkRssiX10.store(static_cast<int16_t>(ctx->linkFilter.dBm() * 10.0f));
+        ctx->linkChannel.store(info.channel);
     }
     // Data frames only: skip management/control/misc frames so the capture and
     // stream buffer are dedicated to the traffic the user is hunting.
@@ -350,6 +399,12 @@ void startCapture(Context* ctx) {
     // so two writers never share the stream buffer. This runs on the timer task,
     // not the LVGL task, so it doesn't freeze the UI.
     joinWriter(ctx);
+
+    // Fresh calibration and a fresh signal average for this capture: the previous run's smoothed RSSI
+    // describes a link that may have moved since.
+    ctx->calibration = tt::wifi::ranging::loadCalibration();
+    ctx->linkFilter.reset();
+    ctx->linkRssiX10.store(kNoLinkReading);
 
     ctx->captureMutex.withLock([ctx] {
         // The user may have tapped Stop while we were waiting for the old writer.
@@ -504,6 +559,7 @@ void onPollTick(Context* ctx) {
     lvgl_lock();
     updateStatsLabel(ctx);
     updateStatusLabel(ctx);
+    updateLinkLabel(ctx);
     lvgl_unlock();
 }
 
@@ -550,6 +606,13 @@ void createWidgets(lv_obj_t* parent, void* userData) {
 
     ctx->statusLabel = lv_label_create(wrapper);
     lv_label_set_text(ctx->statusLabel, "Stopped");
+
+    // Two lines: a dBm reading and the band it falls in. The band is the part worth reading - a bare
+    // distance from an RSSI would be a number with no error bar, which is how a factor-of-two estimate
+    // gets mistaken for a measurement. The calibration behind it lives in
+    // <data>/settings/wifi-ranging.properties.
+    ctx->linkLabel = lv_label_create(wrapper);
+    lv_label_set_text(ctx->linkLabel, "Signal: no frames yet");
 
 #if defined(CONFIG_SOC_WIFI_SUPPORTED)
     {

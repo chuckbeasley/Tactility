@@ -9,6 +9,7 @@
 #include <Tactility/Mutex.h>
 #include <Tactility/Timer.h>
 #include <Tactility/service/wifi/Wifi.h>
+#include <Tactility/wifi/WifiRanging.h>
 
 #include "../wifimonitor/PcapWriter.h"
 
@@ -106,6 +107,10 @@ enum class NetMode { Host, Ssh, Telnet, Port };
 constexpr uint32_t POLL_INTERVAL_MS = 200;
 constexpr size_t STREAM_BUFFER_SIZE = 1024 * 1024;
 constexpr size_t MAX_FRAME_SIZE = 2346;
+
+// "No reading yet" for the atomic the poll tick reads: the smoothed RSSI in tenths of a dBm, so no
+// float is ever shared between the Wi-Fi task and the UI task.
+constexpr int16_t kNoLinkReading = INT16_MIN;
 constexpr uint32_t INJECT_INTERVAL_MS = 50;
 // Reduced from 8. Each injected frame is one esp_wifi_80211_tx, and the driver holds only a small
 // pool of static TX buffers - eight back-to-back sends every 300 ms exhausted it, which is why the
@@ -212,6 +217,15 @@ struct Context {
     // code that actually calls wifi_set_channel() writes this.
     std::atomic<uint8_t> tunedChannel{0};
     uint8_t lockChannel = 0;
+
+    // Signal of the link being captured, as a band rather than a number - the same treatment the
+    // Wi-Fi Monitor gives it, from the same frames. The filter is written only by onPacket() on the
+    // Wi-Fi task; the band is rendered in the poll tick under the LVGL lock.
+    tt::wifi::ranging::Calibration calibration;
+    tt::wifi::ranging::RssiFilter linkFilter;
+    std::atomic<int16_t> linkRssiX10{kNoLinkReading};
+    std::atomic<uint8_t> linkChannel{0};
+    lv_obj_t* linkLabel = nullptr;
     uint8_t channelIndex = 0;
     uint8_t hopTick = 0;
     uint8_t targetMac[6] = {0};
@@ -376,6 +390,22 @@ static void onPacket(void* context, const uint8_t* payload, size_t length, WifiP
         const uint8_t* bssid = (to_ds && !from_ds) ? (payload + 4) : (payload + 16);
         std::memcpy(ctx->apBssid, bssid, 6);
         ctx->apBssidKnown = true;
+    }
+
+    // Signal sample for the link being captured - but only from frames the access point itself sent.
+    // With promiscuous capture the newest frame is usually a client's, and a client transmits at a
+    // fraction of the AP's power: measured here, the AP at -46 dBm against a client's -73 dBm, which
+    // is "same room" against "far / other room" from one spot. The transmitter is Addr2 (offset 10),
+    // compared against the picked target when there is one, since that is the AP being worked on.
+    if (length >= 22) {
+        const uint8_t* expected = ctx->targetBssidKnown ? ctx->targetBssid
+                                   : ctx->apBssidKnown  ? ctx->apBssid
+                                                        : nullptr;
+        if (expected != nullptr && std::memcmp(payload + 10, expected, 6) == 0) {
+            ctx->linkFilter.add(info.rssi);
+            ctx->linkRssiX10.store(static_cast<int16_t>(ctx->linkFilter.dBm() * 10.0f));
+            ctx->linkChannel.store(info.channel);
+        }
     }
 
     if (length == 0 || length > MAX_FRAME_SIZE) {
@@ -1206,6 +1236,11 @@ static void onCaptureStartStop(lv_event_t* event) {
         ctx->eapolCount = 0;
         ctx->pmkidCount = 0;
         ctx->deauthCount = 0;
+        // Fresh calibration and a fresh signal average per capture: the constants do not change while
+        // running, and the previous run's average describes a link that may have moved since.
+        ctx->calibration = tt::wifi::ranging::loadCalibration();
+        ctx->linkFilter.reset();
+        ctx->linkRssiX10.store(kNoLinkReading);
         // The label is refreshed on success because startCapture() re-chooses the directory: a card
         // can have been inserted or removed since this screen was built, and the file follows the
         // choice made now, not the one shown before.
@@ -1414,6 +1449,10 @@ static void showCaptureScreen(Context* ctx) {
 
     ctx->statsLabel = lv_label_create(ctx->body);
     lv_label_set_text(ctx->statsLabel, "");
+
+    // The signal of what is being captured, as a band with its uncertainty - not a bare distance.
+    ctx->linkLabel = lv_label_create(ctx->body);
+    lv_label_set_text(ctx->linkLabel, "Signal: no frames yet");
 }
 
 // ---- Inject screen ----
@@ -1667,6 +1706,23 @@ static void onPollTick(Context* ctx) {
         }
         if (ctx->statusLabel != nullptr) {
             lv_label_set_text(ctx->statusLabel, statusText);
+        }
+        if (ctx->linkLabel != nullptr) {
+            // The captured link's signal as a band, not a bare distance: an RSSI-derived distance
+            // carries a factor-of-two uncertainty, and the band plus its range is the only honest way
+            // to put that on a screen. Calibration lives in <data>/settings/wifi-ranging.properties.
+            const int16_t rssi_x10 = ctx->linkRssiX10.load();
+            if (rssi_x10 == kNoLinkReading) {
+                lv_label_set_text(ctx->linkLabel, "Signal: no frames yet");
+            } else {
+                const float rssi = static_cast<float>(rssi_x10) / 10.0f;
+                const auto value = tt::wifi::ranging::estimate(rssi, ctx->linkChannel.load(), ctx->calibration);
+                char band[64];
+                tt::wifi::ranging::formatBand(value, band, sizeof(band));
+                char line[96];
+                std::snprintf(line, sizeof(line), "Signal: %.0f dBm\n%s", (double)rssi, band);
+                lv_label_set_text(ctx->linkLabel, line);
+            }
         }
         if (ctx->startButtonLabel != nullptr) {
             lv_label_set_text(ctx->startButtonLabel, startText);
