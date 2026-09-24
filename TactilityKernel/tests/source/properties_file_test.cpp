@@ -233,6 +233,33 @@ TEST_CASE("a failed close leaves previously-saved content on disk untouched") {
     rmdir(dir);
 }
 
+TEST_CASE("reading a file does not write to it") {
+    ScratchFile scratch;
+
+    // A comment and a non-alphabetical order: a rewrite would drop the first and reorder the rest, so
+    // byte-for-byte equality is the check that this was a read.
+    const char* original = "# a comment\nzeta=1\nalpha=2\n";
+    write_raw(TEST_PATH, original);
+
+    PropertiesFile* file = properties_file_open(TEST_PATH);
+    char buffer[32];
+    CHECK_EQ(properties_file_get(file, "alpha", buffer, sizeof(buffer)), ERROR_NONE);
+    CHECK_EQ(std::strcmp(buffer, "2"), 0);
+    CHECK_EQ(properties_file_close(file), ERROR_NONE);
+
+    FILE* raw = std::fopen(TEST_PATH, "r");
+    REQUIRE(raw != nullptr);
+    char read_back[64] = {};
+    size_t read_size = std::fread(read_back, 1, sizeof(read_back) - 1, raw);
+    std::fclose(raw);
+    CHECK_EQ(std::strcmp(read_back, original), 0);
+    CHECK_EQ(read_size, std::strlen(original));
+
+    // And an interrupted save's leftovers are not left behind by a read.
+    CHECK_FALSE(file_exists("/tmp/tactility_kernel_properties_file_test.properties.tmp"));
+    CHECK_FALSE(file_exists("/tmp/tactility_kernel_properties_file_test.properties.bak"));
+}
+
 TEST_CASE("properties_file_for_each visits every key exactly once") {
     ScratchFile scratch;
 

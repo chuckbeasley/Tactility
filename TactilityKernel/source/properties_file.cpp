@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <string>
 #include <unordered_map>
@@ -40,6 +41,13 @@ bool split_key_value(const std::string& line, std::string& key, std::string& val
 struct PropertiesFile {
     std::string path;
     std::unordered_map<std::string, std::string> entries;
+    // Whether properties_file_set() was called. A plain read - open, get, close - must not write:
+    // this class used to save unconditionally on close, which turned every reader into a writer and
+    // rewrote the file (dropping its comments and its original key order) once per read. Callers that
+    // read the same file in a loop while something else saves it - the Bluetooth app listing paired
+    // devices twice a second while a device connects - then raced on the same temporary file, and the
+    // loser deleted a record that had just been written.
+    bool dirty = false;
 };
 
 namespace {
@@ -106,15 +114,28 @@ bool load_from_file(PropertiesFile* file) {
     return read_ok;
 }
 
-// Writes to a temporary file in the same directory, then atomically replaces the real path -
-// opening the real path directly with "w" would truncate it immediately, so any failure
-// partway through (full filesystem, I/O error, a reset before close) would discard the
-// previously-good content instead of leaving it intact. Same directory so rename() stays on one
-// filesystem, which is what makes it atomic.
-// @return true if the backing file was fully replaced with the current entries; false (leaving
-// the previous on-disk content untouched) if any step failed.
+// Writes to a temporary file in the same directory, then replaces the real path - opening the real
+// path directly with "w" would truncate it immediately, so any failure partway through (full
+// filesystem, I/O error, a reset before close) would discard the previously-good content instead of
+// leaving it intact. Same directory so rename() stays on one filesystem.
+//
+// The previous content is moved aside rather than deleted first. remove(path) followed by rename()
+// has a window - and a failure path - in which no file exists at all, and that is how a
+// paired-device record was lost: FAT does not rename onto an existing name, the delete that avoided
+// that had already happened, and the rename that followed failed because a *concurrent* save had
+// taken the file. Parking the old file at "<path>.bak" frees the destination name for the rename and
+// leaves something to restore from when it fails.
+//
+// @return true if the backing file was fully replaced with the current entries; false (leaving the
+// previous on-disk content in place) if any step failed.
 bool save_to_file(const PropertiesFile* file) {
-    std::string temp_path = file->path + ".tmp";
+    // One save at a time, process-wide: two tasks saving the same path would otherwise share the
+    // temporary file name and interleave their rename steps.
+    static std::mutex save_mutex;
+    const std::lock_guard<std::mutex> lock(save_mutex);
+
+    const std::string temp_path = file->path + ".tmp";
+    const std::string backup_path = file->path + ".bak";
 
     FILE* handle = std::fopen(temp_path.c_str(), "w");
     if (handle == nullptr) {
@@ -137,14 +158,24 @@ bool save_to_file(const PropertiesFile* file) {
         return false;
     }
 
-    // rename() may not overwrite an existing destination on some filesystems (e.g. FAT on
-    // ESP32), so remove it first; this is best-effort and ignored if the path doesn't exist yet.
-    std::remove(file->path.c_str());
+    // A leftover from an interrupted save would be in the way of the rename below.
+    std::remove(backup_path.c_str());
+    const bool had_previous = std::rename(file->path.c_str(), backup_path.c_str()) == 0;
 
     if (std::rename(temp_path.c_str(), file->path.c_str()) != 0) {
         LOG_E(TAG, "Failed to replace %s", file->path.c_str());
         std::remove(temp_path.c_str());
+        if (had_previous && std::rename(backup_path.c_str(), file->path.c_str()) != 0) {
+            // Nothing better is left to try: the previous content is still on disk, under the
+            // backup name, and saying where is what makes it recoverable rather than lost.
+            LOG_E(TAG, "Failed to restore %s - the previous content is in %s",
+                file->path.c_str(), backup_path.c_str());
+        }
         return false;
+    }
+
+    if (had_previous) {
+        std::remove(backup_path.c_str());
     }
 
     return true;
@@ -168,7 +199,10 @@ PropertiesFile* properties_file_open(const char* path) {
 }
 
 error_t properties_file_close(PropertiesFile* file) {
-    bool saved = save_to_file(file);
+    // Nothing was set, so there is nothing to write - and not writing is the point: a reader that
+    // saves the file back would rewrite it (losing comments and key order) and, worse, race with any
+    // other writer on the same temporary file. See the note on PropertiesFile::dirty.
+    const bool saved = file->dirty ? save_to_file(file) : true;
     delete file;
     return saved ? ERROR_NONE : ERROR_RESOURCE;
 }
@@ -192,6 +226,7 @@ error_t properties_file_get(const PropertiesFile* file, const char* key, char* o
 
 void properties_file_set(PropertiesFile* file, const char* key, const char* value) {
     file->entries[key] = value;
+    file->dirty = true;
 }
 
 void properties_file_for_each(const PropertiesFile* file, PropertiesFileVisitorFn visitor, void* context) {
