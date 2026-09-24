@@ -1019,9 +1019,18 @@ static error_t api_pair(struct Device* /*device*/, const BtAddr /*addr*/) {
 static error_t api_unpair(struct Device* device, const BtAddr addr) {
     // Remove from NimBLE bond store. Settings file removal is handled by
     // the Tactility bluetooth::unpair() wrapper which calls settings::remove().
+    //
+    // Both address types, deliberately. The BtAddr this API carries has no type field, and the store
+    // keys its records on (bytes, type) - ble_addr_cmp() compares both - so deleting only the public
+    // one left a random-address peer's bond behind, permanently taking up one of the store's bond
+    // slots. Every BLE keyboard that uses a random address (all of them, in practice) hit that: the
+    // entry survived "Forget" and the store filled with records for devices the user had removed.
+    // Deleting both types costs one extra lookup when the peer was public.
     ble_addr_t ble_addr = {};
-    ble_addr.type = BLE_ADDR_PUBLIC;
     memcpy(ble_addr.val, addr, BT_ADDR_LEN);
+    ble_addr.type = BLE_ADDR_PUBLIC;
+    ble_store_util_delete_peer(&ble_addr);
+    ble_addr.type = BLE_ADDR_RANDOM;
     ble_store_util_delete_peer(&ble_addr);
     return ERROR_NONE;
 }

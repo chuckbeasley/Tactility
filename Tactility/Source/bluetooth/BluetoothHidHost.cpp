@@ -19,6 +19,7 @@
 #include <host/ble_gap.h>
 #include <host/ble_gatt.h>
 #include <host/ble_hs.h>
+#include <host/ble_store.h>
 #include <host/ble_uuid.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
@@ -30,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -91,6 +93,15 @@ static esp_timer_handle_t hid_enc_retry_timer = nullptr;
 // retry briefly until the controller is free.
 static esp_timer_handle_t hid_host_connect_retry_timer = nullptr;
 static bool hid_host_connect_retry_scheduled = false;
+
+// Whether the attempt in flight has already tried the other address type. "Connect failed status=13"
+// (HCI 0x0D, LL connection establishment failed) is what a direct connect to the wrong address type
+// looks like: the peer answers no advertising report to that address, the controller gives up after
+// its 5 s timeout, and the device reads as unreachable while sitting in the scan list. The type comes
+// from the scan, so this only bites when that lookup missed - a saved peer being auto-connected
+// before any scan reported it, or a peer whose advertisement the controller rewrote - and one retry
+// with the other type turns "tapping it does nothing" back into a connection.
+static bool hid_host_connect_tried_other_addr_type = false;
 
 static std::atomic<int32_t> hid_host_mouse_x{0};
 static std::atomic<int32_t> hid_host_mouse_y{0};
@@ -755,6 +766,10 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
             device.profileId   = BT_PROFILE_HID_HOST;
             device.autoConnect = true;
             const auto addr_hex = settings::addrToHex(identity_addr);
+            // The address this connection actually ran on. Computed here rather than at the end
+            // because the merge below has to know whether the record it is about to remove belongs to
+            // the live link - see the unpair() call.
+            const auto connect_hex = settings::addrToHex(peer_addr);
             settings::PairedDevice existing;
             if (settings::load(addr_hex, existing)) {
                 device.autoConnect = existing.autoConnect;
@@ -786,6 +801,21 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
                             // The user's own choice about auto-connect belongs to the device, not to
                             // the key.
                             device.autoConnect = previous.autoConnect;
+                            // The bond that was filed under the old address goes with the file. Without
+                            // this the NimBLE bond store keeps a slot for an address the peer will never
+                            // use again, and the store is small: when it fills, every later pairing is
+                            // refused (BLE_HS_ESTORE_CAP) and the peer's keys stop being kept at all,
+                            // which is what turns one device into a new paired entry per connection.
+                            //
+                            // Not when the old key is this connection's own address, though: that bond
+                            // may be the one holding the link up, and the entry is being re-filed under
+                            // the identity address and stays valid for the next connection either way.
+                            if (previous_hex == connect_hex) {
+                                LOG_I(TAG, "Kept bond for %s: it is this connection's own address",
+                                    connect_hex.c_str());
+                            } else {
+                                unpair(previous.addr);
+                            }
                             LOG_I(TAG, "Moved paired entry for %s from %s to %s (%s)",
                                 name.c_str(), previous_hex.c_str(), addr_hex.c_str(),
                                 identity_usable ? "identity address" : "new temporary address");
@@ -814,7 +844,6 @@ static void hidHostSubscribeNext(HidHostCtx& ctx) {
             // The connect address may already have produced its own file for this same device. Now
             // that the identity key exists, drop that one, so duplicates disappear as devices
             // reconnect instead of needing to be cleaned up by hand.
-            const auto connect_hex = settings::addrToHex(peer_addr);
             if (connect_hex != addr_hex && settings::hasFileForDevice(connect_hex) &&
                 settings::remove(connect_hex)) {
                 LOG_I(TAG, "Removed duplicate entry %s (same device as %s)",
@@ -966,6 +995,61 @@ static int hidHostSvcDiscCb(uint16_t conn_handle, const struct ble_gatt_error* e
 
 // ---- GAP callback for HID host central connection ----
 
+// Prints an address the way a scanner shows it - most significant byte first - because NimBLE stores
+// it the other way round (val[0] is the least significant byte, which is also the order the
+// paired-device files key on; see settings::addrToHex).
+static void formatPeerAddr(const ble_addr_t& addr, char* out, size_t out_size) {
+    std::snprintf(out, out_size, "%02x:%02x:%02x:%02x:%02x:%02x/%s",
+        addr.val[5], addr.val[4], addr.val[3], addr.val[2], addr.val[1], addr.val[0],
+        addr.type == BLE_ADDR_PUBLIC ? "public"
+            : BLE_ADDR_IS_RPA(&addr) ? "rpa"
+                                     : "random");
+}
+
+// What the host knows about this peer's keys, logged once per connection. This is the difference
+// between a peer that re-encrypts from a stored bond and one that has to pair from scratch every
+// time, and the two look identical from the settings files alone - the second one is what moves the
+// address a device is filed under, because an unbonded peer has no identity address for the host to
+// file it under. "No stored keys" plus a changed address on each connection is the signature of a
+// full bond store (NimBLE logs BLE_HS_ESTORE_CAP when a write is refused); see
+// CONFIG_BT_NIMBLE_MAX_BONDS in Buildscripts/sdkconfig/default.properties.
+static void logPeerBondState(uint16_t conn_handle) {
+    struct ble_gap_conn_desc desc = {};
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) {
+        LOG_W(TAG, "Connected, but the connection descriptor could not be read");
+        return;
+    }
+
+    char ota[40];
+    char id[40];
+    formatPeerAddr(desc.peer_ota_addr, ota, sizeof(ota));
+    formatPeerAddr(desc.peer_id_addr, id, sizeof(id));
+
+    struct ble_store_key_sec key_sec = {};
+    struct ble_store_value_sec value_sec = {};
+    key_sec.peer_addr = desc.peer_id_addr;
+    const int bond_rc = ble_store_read_peer_sec(&key_sec, &value_sec);
+
+    int our_secs = 0;
+    int peer_secs = 0;
+    int cccds = 0;
+    ble_store_util_count(BLE_STORE_OBJ_TYPE_OUR_SEC, &our_secs);
+    ble_store_util_count(BLE_STORE_OBJ_TYPE_PEER_SEC, &peer_secs);
+    ble_store_util_count(BLE_STORE_OBJ_TYPE_CCCD, &cccds);
+
+    LOG_I(TAG, "Peer ota=%s id=%s encrypted=%d bonded=%d authenticated=%d",
+        ota, id, (int)desc.sec_state.encrypted, (int)desc.sec_state.bonded,
+        (int)desc.sec_state.authenticated);
+    if (bond_rc == 0) {
+        LOG_I(TAG, "Stored keys for %s: ltk=%d irk=%d csrk=%d; store our=%d peer=%d cccd=%d (max bonds %d)",
+            id, (int)value_sec.ltk_present, (int)value_sec.irk_present, (int)value_sec.csrk_present,
+            our_secs, peer_secs, cccds, CONFIG_BT_NIMBLE_MAX_BONDS);
+    } else {
+        LOG_I(TAG, "No stored keys for %s (rc=%d); store our=%d peer=%d cccd=%d (max bonds %d)",
+            id, bond_rc, our_secs, peer_secs, cccds, CONFIG_BT_NIMBLE_MAX_BONDS);
+    }
+}
+
 static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
     if (!hid_host_ctx) return 0;
     auto& ctx = *hid_host_ctx;
@@ -975,6 +1059,7 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
             if (event->connect.status == 0) {
                 ctx.connHandle = event->connect.conn_handle;
                 LOG_I(TAG, "Connected (handle=%d)", ctx.connHandle);
+                logPeerBondState(ctx.connHandle);
                 // A connect established — cancel any pending EALREADY retry.
                 if (hid_host_connect_retry_timer != nullptr) {
                     esp_timer_stop(hid_host_connect_retry_timer);
@@ -987,6 +1072,19 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
                 }
             } else {
                 LOG_W(TAG, "Connect failed status=%d", event->connect.status);
+                // One retry with the other address type before giving up, on the timer rather than
+                // inline: re-entering ble_gap_connect() (and the scan stop that precedes it) from
+                // inside the event that reports the failure is the kind of re-entrancy that is hard to
+                // reason about, and the retry path already exists and is exercised on EALREADY.
+                if (!hid_host_connect_tried_other_addr_type && hid_host_connect_retry_timer != nullptr) {
+                    hid_host_connect_tried_other_addr_type = true;
+                    if (!hid_host_connect_retry_scheduled) {
+                        hid_host_connect_retry_scheduled = true;
+                        esp_timer_stop(hid_host_connect_retry_timer);
+                        esp_timer_start_once(hid_host_connect_retry_timer, 250 * 1000);
+                    }
+                    break;
+                }
                 hid_host_ctx.reset();
                 Device* dev;
                 if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
@@ -1053,6 +1151,12 @@ static int hidHostGapCb(struct ble_gap_event* event, void* /*arg*/) {
             if (event->enc_change.conn_handle == ctx.connHandle) {
                 if (event->enc_change.status == 0) {
                     LOG_I(TAG, "Encryption established — retrying CCCD in 500ms");
+                    // Measured here rather than at connect time on purpose: this is the moment the
+                    // keys either were or were not kept, and the difference between "bonded=1, stored
+                    // keys for <identity>" and "bonded=0, no stored keys" is the difference between a
+                    // peer that reconnects to the same identity and one that has to be paired again -
+                    // under a new address - on every connection.
+                    logPeerBondState(event->enc_change.conn_handle);
                     ctx.subscribeIdx = 0;
                     if (hid_enc_retry_timer) {
                         esp_timer_stop(hid_enc_retry_timer);
@@ -1134,6 +1238,9 @@ void hidHostConnect(const std::array<uint8_t, 6>& addr) {
 
     hid_host_ctx = std::make_unique<HidHostCtx>();
     hid_host_ctx->peerAddr = addr;
+    // A fresh request gets a fresh pair of attempts, so a tap after a failed auto-connect is not
+    // silently spent on the address type the previous attempt already used.
+    hid_host_connect_tried_other_addr_type = false;
 
     // Create enc retry timer lazily
     if (hid_enc_retry_timer == nullptr) {
@@ -1187,13 +1294,20 @@ static void hidHostConnectInitiate() {
         }
     }
 
-    // Look up the addr_type from the cached scan results.
+    // Look up the addr_type from the cached scan results. When the cache has nothing for this address
+    // (an auto-connect to a saved peer that no scan has reported yet), public is only a guess - see
+    // hid_host_connect_tried_other_addr_type for what happens when the guess is wrong.
     ble_addr_t ble_addr = {};
     ble_addr.type = BLE_ADDR_PUBLIC;
     std::memcpy(ble_addr.val, hid_host_ctx->peerAddr.data(), 6);
-    uint8_t addr_type = 0;
+    uint8_t addr_type = BLE_ADDR_PUBLIC;
     if (getCachedScanAddrType(hid_host_ctx->peerAddr.data(), &addr_type)) {
         ble_addr.type = addr_type;
+    }
+    if (hid_host_connect_tried_other_addr_type) {
+        ble_addr.type = (ble_addr.type == BLE_ADDR_PUBLIC) ? BLE_ADDR_RANDOM : BLE_ADDR_PUBLIC;
+        LOG_I(TAG, "Retrying connect with the %s address type",
+            ble_addr.type == BLE_ADDR_PUBLIC ? "public" : "random");
     }
 
     uint8_t own_addr_type;
@@ -1296,8 +1410,15 @@ void autoConnectHidHost() {
         for (const auto& peer : saved) {
             if (!peer.autoConnect || peer.profileId != BT_PROFILE_HID_HOST) continue;
             if (peer.name == r.name) {
-                LOG_I(TAG, "Auto-connecting HID host to %s (matched by name, saved address %s)",
-                    settings::addrToHex(r.addr).c_str(), settings::addrToHex(peer.addr).c_str());
+                // The address type the controller reported goes in the log too: a peer whose
+                // advertisement is reported as public while its address changes on every connection
+                // cannot be identified by address at all (see the note in the save path), and the type
+                // is what tells the two cases apart.
+                uint8_t addr_type = 0xFF;
+                const bool have_type = getCachedScanAddrType(r.addr.data(), &addr_type);
+                LOG_I(TAG, "Auto-connecting HID host to %s (matched by name, saved address %s, scan type %s)",
+                    settings::addrToHex(r.addr).c_str(), settings::addrToHex(peer.addr).c_str(),
+                    have_type ? (addr_type == BLE_ADDR_PUBLIC ? "public" : "random") : "unknown");
                 hidHostConnect(r.addr);
                 return;
             }
