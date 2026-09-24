@@ -13,17 +13,67 @@
 
 namespace tt::file {
 
-/** File types for `dirent`'s `d_type`. */
+/**
+ * File types for `dirent`'s `d_type`.
+ *
+ * These are the values the platform's own `dirent.h` reports, taken from its DT_* macros rather than
+ * written out as numbers, because the numbers are not the same everywhere: Linux uses DT_REG = 8 and
+ * DT_DIR = 4, while ESP-IDF 6 defines DT_REG = 1 and DT_DIR = 2. Hardcoded Linux values therefore made
+ * every d_type comparison in this tree wrong on ESP32 - a directory listing reported files with a type
+ * that matched neither TT_DT_REG nor TT_DT_UNKNOWN (so the paired-device loader dropped every record it
+ * was given, and the Files app drew folders as files), and one that matched TT_DT_CHR = 2 instead.
+ *
+ * The remaining types only exist on the POSIX side: ESP-IDF's VFS reports UNKNOWN, REG or DIR and
+ * nothing else, so there TT_DT_CHR's placeholder value coincides with DT_DIR's 2 - which is what the
+ * "directory or character device" checks in this tree mean on that side anyway (see
+ * direntSortAlphaAndType()).
+ */
 enum {
-    TT_DT_UNKNOWN = 0, // Unknown type
-    TT_DT_FIFO = 1, // Named pipe or FIFO
-    TT_DT_CHR = 2, // Character device
-    TT_DT_DIR = 4, // Directory
-    TT_DT_BLK = 6, // Block device
-    TT_DT_REG = 8, // Regular file
-    TT_DT_LNK = 10, // Symbolic link
-    TT_DT_SOCK = 12, // Local-domain socket
-    TT_DT_WHT = 14 // Whiteout inodes
+#ifdef DT_UNKNOWN
+    TT_DT_UNKNOWN = DT_UNKNOWN, // Unknown type
+#else
+    TT_DT_UNKNOWN = 0,
+#endif
+#ifdef DT_FIFO
+    TT_DT_FIFO = DT_FIFO, // Named pipe or FIFO
+#else
+    TT_DT_FIFO = 1,
+#endif
+#ifdef DT_CHR
+    TT_DT_CHR = DT_CHR, // Character device
+#else
+    TT_DT_CHR = 2,
+#endif
+#ifdef DT_DIR
+    TT_DT_DIR = DT_DIR, // Directory
+#else
+    TT_DT_DIR = 4,
+#endif
+#ifdef DT_BLK
+    TT_DT_BLK = DT_BLK, // Block device
+#else
+    TT_DT_BLK = 6,
+#endif
+#ifdef DT_REG
+    TT_DT_REG = DT_REG, // Regular file
+#else
+    TT_DT_REG = 8,
+#endif
+#ifdef DT_LNK
+    TT_DT_LNK = DT_LNK, // Symbolic link
+#else
+    TT_DT_LNK = 10,
+#endif
+#ifdef DT_SOCK
+    TT_DT_SOCK = DT_SOCK, // Local-domain socket
+#else
+    TT_DT_SOCK = 12,
+#endif
+#ifdef DT_WHT
+    TT_DT_WHT = DT_WHT // Whiteout inodes
+#else
+    TT_DT_WHT = 14
+#endif
 };
 
 #ifdef _WIN32
