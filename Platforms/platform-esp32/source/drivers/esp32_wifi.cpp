@@ -159,6 +159,7 @@ static void wifiHealthTick(void*) {
 
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <new>
 
@@ -265,6 +266,170 @@ void fire_event(Esp32WifiCtx* ctx, WifiEvent event) {
     mutex_unlock(&ctx->subscriptionsMutex);
 }
 
+// ---- Wi-Fi FTM (802.11mc) probe ----
+//
+// PROBE, temporary: answers one question - does the AP this board is associated with implement
+// 802.11mc Fine Timing Measurement, i.e. is there a real distance measurement available here instead
+// of an RSSI estimate? The C5's radio supports it (SOC_WIFI_FTM_SUPPORT), the host API hands back
+// dist_est in centimetres, and the only unknown is the far end: an AP that does not answer as an FTM
+// responder makes the whole feature moot.
+//
+// Runs once, a couple of seconds after the station gets its IP, and logs the outcome. Every status is
+// logged, including the ones that mean "not supported", because that is the answer being looked for -
+// not just the successful case.
+//
+// Behind CONFIG_ESP_WIFI_FTM_ENABLE (the API does not exist without it), so every other device in
+// this tree still builds; only the profile being measured turns it on.
+#if defined(CONFIG_ESP_WIFI_FTM_ENABLE)
+static esp_timer_handle_t s_ftmProbeTimer = nullptr;
+static esp_timer_handle_t s_ftmProbeScanTimer = nullptr;
+static bool s_ftmProbeDone = false;
+static int s_ftmProbeAttempts = 0;
+static bool s_ftmProbeApClaimsResponder = false;
+static bool s_ftmProbeScanWanted = false;
+static int s_ftmProbeScanAttempts = 0;
+static constexpr int FTM_PROBE_MAX_ATTEMPTS = 3;
+static constexpr int FTM_PROBE_MAX_SCAN_ATTEMPTS = 4;
+
+static void ftmProbeStart(void* /*arg*/) {
+    wifi_ap_record_t ap = {};
+    esp_err_t err = esp_wifi_sta_get_ap_info(&ap);
+    if (err != ESP_OK) {
+        LOG_W("WifiFtm", "PROBE: no associated AP (%s)", esp_err_to_name(err));
+        return;
+    }
+
+    char bssid[18];
+    std::snprintf(bssid, sizeof(bssid), "%02x:%02x:%02x:%02x:%02x:%02x",
+        ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+
+    wifi_ftm_initiator_cfg_t cfg = {};
+    std::memcpy(cfg.resp_mac, ap.bssid, 6);
+    cfg.channel = ap.primary;
+    cfg.frm_count = 16;
+    cfg.burst_period = 2;
+
+    // Whether the AP advertises 802.11mc at all is visible before any frame is sent: the Extended
+    // Capabilities element's "FTM Responder" bit, which the driver already parses into this record.
+    // Logging it separates "the AP never claimed to support this" from "it claimed to and still did
+    // not answer", which are different problems with different fixes.
+    if (s_ftmProbeAttempts == 0) {
+        s_ftmProbeApClaimsResponder = ap.ftm_responder != 0;
+        LOG_I("WifiFtm", "PROBE: AP %s (\"%s\") ch=%u rssi=%d ftm_responder=%d ftm_initiator=%d",
+            bssid, reinterpret_cast<const char*>(ap.ssid), (unsigned)ap.primary, (int)ap.rssi,
+            (int)ap.ftm_responder, (int)ap.ftm_initiator);
+    }
+    s_ftmProbeAttempts++;
+
+    LOG_I("WifiFtm", "PROBE: FTM session attempt %d/%d (frm_count=%u burst_period=%u)",
+        s_ftmProbeAttempts, FTM_PROBE_MAX_ATTEMPTS, (unsigned)cfg.frm_count, (unsigned)cfg.burst_period);
+
+    err = esp_wifi_ftm_initiate_session(&cfg);
+    if (err != ESP_OK) {
+        LOG_W("WifiFtm", "PROBE: esp_wifi_ftm_initiate_session failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void ftmProbeScheduleOnce() {
+    if (s_ftmProbeDone) return;
+    s_ftmProbeDone = true;
+    s_ftmProbeAttempts = 0;
+    if (s_ftmProbeTimer == nullptr) {
+        esp_timer_create_args_t args = {};
+        args.callback        = ftmProbeStart;
+        args.dispatch_method = ESP_TIMER_TASK;
+        args.name            = "ftm_probe";
+        if (esp_timer_create(&args, &s_ftmProbeTimer) != ESP_OK) {
+            LOG_E("WifiFtm", "PROBE: timer create failed");
+            return;
+        }
+    }
+    // Two seconds: the association has just completed and the driver is still finishing its own
+    // post-connect work; an FTM request sent into that is a needless second variable.
+    esp_timer_start_once(s_ftmProbeTimer, 2 * 1000 * 1000);
+}
+
+// Starts (or restarts) the scan for other 802.11mc responders. Runs on the esp_timer task: the scan
+// itself is non-blocking, because a blocking one would need the AP records on this task's 2 KB stack.
+static void ftmProbeScanStart(void* /*arg*/) {
+    s_ftmProbeScanWanted = true;
+    esp_err_t err = esp_wifi_scan_start(nullptr, false);
+    if (err != ESP_OK) {
+        s_ftmProbeScanWanted = false;
+        LOG_W("WifiFtm", "PROBE: could not scan for other FTM responders: %s", esp_err_to_name(err));
+    }
+}
+
+static void ftmProbeLogReport(const wifi_event_ftm_report_t* report) {
+    char peer[18];
+    std::snprintf(peer, sizeof(peer), "%02x:%02x:%02x:%02x:%02x:%02x",
+        report->peer_mac[0], report->peer_mac[1], report->peer_mac[2],
+        report->peer_mac[3], report->peer_mac[4], report->peer_mac[5]);
+
+    const char* status;
+    switch (report->status) {
+        case FTM_STATUS_SUCCESS:          status = "SUCCESS"; break;
+        case FTM_STATUS_UNSUPPORTED:      status = "UNSUPPORTED (peer does not do FTM)"; break;
+        case FTM_STATUS_CONF_REJECTED:    status = "CONF_REJECTED"; break;
+        case FTM_STATUS_NO_RESPONSE:      status = "NO_RESPONSE"; break;
+        case FTM_STATUS_FAIL:             status = "FAIL"; break;
+        case FTM_STATUS_NO_VALID_MSMT:    status = "NO_VALID_MSMT"; break;
+        case FTM_STATUS_USER_TERM:        status = "USER_TERM"; break;
+        default:                          status = "UNKNOWN"; break;
+    }
+
+    LOG_I("WifiFtm", "PROBE: report from %s: status=%s rtt_raw=%uns rtt_est=%uns dist_est=%ucm entries=%u",
+        peer, status, (unsigned)report->rtt_raw, (unsigned)report->rtt_est,
+        (unsigned)report->dist_est, (unsigned)report->ftm_report_num_entries);
+
+    if (report->status == FTM_STATUS_SUCCESS && report->ftm_report_num_entries > 0) {
+        // The per-burst entries carry the raw timestamps and each frame's RSSI; the first few are
+        // enough to see whether the measurement is consistent or drifting.
+        wifi_ftm_report_entry_t entries[8] = {};
+        uint8_t count = report->ftm_report_num_entries;
+        if (count > 8) count = 8;
+        if (esp_wifi_ftm_get_report(entries, count) == ESP_OK) {
+            for (uint8_t i = 0; i < count; ++i) {
+                LOG_I("WifiFtm", "PROBE:   burst %u: rtt=%ups rssi=%d ppm=%d",
+                    (unsigned)i, (unsigned)entries[i].rtt, (int)entries[i].rssi, (int)entries[i].ppm);
+            }
+        }
+        LOG_I("WifiFtm", "PROBE verdict: FTM WORKS against this AP - %.2f m (rtt_est %u ns over %u bursts)",
+            (double)report->dist_est / 100.0, (unsigned)report->rtt_est,
+            (unsigned)report->ftm_report_num_entries);
+    } else {
+        // Free the internal report; the API documents NULL as "just release it".
+        esp_wifi_ftm_get_report(nullptr, 0);
+
+        if (s_ftmProbeAttempts < FTM_PROBE_MAX_ATTEMPTS && s_ftmProbeTimer != nullptr) {
+            LOG_I("WifiFtm", "PROBE: retrying in 2s (attempt %d of %d)",
+                s_ftmProbeAttempts + 1, FTM_PROBE_MAX_ATTEMPTS);
+            esp_timer_start_once(s_ftmProbeTimer, 2 * 1000 * 1000);
+        } else {
+            LOG_I("WifiFtm", "PROBE verdict: no usable FTM from this AP after %d attempts "
+                "(AP advertises FTM responder: %s) - RSSI ranging is the only option here",
+                s_ftmProbeAttempts, s_ftmProbeApClaimsResponder ? "yes" : "no");
+            // And before giving up on 802.11mc entirely: is there any other AP in range that does
+            // answer as a responder? The result is reported from the driver's own scan-complete path,
+            // where the records are already read into the context - a blocking scan here would run on
+            // the 2 KB esp_timer stack.
+            if (s_ftmProbeScanTimer == nullptr) {
+                esp_timer_create_args_t scan_args = {};
+                scan_args.callback        = ftmProbeScanStart;
+                scan_args.dispatch_method = ESP_TIMER_TASK;
+                scan_args.name            = "ftm_scan";
+                if (esp_timer_create(&scan_args, &s_ftmProbeScanTimer) != ESP_OK) {
+                    LOG_E("WifiFtm", "PROBE: scan timer create failed");
+                    return;
+                }
+            }
+            s_ftmProbeScanAttempts = 0;
+            esp_timer_start_once(s_ftmProbeScanTimer, 2 * 1000 * 1000);
+        }
+    }
+}
+#endif // CONFIG_ESP_WIFI_FTM_ENABLE
+
 // ---- ESP-IDF event handling (runs on the esp_event task) ----
 
 void on_wifi_or_ip_event(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
@@ -330,6 +495,16 @@ void on_wifi_or_ip_event(void* arg, esp_event_base_t event_base, int32_t event_i
             .gateway = ctx->ipInfo.gw.addr,
         };
         system_event_emit(KERNEL_EVENT_NETWORK_CONNECTED, &connected_event, sizeof(connected_event));
+
+        // The FTM branch below is inside this #if on purpose: the else-if chain stays intact whether
+        // or not the feature is compiled in, because the branch's own body wraps the brace.
+        // PROBE: one FTM session per boot, against whatever AP this associated with.
+#if defined(CONFIG_ESP_WIFI_FTM_ENABLE)
+        ftmProbeScheduleOnce();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_FTM_REPORT) {
+        // PROBE: the outcome of the session started above.
+        ftmProbeLogReport(static_cast<const wifi_event_ftm_report_t*>(event_data));
+#endif
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
         mutex_lock(&ctx->mutex);
         ctx->scanning = false;
@@ -341,6 +516,34 @@ void on_wifi_or_ip_event(void* arg, esp_event_base_t event_base, int32_t event_i
         WifiEvent event = {};
         event.type = WIFI_EVENT_TYPE_SCAN_FINISHED;
         fire_event(ctx, event);
+
+#if defined(CONFIG_ESP_WIFI_FTM_ENABLE)
+        if (s_ftmProbeScanWanted) {
+            unsigned responders = 0;
+            for (uint16_t i = 0; i < count; ++i) {
+                if (ctx->scanResults[i].ftm_responder == 0) continue;
+                responders++;
+                LOG_I("WifiFtm", "PROBE: 802.11mc responder in range: \"%s\" rssi=%d ch=%u",
+                    reinterpret_cast<const char*>(ctx->scanResults[i].ssid),
+                    (int)ctx->scanResults[i].rssi, (unsigned)ctx->scanResults[i].primary);
+            }
+
+            s_ftmProbeScanAttempts++;
+            if (count == 0 && s_ftmProbeScanAttempts < FTM_PROBE_MAX_SCAN_ATTEMPTS) {
+                // A scan that comes back with no records at all means it was cut short rather than
+                // that the air is empty - observed here as the Wi-Fi health monitor forcing a
+                // reconnect mid-scan, which tears the scan down with it. Retry rather than report a
+                // measurement that never happened.
+                LOG_I("WifiFtm", "PROBE: scan %d returned no records (interrupted?), retrying in 5s",
+                    s_ftmProbeScanAttempts);
+                esp_timer_start_once(s_ftmProbeScanTimer, 5 * 1000 * 1000);
+            } else {
+                s_ftmProbeScanWanted = false;
+                LOG_I("WifiFtm", "PROBE verdict: %u of %u APs in range advertise 802.11mc support "
+                    "(scan attempt %d)", responders, (unsigned)count, s_ftmProbeScanAttempts);
+            }
+        }
+#endif
     }
 }
 
