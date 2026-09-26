@@ -26,6 +26,8 @@
 #include <esp_timer.h>
 #include <lwip/sockets.h>
 #include <lwip/stats.h>
+// Included here rather than with the rest of the Tactility headers below, because the health monitor
+// logs from above that point.
 #include <tactility/log.h>
 
 constexpr auto* WIFI_HEALTH_TAG = "wifi_health";
@@ -37,6 +39,116 @@ static esp_timer_handle_t s_healthTimer = nullptr;
 static constexpr int HEALTH_PROBE_INTERVAL_S = 5;
 static constexpr int HEALTH_PROBE_TIMEOUT_S = 3;
 static constexpr int HEALTH_FAILURES_BEFORE_RECONNECT = 3;
+
+// ---- Recovery ----
+//
+// The fault this monitor exists for is invisible from the association state: the station stays
+// associated at a healthy RSSI (measured at -42 dBm, with a PC on the same BSSID still reaching the
+// gateway), beacons keep arriving - no AP-loss disconnect ever fires, and the driver's own beacon
+// timeout is 25 s - and no data moves in either direction: TCP connects to the gateway, to a PC on
+// the same LAN, to the DNS server and to the internet all fail with ETIMEDOUT, and DNS resolution
+// fails with them. Measured windows of 60-100 seconds of that, and it is not the power-save mode (it
+// happens with the radio wide awake), not the BLE scan duty cycle (cutting it changed nothing) and not
+// a reboot (the fault windows contain no boot banner). What ends it: re-associating restored traffic
+// in some observations, and in others the link recovered on its own within a minute.
+//
+// It does not always come back on the first re-association either. One measured recovery needed two
+// disconnects twelve seconds apart: the first gave a new DHCP lease in 1.1 s and the link stayed dead,
+// the second took 12 s and then carried traffic normally for the next two minutes. So a recovery is a
+// staged, verified sequence rather than a fire-and-forget disconnect: each stage gets a window in
+// which the probe decides whether it worked, a stage that did not is escalated once, and a round that
+// fails entirely is followed by a cooldown that grows. Reconnecting every 15 seconds on a link that is
+// not coming back costs the DHCP lease, every open socket and any request in flight, and fixes nothing.
+static constexpr int HEALTH_STAGE_NONE = 0;
+static constexpr int HEALTH_STAGE_REASSOCIATE = 1;
+static constexpr int HEALTH_STAGE_FRESH_JOIN = 2;
+static constexpr int64_t HEALTH_VERIFY_US = 12 * 1000 * 1000;
+static constexpr int HEALTH_COOLDOWN_SECONDS[] = { 15, 30, 60, 120, 300 };
+
+static int s_healthStage = HEALTH_STAGE_NONE;
+static int s_healthRounds = 0;
+static int64_t s_healthStageStartUs = 0;
+static int64_t s_healthStageDeadlineUs = 0;
+static int64_t s_healthCooldownUntilUs = 0;
+
+static int cooldownSeconds(int round) {
+    constexpr int count = (int)(sizeof(HEALTH_COOLDOWN_SECONDS) / sizeof(HEALTH_COOLDOWN_SECONDS[0]));
+    return HEALTH_COOLDOWN_SECONDS[round < 0 ? 0 : (round < count ? round : count - 1)];
+}
+
+/** Re-associate, or re-join without the cached BSSID and channel so the driver scans again.
+ *
+ *  The cached BSS is what a fast reconnect reuses, and a station that re-joins the same mesh node it
+ *  just failed on is not obviously a different attempt: clearing it makes the second stage a fresh
+ *  scan, which can land on another node of the same SSID.
+ */
+static void startRecoveryStage(int stage, int64_t now_us) {
+    // Disconnect first: the driver refuses a configuration change while a connection is being
+    // established (measured: esp_wifi_set_config returned an error when it was called before the
+    // disconnect, and the log said so on the first staged recovery this ran).
+    esp_wifi_disconnect();
+
+    if (stage == HEALTH_STAGE_FRESH_JOIN) {
+        wifi_config_t config = {};
+        const esp_err_t get_result = esp_wifi_get_config(WIFI_IF_STA, &config);
+        if (get_result == ESP_OK) {
+            config.sta.bssid_set = false;
+            config.sta.channel = 0;
+            const esp_err_t set_result = esp_wifi_set_config(WIFI_IF_STA, &config);
+            if (set_result != ESP_OK) {
+                LOG_W(WIFI_HEALTH_TAG, "Could not clear the cached BSS/channel before re-joining: %s",
+                    esp_err_to_name(set_result));
+            }
+        } else {
+            LOG_W(WIFI_HEALTH_TAG, "Could not read the station config before re-joining: %s",
+                esp_err_to_name(get_result));
+        }
+        LOG_W(WIFI_HEALTH_TAG, "Re-joining from a fresh scan");
+    } else {
+        LOG_W(WIFI_HEALTH_TAG, "Re-associating to recover the link");
+    }
+
+    s_healthStage = stage;
+    s_healthStageStartUs = now_us;
+    s_healthStageDeadlineUs = now_us + HEALTH_VERIFY_US;
+    esp_wifi_connect();
+}
+
+/** One TCP connect to the gateway's port 80: did a round trip to it complete?
+ *
+ *  A refusal counts as an answer. The far end sending a RST is the gateway proving it received the
+ *  SYN and replied, which is what "is there a path at all" asks; counting it as unreachable would tear
+ *  down a working link on any gateway whose port 80 is closed.
+ */
+static bool probeGateway(uint32_t gateway_address) {
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return true;  // No socket to probe with is not evidence about the link.
+    }
+    fcntl(sock, F_SETFL, O_NONBLOCK);
+
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    addr.sin_addr.s_addr = gateway_address;
+
+    bool answered = connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0;
+    if (!answered && errno == EINPROGRESS) {
+        fd_set write_set;
+        FD_ZERO(&write_set);
+        FD_SET(sock, &write_set);
+        struct timeval timeout = {};
+        timeout.tv_sec = HEALTH_PROBE_TIMEOUT_S;
+        if (select(sock + 1, nullptr, &write_set, nullptr, &timeout) > 0) {
+            int socket_error = 0;
+            socklen_t length = sizeof(socket_error);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &socket_error, &length);
+            answered = socket_error == 0 || socket_error == ECONNREFUSED;
+        }
+    }
+    close(sock);
+    return answered;
+}
 
 #include <esp_rom_sys.h>
 #include <esp_rom_uart.h>
@@ -87,39 +199,47 @@ static void wifiHealthTick(void*) {
         return;
     }
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        return;
-    }
-    fcntl(sock, F_SETFL, O_NONBLOCK);
+    const int64_t now_us = esp_timer_get_time();
+    const bool linkUp = probeGateway(info.gw.addr);
 
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);
-    addr.sin_addr.s_addr = info.gw.addr;
-
-    bool reachable = connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0;
-    if (!reachable && errno == EINPROGRESS) {
-        fd_set write_set;
-        FD_ZERO(&write_set);
-        FD_SET(sock, &write_set);
-        struct timeval timeout = {};
-        timeout.tv_sec = HEALTH_PROBE_TIMEOUT_S;
-        if (select(sock + 1, nullptr, &write_set, nullptr, &timeout) > 0) {
-            int socket_error = 0;
-            socklen_t length = sizeof(socket_error);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, &socket_error, &length);
-            reachable = socket_error == 0;
+    if (linkUp) {
+        if (s_healthStage != HEALTH_STAGE_NONE) {
+            LOG_I(WIFI_HEALTH_TAG, "Link recovered after stage %d (%d ms)",
+                s_healthStage, (int)((now_us - s_healthStageStartUs) / 1000));
         }
-    }
-    close(sock);
-
-    if (reachable) {
         s_healthFailures = 0;
+        s_healthStage = HEALTH_STAGE_NONE;
+        s_healthRounds = 0;
+        s_healthCooldownUntilUs = 0;
         return;
     }
 
     s_healthFailures++;
+
+    // A recovery is in flight: give it its verification window before judging it.
+    if (s_healthStage != HEALTH_STAGE_NONE) {
+        if (now_us < s_healthStageDeadlineUs) {
+            return;
+        }
+        if (s_healthStage == HEALTH_STAGE_REASSOCIATE) {
+            LOG_W(WIFI_HEALTH_TAG, "Link still down %d ms after re-associating - re-joining from a fresh scan",
+                (int)((now_us - s_healthStageStartUs) / 1000));
+            startRecoveryStage(HEALTH_STAGE_FRESH_JOIN, now_us);
+            return;
+        }
+        LOG_W(WIFI_HEALTH_TAG, "Link still down %d ms after a fresh join - backing off for %d s",
+            (int)((now_us - s_healthStageStartUs) / 1000), cooldownSeconds(s_healthRounds) );
+        s_healthRounds++;
+        s_healthStage = HEALTH_STAGE_NONE;
+        s_healthCooldownUntilUs = now_us + (int64_t)cooldownSeconds(s_healthRounds) * 1000 * 1000;
+        s_healthFailures = 0;
+        return;
+    }
+
+    if (now_us < s_healthCooldownUntilUs) {
+        return;
+    }
+
     if (s_healthFailures < HEALTH_FAILURES_BEFORE_RECONNECT) {
         return;
     }
@@ -127,17 +247,15 @@ static void wifiHealthTick(void*) {
     wifi_ap_record_t ap = {};
     const bool associated = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
 #if LWIP_STATS && IP_STATS && TCP_STATS
-    LOG_W(WIFI_HEALTH_TAG, "gateway unreachable for %d probes (associated=%d rssi=%d ip_recv=%u tcp_recv=%u) - reconnecting",
+    LOG_W(WIFI_HEALTH_TAG, "gateway unreachable for %d probes (associated=%d rssi=%d ip_recv=%u tcp_recv=%u) - recovering",
         s_healthFailures, (int)associated, (int)ap.rssi,
         (unsigned)lwip_stats.ip.recv, (unsigned)lwip_stats.tcp.recv);
 #else
-    LOG_W(WIFI_HEALTH_TAG, "gateway unreachable for %d probes (associated=%d rssi=%d) - reconnecting",
+    LOG_W(WIFI_HEALTH_TAG, "gateway unreachable for %d probes (associated=%d rssi=%d) - recovering",
         s_healthFailures, (int)associated, (int)ap.rssi);
 #endif
     dumpHealthTaskTable();
-    s_healthFailures = 0;
-    esp_wifi_disconnect();
-    esp_wifi_connect();
+    startRecoveryStage(HEALTH_STAGE_REASSOCIATE, now_us);
 }
 
 #include <tactility/concurrent/mutex.h>
@@ -614,6 +732,30 @@ error_t bring_up_wifi(Esp32WifiCtx* ctx) {
         esp_netif_destroy(ctx->netif);
         ctx->netif = nullptr;
         return esp_err_to_error(err);
+    }
+
+    // Power save, applied once the radio is up - the driver rejects the call before this point.
+    //
+    // IDF's default is WIFI_PS_MIN_MODEM, which wakes the radio once per beacon interval. On a link
+    // that misses round trips that is not just latency: the health monitor below probes the gateway
+    // every 5 s, and on a link this board sees with its antenna situation it concludes the connection
+    // is dead and forces a reconnect every 15-20 seconds - tearing down the connection it exists to
+    // protect, while the board stays associated with a healthy RSSI and its own web server goes
+    // unreachable. CONFIG_TT_WIFI_POWER_SAVE turns IDF's default back on for boards where battery
+    // life matters more; see that option's help text for the measurements behind the default.
+    {
+#if defined(CONFIG_TT_WIFI_POWER_SAVE)
+        const wifi_ps_type_t power_save_mode = WIFI_PS_MIN_MODEM;
+#else
+        const wifi_ps_type_t power_save_mode = WIFI_PS_NONE;
+#endif
+        err = esp_wifi_set_ps(power_save_mode);
+        if (err != ESP_OK) {
+            LOG_W(TAG, "esp_wifi_set_ps(%d) failed: %s", (int)power_save_mode, esp_err_to_name(err));
+        } else {
+            LOG_I(TAG, "Wi-Fi power save: %s",
+                power_save_mode == WIFI_PS_NONE ? "off (radio stays awake)" : "on (wakes per beacon)");
+        }
     }
 
     // Start the health monitor (see wifiHealthTick). Created once; the netif is re-pointed on every

@@ -157,4 +157,27 @@ menu "Tactility App"
             a kilobyte of stack per rendered row (the Bluetooth app overflowed at 8 KB while building
             up to 60 rows, and the Motion screen died at 1.5 KB inside LVGL's style walk). Screens
             that declare their own size ask for 2.4 KB to 12 KB, the heavier ones clustering at 4-8 KB.
+    config TT_WIFI_POWER_SAVE
+        bool "Let the Wi-Fi radio sleep between beacons (power save on)"
+        default n
+        help
+            Off by default, which means the radio stays awake (WIFI_PS_NONE) instead of IDF's
+            WIFI_PS_MIN_MODEM. That is a latency decision, and it is the single biggest one available:
+            with power save on, the radio only wakes once per beacon interval, so every round trip
+            waits up to that interval and anything unsolicited is missed.
+
+            Measured on the Waveshare ESP32-C5 against this network's AP (beacon interval 102.4 ms):
+            ICMP from the LAN averaged 662 ms with a 3.2 s worst case and 40-50% of pings unanswered,
+            and a bulk transfer of 4.25 MB did not complete in 180 s. With power save off the same
+            pings averaged 60 ms with a 278 ms worst case. The symptom that made this a default rather
+            than a per-caller choice: the Wi-Fi health monitor probes the gateway every 5 s, and on a
+            link that misses that many round trips it concludes the connection is dead and forces a
+            reconnect - which tears down the very connection it is trying to protect, every 15-20
+            seconds, and leaves the board's own web server unreachable while it is up and associated.
+
+            What this costs: idle current. Power save is the right trade on a battery-powered device,
+            and callers that need low latency for a session already disable it explicitly
+            (tt::service::wifi::setPowerSaveEnabled) and restore it afterwards - the mirror and the
+            media player both do. Turn this on for a board where battery life matters more than
+            latency, and expect the reconnects above to come back with it.
 endmenu

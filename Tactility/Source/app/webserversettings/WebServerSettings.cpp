@@ -356,8 +356,20 @@ int32_t appMain(int argc, char* argv[]) {
     Context ctx {};
     ctx.appInstanceId = appInstanceId;
     ctx.wsSettings = settings::webserver::loadOrGetDefault();
-    // Reflect the server's actual running state, in case it differs from the persisted setting
-    ctx.wsSettings.webServerEnabled = service::webserver::isWebServerEnabled();
+    // Deliberately NOT overwritten with service::webserver::isWebServerEnabled() here.
+    //
+    // The switch used to be set from the server's running state "in case it differs from the persisted
+    // setting", and this screen saves on exit whenever anything on it changed. So opening it while the
+    // HTTP server happened to be stopped - before the service started, after a failed bind, or after
+    // the AP-mode screen armed its own settings - showed the switch as off, and then saving an
+    // unrelated edit (a username, a password) persisted that off over the user's setting. The server
+    // kept running for the rest of that boot because nothing stopped it, and came up disabled on the
+    // next one, with no log line saying why. Found exactly that way: a board whose web server had
+    // served the whole session stopped answering after a reboot, and its webserver.properties on the
+    // data partition read webServerEnabled=0 next to the credentials that had just been set.
+    //
+    // The switch is a setting, not a status indicator: it shows what is stored, and turning it on or
+    // off applies immediately (see onWebServerEnabledSwitch).
     ctx.originalSettings = ctx.wsSettings;
 
     TaskEventGroup event_group {};

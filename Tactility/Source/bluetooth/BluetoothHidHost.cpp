@@ -1399,6 +1399,28 @@ bool hidHostGetConnectedPeer(std::array<uint8_t, 6>& addr_out) {
 static esp_timer_handle_t hid_host_auto_scan_timer = nullptr;
 constexpr uint64_t AUTO_CONNECT_RETRY_INTERVAL_US = 10 * 1000 * 1000;
 
+// How long to wait between auto-connect scans.
+//
+// The chain above re-scans the moment a scan finishes without the peer in it, and a scan takes five
+// seconds, so "keep checking until the device powers back on" ran the BLE radio at a 100% duty cycle
+// for as long as the keyboard was away: the boot log shows scans starting at 5, 10, 15, 20, 25, 30 and
+// 35 seconds, back to back. That is radio time and battery spent looking for a keyboard that is
+// switched off, on a chip whose one radio also carries Wi-Fi.
+//
+// What this is not: the cause of the intermittent total Wi-Fi outage this board sees (associated at
+// -42 dBm, no data in either direction for 60-100 s at a time). That was the reason it was tried, and
+// the outage still happened with the scan duty cycle cut to a fifth, so the change is kept on its own
+// terms rather than as a fix for that.
+//
+// The gap starts small, because the case this exists for is a keyboard that has just been switched
+// on, and grows after a few misses: a keyboard that has been off for a minute is not waiting for a
+// scan every five seconds, and half a minute is still fast enough to pick it up by itself.
+constexpr uint32_t AUTO_CONNECT_SCAN_GAP_FAST_MS = 5 * 1000;
+constexpr uint32_t AUTO_CONNECT_SCAN_GAP_SLOW_MS = 30 * 1000;
+constexpr int AUTO_CONNECT_SCAN_FAST_MISSES = 6;
+static int auto_connect_scan_misses = 0;
+static uint32_t auto_connect_last_scan_ms = 0;
+
 static void hidHostAutoScanTick(void* /*arg*/) {
     if (getRadioState() != RadioState::On) return;
     // A connect is already in flight: autoConnectHidHost() would only tell hidHostConnect() to
@@ -1449,6 +1471,8 @@ void autoConnectHidHost() {
             if (!peer.autoConnect || peer.profileId != BT_PROFILE_HID_HOST) continue;
             if (peer.addr == r.addr) {
                 LOG_I(TAG, "Auto-connecting HID host to %s", settings::addrToHex(r.addr).c_str());
+                // The peer is back: the next search starts fast again.
+                auto_connect_scan_misses = 0;
                 hidHostConnect(r.addr);
                 return;
             }
@@ -1469,22 +1493,37 @@ void autoConnectHidHost() {
                 LOG_I(TAG, "Auto-connecting HID host to %s (matched by name, saved address %s, scan type %s)",
                     settings::addrToHex(r.addr).c_str(), settings::addrToHex(peer.addr).c_str(),
                     have_type ? (addr_type == BLE_ADDR_PUBLIC ? "public" : "random") : "unknown");
+                auto_connect_scan_misses = 0;
                 hidHostConnect(r.addr);
                 return;
             }
         }
     }
 
-    // Device not in the last scan. If we have an autoConnect HID host peer, restart
-    // scanning so we keep checking until the device powers back on.
+    // Device not in the last scan. If we have an autoConnect HID host peer, restart scanning so we
+    // keep checking until the device powers back on - but at a duty cycle the radio can afford
+    // (see the gap constants above), rather than back to back.
     auto peers = settings::loadAll();
     for (const auto& peer : peers) {
         if (peer.autoConnect && peer.profileId == BT_PROFILE_HID_HOST) {
             Device* dev;
             if (device_get_first_active_by_type(&BLUETOOTH_TYPE, &dev) == ERROR_NONE) {
                 if (!bluetooth_is_scanning(dev)) {
-                    LOG_I(TAG, "Auto-connect HID host: device not in scan, retrying scan");
+                    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                    const uint32_t gap_ms = auto_connect_scan_misses < AUTO_CONNECT_SCAN_FAST_MISSES
+                        ? AUTO_CONNECT_SCAN_GAP_FAST_MS
+                        : AUTO_CONNECT_SCAN_GAP_SLOW_MS;
+                    if (auto_connect_scan_misses > 0 && (now_ms - auto_connect_last_scan_ms) < gap_ms) {
+                        // Not due yet. The watchdog calls this every 10 s, so this is the branch that
+                        // keeps a keyboard-less device from scanning continuously.
+                        device_put(dev);
+                        return;
+                    }
+                    LOG_I(TAG, "Auto-connect HID host: device not in scan, retrying scan (%d misses)",
+                        auto_connect_scan_misses);
                     bluetooth_scan_start(dev);
+                    auto_connect_last_scan_ms = now_ms;
+                    auto_connect_scan_misses++;
                 }
                 device_put(dev);
             }
