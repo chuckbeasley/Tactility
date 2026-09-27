@@ -279,6 +279,13 @@ void View::updateNetworkList() {
             } else if (!state->hasScannedAfterRadioOn() || state->isScanning()) {
                 // hasScannedAfterRadioOn() prevents briefly showing "No networks found" when turning radio on.
                 lv_obj_add_flag(networks_list, LV_OBJ_FLAG_HIDDEN);
+            } else if (state->isScanRetryPending()) {
+                // A scan came back empty and another is on its way (see WifiManage.cpp). Saying "looking"
+                // is the honest thing here: the alternative was a definitive "No networks found" next to
+                // a scan that had simply been cut short, and the screen offered no way to ask again.
+                lv_obj_clear_flag(networks_list, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_t* label = lv_label_create(networks_list);
+                lv_label_set_text(label, "Looking for networks...");
             } else {
                 lv_obj_clear_flag(networks_list, LV_OBJ_FLAG_HIDDEN);
                 lv_obj_t* label = lv_label_create(networks_list);
@@ -303,7 +310,10 @@ void View::updateNetworkList() {
 }
 
 void View::updateScanning() {
-    if (state->getRadioState() == service::wifi::RadioState::On && state->isScanning()) {
+    // The spinner also stays up between the retries of an empty scan: to the user, a scan that found
+    // nothing and is about to be repeated is still a scan in progress.
+    const bool busy = state->isScanning() || state->isScanRetryPending();
+    if (state->getRadioState() == service::wifi::RadioState::On && busy) {
         lv_obj_remove_flag(scanning_spinner, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(scanning_spinner, LV_OBJ_FLAG_HIDDEN);

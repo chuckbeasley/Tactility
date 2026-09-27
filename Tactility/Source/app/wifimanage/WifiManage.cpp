@@ -15,6 +15,7 @@
 #include <tactility/check.h>
 #include <tactility/device.h>
 #include <tactility/log.h>
+#include <tactility/time.h>
 
 #include <lvgl/lvgl.h>
 
@@ -42,9 +43,44 @@ struct Context {
     uint32_t refreshBit = 0;
     std::atomic<bool> needsRefresh {false};
 
+    // Empty-scan retries, see onWifiEvent(). Deadline 0 means "no retry pending".
+    int emptyScanRetries = 0;
+    TickType_t retryScanAtTicks = 0;
+    // The last connection state the retry budget was re-armed for, so a fresh association (which is
+    // what the service's health monitor does to bring a silent link back) gets a fresh budget.
+    service::wifi::RadioState lastRadioState = service::wifi::RadioState::Off;
+
     void lock() { mutex.lock(); }
     void unlock() { mutex.unlock(); }
 };
+
+// A scan that comes back with no records at all is more often a scan that was cut short than an empty
+// air: measured on this board (Waveshare ESP32-C5), a scan issued while the station is associated
+// returns zero records while the link is in its silent state - the platform driver's FTM probe reports
+// the same thing on the same scans ("scan N returned no records (interrupted?), retrying in 5s"), and
+// the identical scan minutes later returned 27 APs. This screen used to show "No networks found" and
+// then do nothing at all: one starved scan and the list stayed empty until the app was closed and
+// opened again, with no way to ask again from the screen.
+//
+// The silence lasts 50-95 s when it happens, so two retries three seconds apart would not outlast it:
+// the screen would still end up saying there are no networks. Instead the retries keep going for about
+// a minute with a growing gap, which matters because the service's own health monitor re-associates
+// and restores the link within about 10-20 s of detecting it - so a retry a few seconds later finds a
+// working radio and the list fills itself in, without the user closing and reopening the screen.
+constexpr int MAX_EMPTY_SCAN_RETRIES = 6;
+constexpr TickType_t EMPTY_SCAN_RETRY_FIRST_DELAY = pdMS_TO_TICKS(3000);
+constexpr TickType_t EMPTY_SCAN_RETRY_MAX_DELAY = pdMS_TO_TICKS(12000);
+// How long the event loop waits while a retry is pending, so the deadline is actually reached.
+constexpr TickType_t RETRY_POLL_INTERVAL = pdMS_TO_TICKS(250);
+
+/** 3 s, 6 s, 12 s, then 12 s for every further attempt. */
+static TickType_t emptyScanRetryDelay(int attempt) {
+    TickType_t delay = EMPTY_SCAN_RETRY_FIRST_DELAY;
+    for (int i = 1; i < attempt && delay < EMPTY_SCAN_RETRY_MAX_DELAY; i++) {
+        delay *= 2;
+    }
+    return delay < EMPTY_SCAN_RETRY_MAX_DELAY ? delay : EMPTY_SCAN_RETRY_MAX_DELAY;
+}
 
 
 static void onConnect(const std::string& ssid) {
@@ -89,6 +125,22 @@ void onWifiEvent(Context* ctx, WifiEvent event) {
     auto radio_state = service::wifi::getRadioState();
     LOG_I(TAG, "Update with state %s", service::wifi::radioStateToString(radio_state));
     ctx->state.setRadioState(radio_state);
+
+    // A fresh association re-arms the empty-scan retry budget. The service brings a silent link back
+    // by re-associating (see the health monitor in the platform's wifi driver), and that is exactly
+    // when a retry that had given up deserves another go: without this, a 50-95 s silence outlives the
+    // budget and the screen stays on "No networks found" until the app is reopened.
+    if (radio_state == service::wifi::RadioState::ConnectionActive &&
+        ctx->lastRadioState != service::wifi::RadioState::ConnectionActive) {
+        ctx->emptyScanRetries = 0;
+    }
+    if (radio_state == service::wifi::RadioState::Off) {
+        ctx->emptyScanRetries = 0;
+        ctx->retryScanAtTicks = 0;
+        ctx->state.setScanRetryPending(false);
+    }
+    ctx->lastRadioState = radio_state;
+
     switch (event.type) {
         case WIFI_EVENT_TYPE_SCAN_STARTED:
             ctx->state.setScanning(true);
@@ -96,6 +148,24 @@ void onWifiEvent(Context* ctx, WifiEvent event) {
         case WIFI_EVENT_TYPE_SCAN_FINISHED:
             ctx->state.setScanning(false);
             ctx->state.updateApRecords();
+            if (ctx->state.getApRecordCount() == 0 && radio_state != service::wifi::RadioState::Off) {
+                if (ctx->emptyScanRetries < MAX_EMPTY_SCAN_RETRIES) {
+                    ctx->emptyScanRetries++;
+                    const TickType_t delay = emptyScanRetryDelay(ctx->emptyScanRetries);
+                    ctx->retryScanAtTicks = get_ticks() + delay;
+                    ctx->state.setScanRetryPending(true);
+                    LOG_I(TAG, "Scan returned no networks - retrying in %d ms (attempt %d of %d)",
+                        (int)(delay * portTICK_PERIOD_MS), ctx->emptyScanRetries + 1,
+                        MAX_EMPTY_SCAN_RETRIES + 1);
+                } else {
+                    ctx->state.setScanRetryPending(false);
+                    LOG_I(TAG, "Scan returned no networks after %d attempts - giving up",
+                        MAX_EMPTY_SCAN_RETRIES + 1);
+                }
+            } else {
+                ctx->emptyScanRetries = 0;
+                ctx->state.setScanRetryPending(false);
+            }
             break;
         case WIFI_EVENT_TYPE_RADIO_STATE_CHANGED:
             if (event.radio_state == WIFI_RADIO_STATE_ON && !service::wifi::isScanning()) {
@@ -188,7 +258,28 @@ int32_t appMain(int argc, char* argv[]) {
         // portMAX_DELAY - task_event_group_wait_any() still returns immediately for app_event
         // and (once live) wifi_event, this timeout only matters while neither has fired yet.
         TickType_t wait_timeout = (ctx.wifiDevice == nullptr) ? pdMS_TO_TICKS(500) : portMAX_DELAY;
+        if (ctx.retryScanAtTicks != 0) {
+            // A retry is pending, so the loop has to wake up to run it.
+            wait_timeout = RETRY_POLL_INTERVAL;
+        }
         task_event_group_wait_any(&event_group, nullptr, wait_timeout);
+
+        if (ctx.retryScanAtTicks != 0 && get_ticks() >= ctx.retryScanAtTicks) {
+            if (service::wifi::getRadioState() == service::wifi::RadioState::Off) {
+                // Nothing to retry against: the radio is off, so no scan of ours can run and no event
+                // is coming from this path.
+                ctx.retryScanAtTicks = 0;
+                ctx.state.setScanRetryPending(false);
+            } else if (service::wifi::isScanning()) {
+                // A scan is already in flight (the app's own, or one a caller asked for). Wait for it
+                // rather than dropping the retry: dropping it here is what left the screen blank until
+                // the app was reopened.
+                ctx.retryScanAtTicks = get_ticks() + RETRY_POLL_INTERVAL;
+            } else {
+                ctx.retryScanAtTicks = 0;
+                service::wifi::scan();
+            }
+        }
 
         if (ctx.wifiDevice == nullptr) {
             Device* retry_device = nullptr;

@@ -9,6 +9,19 @@ void State::setScanning(bool isScanning) {
     mutex.unlock();
 }
 
+void State::setScanRetryPending(bool pending) {
+    mutex.lock();
+    scanRetryPending = pending;
+    mutex.unlock();
+}
+
+bool State::isScanRetryPending() const {
+    mutex.lock();
+    bool result = scanRetryPending;
+    mutex.unlock();
+    return result;
+}
+
 void State::setRadioState(service::wifi::RadioState state) {
     mutex.lock();
     radioState = state;

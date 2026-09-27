@@ -13,6 +13,9 @@ class State final {
     RecursiveMutex mutex;
     bool scanning = false;
     bool scannedAfterRadioOn = false;
+    // True while an empty scan is being retried (see WifiManage.cpp): the screen uses it to keep
+    // showing that it is still looking instead of claiming there are no networks yet.
+    bool scanRetryPending = false;
     service::wifi::RadioState radioState;
     std::vector<WifiApRecord> apRecords;
     std::string connectSsid;
@@ -22,6 +25,9 @@ public:
 
     void setScanning(bool isScanning);
     bool isScanning() const;
+
+    void setScanRetryPending(bool pending);
+    bool isScanRetryPending() const;
 
     bool hasScannedAfterRadioOn() const { return scannedAfterRadioOn; }
 
