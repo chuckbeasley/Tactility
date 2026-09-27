@@ -130,10 +130,12 @@ bool started = false;
  * Tracked rather than asked of the driver because the mirror and now the radar screen both borrow the
  * radio for a low-latency stretch and want to put back what they found.
  *
- * The starting value comes from CONFIG_TT_WIFI_POWER_SAVE, which is off by default: on a link that
- * misses round trips, power save does not merely add latency, it makes the health monitor decide the
- * connection is dead and force a reconnect every 15-20 seconds. See that option's help text for the
- * measurements and for what turning it on costs.
+ * The starting value comes from CONFIG_TT_WIFI_POWER_SAVE, which is off by default because the radio
+ * waking once per beacon interval costs about 90 ms on every round trip (measured: 7.5 ms average with
+ * power save off against 98 ms with it on, same traffic). It is a working setting either way - with it
+ * on, fifteen weather fetches in three minutes completed and the health monitor never fired - so a
+ * battery-powered build can turn it on and accept the latency. See that option's help text for the
+ * measurements.
  */
 #if defined(CONFIG_TT_WIFI_POWER_SAVE)
 bool powerSaveEnabled = true;

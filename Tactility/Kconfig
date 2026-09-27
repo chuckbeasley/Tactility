@@ -162,22 +162,28 @@ menu "Tactility App"
         default n
         help
             Off by default, which means the radio stays awake (WIFI_PS_NONE) instead of IDF's
-            WIFI_PS_MIN_MODEM. That is a latency decision, and it is the single biggest one available:
-            with power save on, the radio only wakes once per beacon interval, so every round trip
-            waits up to that interval and anything unsolicited is missed.
+            WIFI_PS_MIN_MODEM. That is a latency decision: with power save on the radio only wakes once
+            per beacon interval, so every round trip waits up to that interval and anything unsolicited
+            is missed.
 
-            Measured on the Waveshare ESP32-C5 against this network's AP (beacon interval 102.4 ms):
-            ICMP from the LAN averaged 662 ms with a 3.2 s worst case and 40-50% of pings unanswered,
-            and a bulk transfer of 4.25 MB did not complete in 180 s. With power save off the same
-            pings averaged 60 ms with a 278 ms worst case. The symptom that made this a default rather
-            than a per-caller choice: the Wi-Fi health monitor probes the gateway every 5 s, and on a
-            link that misses that many round trips it concludes the connection is dead and forces a
-            reconnect - which tears down the very connection it is trying to protect, every 15-20
-            seconds, and leaves the board's own web server unreachable while it is up and associated.
+            Measured on the Waveshare ESP32-C5 against this network's AP (beacon interval 102.4 ms),
+            with the same idle/burst/app traffic in both arms and the FTM probe that used to disturb the
+            link removed (see that board's device profile):
 
-            What this costs: idle current. Power save is the right trade on a battery-powered device,
-            and callers that need low latency for a session already disable it explicitly
+              * power save on: idle 214/214 ICMP replies at 5/98/207 ms min/avg/max, a burst phase of
+                fifteen weather launches 143/150 at 4.7% loss with three 2-8 s interruptions, and 15/15
+                weather fetches completed;
+              * power save off: idle 231/231 at 4/7.5/52 ms, the same burst phase 170/170 at 0% loss,
+                16/16 fetches.
+
+            So the price of power save on this link is about 90 ms of added round trip and a few percent
+            of loss under burst load - a working link either way. An earlier version of this text quoted
+            662 ms average and 40-50% unanswered pings; those numbers were measured with a leftover FTM
+            probe present that put the receive path into a silent state, and they described that fault
+            rather than power save.
+
+            What this costs: idle current, which is the whole point of turning it on. Callers that need
+            low latency for a session disable it explicitly either way
             (tt::service::wifi::setPowerSaveEnabled) and restore it afterwards - the mirror and the
-            media player both do. Turn this on for a board where battery life matters more than
-            latency, and expect the reconnects above to come back with it.
+            media player both do.
 endmenu
