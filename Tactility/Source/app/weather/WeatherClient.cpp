@@ -12,8 +12,11 @@
 
 #ifdef ESP_PLATFORM
 // For the heap figures logged around the forecast parse, which is the one place in this app whose
-// cost lands in internal RAM rather than PSRAM.
+// cost lands in internal RAM rather than PSRAM, and for the pause between a failed request and its
+// retry.
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #endif
 
 namespace tt::app::weather {
@@ -24,6 +27,29 @@ constexpr auto* TAG = "Weather";
 
 // Shared with the radar screen, which fetches its imagery through the same path.
 using tt::network::httpGet;
+
+/**
+ * httpGet() with one retry.
+ *
+ * A screen here is built from a chain of five HTTPS documents - geocode, points, stations, latest
+ * observation, forecast - and any single one failing leaves an error on screen with nothing to
+ * recover it, because nothing retries. Measured on this board: the forecast request (the largest
+ * response, 12965 bytes) failed with a client-level error after about 11 s - the log line was
+ * "Weather: Forecast failed: Server returned -1" and the screen showed "Could not retrieve the
+ * forecast" until it was opened again - while the board answered ICMP from the LAN throughout that
+ * window, so this was not the link.
+ *
+ * One second between the attempts, because Nominatim's usage policy asks clients to stay at or below
+ * one request per second and it is the first document in the chain.
+ */
+bool httpGetRetrying(const std::string& url, tt::network::HttpBody& outBody, std::string& outError) {
+    if (httpGet(url, outBody, outError)) {
+        return true;
+    }
+    LOG_W(TAG, "%s failed (%s) - retrying once", url.c_str(), outError.c_str());
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    return httpGet(url, outBody, outError);
+}
 
 // region JSON helpers
 
@@ -79,7 +105,7 @@ bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outCond
     // which allocates a small block per token. Parsing that to read the first entry dropped the
     // internal heap to 12 bytes on real hardware; asking the server for the one station this code
     // actually uses does the same job for about a kilobyte.
-    if (!httpGet(stationsUrl + "?limit=1", body, error)) {
+    if (!httpGetRetrying(stationsUrl + "?limit=1", body, error)) {
         LOG_W(TAG, "Station list failed: %s", error.c_str());
         return false;
     }
@@ -111,7 +137,7 @@ bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outCond
     if (shouldAbort()) {
         return false;
     }
-    if (!httpGet(stationUrl + "/observations/latest", body, error)) {
+    if (!httpGetRetrying(stationUrl + "/observations/latest", body, error)) {
         LOG_W(TAG, "Observation failed: %s", error.c_str());
         return false;
     }
@@ -148,7 +174,7 @@ bool fetchForecast(const std::string& forecastUrl, Forecast& outForecast, const 
 
     std::string error;
     tt::network::HttpBody body;
-    if (!httpGet(forecastUrl, body, error)) {
+    if (!httpGetRetrying(forecastUrl, body, error)) {
         LOG_W(TAG, "Forecast failed: %s", error.c_str());
         return false;
     }
@@ -225,7 +251,7 @@ bool geocodePostalCode(const std::string& postalCode, Coordinates& outCoordinate
     );
 
     tt::network::HttpBody body;
-    if (!httpGet(url, body, outError)) {
+    if (!httpGetRetrying(url, body, outError)) {
         return false;
     }
 
@@ -266,7 +292,7 @@ bool fetchReport(const Coordinates& coordinates, WeatherReport& outReport, const
     );
 
     tt::network::HttpBody body;
-    if (!httpGet(pointsUrl, body, outError)) {
+    if (!httpGetRetrying(pointsUrl, body, outError)) {
         LOG_W(TAG, "Points lookup failed: %s", outError.c_str());
         return false;
     }
