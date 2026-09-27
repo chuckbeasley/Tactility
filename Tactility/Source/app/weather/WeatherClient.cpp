@@ -92,7 +92,7 @@ cJSON* parseJson(const char* body, std::string& outError) {
 
 // endregion
 
-bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outConditions, const AbortCheck& shouldAbort) {
+bool fetchObservation(tt::network::HttpSession& session, const std::string& stationsUrl, CurrentConditions& outConditions, const AbortCheck& shouldAbort) {
     std::string error;
     tt::network::HttpBody body;
 
@@ -105,7 +105,7 @@ bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outCond
     // which allocates a small block per token. Parsing that to read the first entry dropped the
     // internal heap to 12 bytes on real hardware; asking the server for the one station this code
     // actually uses does the same job for about a kilobyte.
-    if (!httpGetRetrying(stationsUrl + "?limit=1", body, error)) {
+    if (!session.get(stationsUrl + "?limit=1", body, error)) {
         LOG_W(TAG, "Station list failed: %s", error.c_str());
         return false;
     }
@@ -137,7 +137,7 @@ bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outCond
     if (shouldAbort()) {
         return false;
     }
-    if (!httpGetRetrying(stationUrl + "/observations/latest", body, error)) {
+    if (!session.get(stationUrl + "/observations/latest", body, error)) {
         LOG_W(TAG, "Observation failed: %s", error.c_str());
         return false;
     }
@@ -167,14 +167,14 @@ bool fetchObservation(const std::string& stationsUrl, CurrentConditions& outCond
     return true;
 }
 
-bool fetchForecast(const std::string& forecastUrl, Forecast& outForecast, const AbortCheck& shouldAbort) {
+bool fetchForecast(tt::network::HttpSession& session, const std::string& forecastUrl, Forecast& outForecast, const AbortCheck& shouldAbort) {
     if (shouldAbort()) {
         return false;
     }
 
     std::string error;
     tt::network::HttpBody body;
-    if (!httpGetRetrying(forecastUrl, body, error)) {
+    if (!session.get(forecastUrl, body, error)) {
         LOG_W(TAG, "Forecast failed: %s", error.c_str());
         return false;
     }
@@ -291,8 +291,16 @@ bool fetchReport(const Coordinates& coordinates, WeatherReport& outReport, const
         coordinates.longitude
     );
 
+    // One connection for the whole NWS chain - points, stations, observation, forecast. Each of these
+    // used to be its own TLS handshake, so one refresh opened five connections within a few seconds;
+    // measured on this board, a burst of short-lived connections is the traffic pattern that can take
+    // the Wi-Fi receive path down for a minute (that measurement is written up beside the Wi-Fi
+    // settings in the ESP32-C5 device profiles), and four of the five handshakes were pure overhead on
+    // a fetch that has to finish inside a screen refresh.
+    tt::network::HttpSession session;
+
     tt::network::HttpBody body;
-    if (!httpGetRetrying(pointsUrl, body, outError)) {
+    if (!session.get(pointsUrl, body, outError)) {
         LOG_W(TAG, "Points lookup failed: %s", outError.c_str());
         return false;
     }
@@ -337,12 +345,12 @@ bool fetchReport(const Coordinates& coordinates, WeatherReport& outReport, const
     // The observation is optional on purpose: it comes from a different endpoint and a station
     // that is offline must not cost the user the forecast.
     if (!stationsUrl.empty()) {
-        if (!fetchObservation(stationsUrl, outReport.current, shouldAbort)) {
+        if (!fetchObservation(session, stationsUrl, outReport.current, shouldAbort)) {
             LOG_W(TAG, "Continuing without current conditions");
         }
     }
 
-    if (!fetchForecast(forecastUrl, outReport.forecast, shouldAbort)) {
+    if (!fetchForecast(session, forecastUrl, outReport.forecast, shouldAbort)) {
         outError = "Could not retrieve the forecast";
         return false;
     }
