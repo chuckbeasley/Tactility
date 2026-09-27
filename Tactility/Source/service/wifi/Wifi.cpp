@@ -127,15 +127,13 @@ bool started = false;
 /**
  * Whether power save is wanted, which is what the driver is set to except when the radio is off.
  *
- * Tracked rather than asked of the driver because the mirror and now the radar screen both borrow the
- * radio for a low-latency stretch and want to put back what they found.
+ * Tracked rather than asked of the driver because the mirror, the media player and the radar screen all
+ * borrow the radio for a low-latency stretch and put back what they found.
  *
- * The starting value comes from CONFIG_TT_WIFI_POWER_SAVE, which is off by default because the radio
- * waking once per beacon interval costs about 90 ms on every round trip (measured: 7.5 ms average with
- * power save off against 98 ms with it on, same traffic). It is a working setting either way - with it
- * on, fifteen weather fetches in three minutes completed and the health monitor never fired - so a
- * battery-powered build can turn it on and accept the latency. See that option's help text for the
- * measurements.
+ * The starting value comes from CONFIG_TT_WIFI_POWER_SAVE, on by default (IDF's own default too): power
+ * is the scarce resource and latency is a per-session need. Measured, it costs about 90 ms per round
+ * trip (7.5 ms average with it off against 98 ms with it on, same traffic) and a few percent of loss
+ * under burst load, and the link works either way. See that option's help text for the numbers.
  */
 #if defined(CONFIG_TT_WIFI_POWER_SAVE)
 bool powerSaveEnabled = true;

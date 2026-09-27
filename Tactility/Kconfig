@@ -159,31 +159,33 @@ menu "Tactility App"
             that declare their own size ask for 2.4 KB to 12 KB, the heavier ones clustering at 4-8 KB.
     config TT_WIFI_POWER_SAVE
         bool "Let the Wi-Fi radio sleep between beacons (power save on)"
-        default n
+        default y
         help
-            Off by default, which means the radio stays awake (WIFI_PS_NONE) instead of IDF's
-            WIFI_PS_MIN_MODEM. That is a latency decision: with power save on the radio only wakes once
-            per beacon interval, so every round trip waits up to that interval and anything unsolicited
-            is missed.
+            On by default, which is IDF's own default (WIFI_PS_MIN_MODEM): the radio sleeps between
+            beacons and wakes for each one. Power is the scarce resource on a battery-powered device and
+            latency is only needed for a session, so the default is the power-saving side and the
+            sessions that need the radio awake turn it off while they run - the screen mirror, the media
+            player while it streams, and the radar while it fetches all do that through
+            tt::service::wifi::setPowerSaveEnabled(), storing and restoring what they found.
 
-            Measured on the Waveshare ESP32-C5 against this network's AP (beacon interval 102.4 ms),
-            with the same idle/burst/app traffic in both arms and the FTM probe that used to disturb the
-            link removed (see that board's device profile):
+            What it costs, measured on the Waveshare ESP32-C5 against this network's AP (beacon interval
+            102.4 ms), same idle/burst/app traffic in both arms:
 
               * power save on: idle 214/214 ICMP replies at 5/98/207 ms min/avg/max, a burst phase of
-                fifteen weather launches 143/150 at 4.7% loss with three 2-8 s interruptions, and 15/15
-                weather fetches completed;
+                fifteen weather launches 143/150 at 4.7% loss with three 2-8 s interruptions, 15/15
+                weather fetches completed, and the health monitor never fired;
               * power save off: idle 231/231 at 4/7.5/52 ms, the same burst phase 170/170 at 0% loss,
                 16/16 fetches.
 
-            So the price of power save on this link is about 90 ms of added round trip and a few percent
-            of loss under burst load - a working link either way. An earlier version of this text quoted
-            662 ms average and 40-50% unanswered pings; those numbers were measured with a leftover FTM
-            probe present that put the receive path into a silent state, and they described that fault
-            rather than power save.
+            So it costs about 90 ms on every round trip (ICMP average 7.5 ms with it off against 98 ms
+            with it on). Measured against this board's own web server from a PC on the same LAN, where
+            the client's own overhead dominates: /api/sysinfo took 96 ms on average with power save off
+            against 150 ms with it on, worst case 273 ms against 587 ms. In other words a browser's
+            requests are tens of milliseconds slower, not unusable. An earlier version of this text
+            quoted 662 ms average and 40-50% unanswered pings, but those were measured with a leftover
+            FTM probe present that put the receive path into a silent state - they described that fault,
+            not power save, which is why the default could safely move back to on.
 
-            What this costs: idle current, which is the whole point of turning it on. Callers that need
-            low latency for a session disable it explicitly either way
-            (tt::service::wifi::setPowerSaveEnabled) and restore it afterwards - the mirror and the
-            media player both do.
+            Set this to n on a board where every round trip matters more than idle current, for example
+            one that serves its web UI to a browser all day.
 endmenu

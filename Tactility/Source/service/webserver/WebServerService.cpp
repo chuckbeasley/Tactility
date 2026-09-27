@@ -361,6 +361,11 @@ RemoteSession* remoteSessionForFd(int fd) {
 // Re-enabling is idempotent, so a lapsed window that is then re-requested is harmless.
 constexpr uint32_t MIRROR_LOW_LATENCY_TIMEOUT_MS = 4000;
 bool mirrorLowLatencyActive = false;
+// What power save was set to before this session turned it off, so the session puts back what it found
+// instead of guessing. Radar and the media player both store-and-restore for the same reason: a mirror
+// is not the only thing that may have an opinion about it, and a board whose default is off must not be
+// left with it on by a viewer that has already gone away.
+bool mirrorPowerSaveWasEnabled = false;
 std::unique_ptr<Timer> mirrorLowLatencyTimer;
 
 void mirrorEndLowLatency() {
@@ -368,13 +373,16 @@ void mirrorEndLowLatency() {
         return;
     }
     mirrorLowLatencyActive = false;
-    tt::service::wifi::setPowerSaveEnabled(true);
+    if (mirrorPowerSaveWasEnabled) {
+        tt::service::wifi::setPowerSaveEnabled(true);
+    }
     // The client has stopped asking for frames, so as far as the device is concerned the session is
     // over. Close what its input left open on screen - notably the on-screen keyboard, which a
     // remote tap on a text field opens exactly as a local tap would.
     remoteInputNotifyMirrorStopped();
-    LOG_I(TAG, "/ws/remote: no frames for %u ms, WiFi power save restored",
-        (unsigned)MIRROR_LOW_LATENCY_TIMEOUT_MS);
+    LOG_I(TAG, "/ws/remote: no frames for %u ms, WiFi power save %s",
+        (unsigned)MIRROR_LOW_LATENCY_TIMEOUT_MS,
+        mirrorPowerSaveWasEnabled ? "restored" : "left as it was (it was already off)");
 }
 
 /** Marks a frame request: keeps WiFi awake and restarts the idle window. */
@@ -390,8 +398,11 @@ void mirrorRequestLowLatency() {
 
     if (!mirrorLowLatencyActive) {
         mirrorLowLatencyActive = true;
-        tt::service::wifi::setPowerSaveEnabled(false);
-        LOG_I(TAG, "/ws/remote: frame requested, WiFi power save disabled");
+        mirrorPowerSaveWasEnabled = tt::service::wifi::isPowerSaveEnabled();
+        if (mirrorPowerSaveWasEnabled) {
+            tt::service::wifi::setPowerSaveEnabled(false);
+            LOG_I(TAG, "/ws/remote: frame requested, WiFi power save disabled");
+        }
     }
 
     // reset() also (re)starts a timer that already fired, which is what extends the window.
